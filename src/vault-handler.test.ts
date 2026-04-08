@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { handleVaultRequest, VaultDeps } from './vault-handler.js';
 import { TokenStore } from './token-store.js';
 
