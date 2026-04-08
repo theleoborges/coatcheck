@@ -5,6 +5,7 @@ import { URL } from 'node:url';
 import { TokenStore } from './token-store.js';
 import { SecretFetcher } from './secret-fetcher.js';
 import { CertAuthority } from './ca.js';
+import { handleVaultRequest } from './vault-handler.js';
 
 const PROXY_PORT = parseInt(process.env.PROXY_PORT ?? '3128', 10);
 const AGENT_LABEL = process.env.AGENT_LABEL;
@@ -17,83 +18,13 @@ if (!AGENT_LABEL) {
 const tokenStore = new TokenStore();
 const secretFetcher = new SecretFetcher(AGENT_LABEL);
 const ca = new CertAuthority();
-
-// --- Vault API handler (requests to the proxy itself) ---
-
-function handleVaultRequest(req: http.IncomingMessage, res: http.ServerResponse): boolean {
-  const url = req.url ?? '';
-
-  // Health check
-  if (url === '/_health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', tokens_active: tokenStore.size }));
-    return true;
-  }
-
-  // Serve CA certificate (for agent container to trust)
-  if (url === '/_ca') {
-    res.writeHead(200, { 'Content-Type': 'application/x-pem-file' });
-    res.end(ca.caCertPem);
-    return true;
-  }
-
-  // List integrations/secrets
-  if (url === '/_vault' && req.method === 'GET') {
-    secretFetcher.listSecrets().then(names => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ secrets: names }));
-    }).catch(err => {
-      console.error('Error listing secrets:', err);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Failed to list secrets' }));
-    });
-    return true;
-  }
-
-  // Get/check a secret
-  const vaultMatch = url.match(/^\/_vault\/([^/?]+)(\?.*)?$/);
-  if (vaultMatch && req.method === 'GET') {
-    const secretName = decodeURIComponent(vaultMatch[1]);
-    const params = new URLSearchParams(vaultMatch[2] ?? '');
-
-    if (params.get('check') === '1') {
-      secretFetcher.exists(secretName).then(exists => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ exists }));
-      }).catch(err => {
-        console.error('Error checking secret:', err);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Failed to check secret' }));
-      });
-      return true;
-    }
-
-    // Issue a proxy token
-    secretFetcher.get(secretName).then(value => {
-      if (value === null) {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `Secret '${secretName}' not found`, vault_url: 'https://example.com/dashboard/vault' }));
-        return;
-      }
-      const token = tokenStore.issue(secretName, value);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds }));
-    }).catch(err => {
-      console.error('Error fetching secret:', err);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Failed to fetch secret' }));
-    });
-    return true;
-  }
-
-  return false;
-}
+const vaultDeps = { tokenStore, secretFetcher, ca };
 
 // --- HTTP proxy (CONNECT for HTTPS, forward for HTTP) ---
 
 const server = http.createServer((req, res) => {
   // Handle vault API requests directly
-  if (handleVaultRequest(req, res)) return;
+  if (handleVaultRequest(req, res, vaultDeps)) return;
 
   // Forward HTTP proxy request
   const targetUrl = req.url;
