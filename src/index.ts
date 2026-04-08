@@ -245,8 +245,11 @@ function swapTokensInRawHeaders(headerStr: string, hostname: string): string {
 
 // --- Start ---
 
-server.listen(PROXY_PORT, '127.0.0.1', () => {
-  console.log(`Secret proxy listening on 127.0.0.1:${PROXY_PORT}`);
+// Bind to 0.0.0.0 in dev (docker-compose port mapping), 127.0.0.1 in prod (sidecar)
+const BIND_HOST = process.env.PROXY_BIND_HOST ?? '127.0.0.1';
+
+server.listen(PROXY_PORT, BIND_HOST, () => {
+  console.log(`Secret proxy listening on ${BIND_HOST}:${PROXY_PORT}`);
   console.log(`Agent label: ${AGENT_LABEL}`);
   console.log(`Vault API: http://localhost:${PROXY_PORT}/_vault`);
 });

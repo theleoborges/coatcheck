@@ -40,11 +40,20 @@ export class SecretFetcher {
     this.proxyRoleArn = proxyRoleArn ?? process.env.PROXY_ROLE_ARN;
   }
 
+  /** SSM client options — includes endpoint override for LocalStack in dev */
+  private get ssmBaseOptions(): Record<string, unknown> {
+    const opts: Record<string, unknown> = { region: this.region };
+    if (process.env.AWS_ENDPOINT_URL) {
+      opts.endpoint = process.env.AWS_ENDPOINT_URL;
+    }
+    return opts;
+  }
+
   /** Get an SSM client, assuming the proxy role if configured */
   private async getSSMClient(): Promise<SSMClient> {
     if (!this.proxyRoleArn) {
-      // No role to assume — use default credentials (task role)
-      return new SSMClient({ region: this.region });
+      // No role to assume — use default credentials (task role or env creds)
+      return new SSMClient(this.ssmBaseOptions);
     }
 
     // Refresh assumed credentials if expired or not yet assumed
@@ -70,7 +79,7 @@ export class SecretFetcher {
     }
 
     return new SSMClient({
-      region: this.region,
+      ...this.ssmBaseOptions,
       credentials: {
         accessKeyId: this.assumedCreds.accessKeyId,
         secretAccessKey: this.assumedCreds.secretAccessKey,
