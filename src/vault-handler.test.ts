@@ -149,17 +149,42 @@ describe('Vault Handler', () => {
   // --- Multi-value secret ---
 
   it('returns fields list for multi-value secret without field param', async () => {
-    await setup({ supabase: JSON.stringify({ 'project-url': 'https://proj.supabase.co', 'service-role-key': 'sbp_secret' }) });
+    await setup({ supabase: JSON.stringify({ 'project-url': 'https://proj.supabase.co', 'service-role-key': 'sbp_secret', _cleartext: ['project-url'] }) });
     const { status, body } = await fetchJSON(port, '/_vault/supabase');
     expect(status).toBe(200);
     expect(body.type).toBe('multi');
     expect(body.fields).toEqual(['project-url', 'service-role-key']);
+    // _cleartext should not appear in fields list
+    expect(body.fields).not.toContain('_cleartext');
     // No token should be issued
     expect(body.token).toBeUndefined();
     expect(tokenStore.size).toBe(0);
   });
 
-  it('issues token for a specific field of multi-value secret', async () => {
+  it('returns raw value for cleartext field (no token)', async () => {
+    await setup({ supabase: JSON.stringify({ 'project-url': 'https://proj.supabase.co', 'service-role-key': 'sbp_secret', _cleartext: ['project-url'] }) });
+
+    const { status, body } = await fetchJSON(port, '/_vault/supabase?field=project-url');
+    expect(status).toBe(200);
+    expect(body.value).toBe('https://proj.supabase.co');
+    expect(body.cleartext).toBe(true);
+    // No token issued for cleartext fields
+    expect(body.token).toBeUndefined();
+    expect(tokenStore.size).toBe(0);
+  });
+
+  it('issues token for sensitive field even when _cleartext is present', async () => {
+    await setup({ supabase: JSON.stringify({ 'project-url': 'https://proj.supabase.co', 'service-role-key': 'sbp_secret', _cleartext: ['project-url'] }) });
+
+    const { status, body } = await fetchJSON(port, '/_vault/supabase?field=service-role-key');
+    expect(status).toBe(200);
+    expect(body.token).toMatch(/^tok_/);
+    expect(tokenStore.resolve(body.token as string)).toBe('sbp_secret');
+    expect(body.value).toBeUndefined();
+    expect(tokenStore.size).toBe(1);
+  });
+
+  it('issues tokens for all fields when no _cleartext metadata', async () => {
     await setup({ supabase: JSON.stringify({ 'project-url': 'https://proj.supabase.co', 'service-role-key': 'sbp_secret' }) });
 
     const { status: s1, body: b1 } = await fetchJSON(port, '/_vault/supabase?field=project-url');
@@ -172,17 +197,25 @@ describe('Vault Handler', () => {
     expect(b2.token).toMatch(/^tok_/);
     expect(tokenStore.resolve(b2.token as string)).toBe('sbp_secret');
 
-    // Two separate tokens issued
     expect(tokenStore.size).toBe(2);
   });
 
   it('returns 400 for invalid field on multi-value secret', async () => {
-    await setup({ supabase: JSON.stringify({ 'project-url': 'x', 'service-role-key': 'y' }) });
+    await setup({ supabase: JSON.stringify({ 'project-url': 'x', 'service-role-key': 'y', _cleartext: ['project-url'] }) });
     const { status, body } = await fetchJSON(port, '/_vault/supabase?field=bogus');
     expect(status).toBe(400);
     expect(body.error).toContain("Field 'bogus' not found");
     expect(body.error).toContain('project-url');
     expect(body.error).toContain('service-role-key');
+    // _cleartext should not appear in error message
+    expect(body.error).not.toContain('_cleartext');
+  });
+
+  it('returns 400 when requesting _cleartext as a field', async () => {
+    await setup({ supabase: JSON.stringify({ 'project-url': 'x', 'service-role-key': 'y', _cleartext: ['project-url'] }) });
+    const { status, body } = await fetchJSON(port, '/_vault/supabase?field=_cleartext');
+    expect(status).toBe(400);
+    expect(body.error).toContain('not found');
   });
 
   // --- Edge cases ---

@@ -89,21 +89,32 @@ export function handleVaultRequest(
 
       if (parsed) {
         // Multi-value secret
+        // _cleartext lists fields that are safe to return as raw values (URLs, domains, IDs)
+        const cleartextFields: string[] = Array.isArray(parsed._cleartext) ? parsed._cleartext : [];
+        // User-visible fields exclude the _cleartext metadata key
+        const userFields = Object.keys(parsed).filter(k => k !== '_cleartext');
+
         if (!field) {
           // No field requested — return available fields so the agent knows what to ask for
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'multi', fields: Object.keys(parsed) }));
+          res.end(JSON.stringify({ type: 'multi', fields: userFields }));
+          return;
+        }
+        if (field === '_cleartext' || parsed[field] === undefined) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `Field '${field}' not found. Available: ${userFields.join(', ')}` }));
           return;
         }
         const fieldValue = parsed[field];
-        if (fieldValue === undefined) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: `Field '${field}' not found. Available: ${Object.keys(parsed).join(', ')}` }));
-          return;
+        if (cleartextFields.includes(field)) {
+          // Non-sensitive field — return raw value (no token) so it can be used directly in URLs
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ value: fieldValue, cleartext: true }));
+        } else {
+          const token = tokenStore.issue(`${secretName}:${field}`, fieldValue);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds }));
         }
-        const token = tokenStore.issue(`${secretName}:${field}`, fieldValue);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds }));
       } else {
         // Simple secret — field param is ignored
         const token = tokenStore.issue(secretName, value);
