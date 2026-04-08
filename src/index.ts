@@ -30,6 +30,13 @@ function handleVaultRequest(req: http.IncomingMessage, res: http.ServerResponse)
     return true;
   }
 
+  // Serve CA certificate (for agent container to trust)
+  if (url === '/_ca') {
+    res.writeHead(200, { 'Content-Type': 'application/x-pem-file' });
+    res.end(ca.caCertPem);
+    return true;
+  }
+
   // List integrations/secrets
   if (url === '/_vault' && req.method === 'GET') {
     secretFetcher.listSecrets().then(names => {
