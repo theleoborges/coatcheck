@@ -139,6 +139,11 @@ server.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head:
     return;
   }
 
+  // Prevent unhandled socket errors from crashing the process
+  clientSocket.on('error', (err) => {
+    console.error(`Client socket error (CONNECT ${hostname}):`, err.message);
+  });
+
   // Check if we have any active tokens — if not, just tunnel directly (no MITM needed)
   if (tokenStore.size === 0) {
     tunnelDirect(hostname, port, clientSocket, head);
@@ -203,7 +208,12 @@ function tunnelDirect(hostname: string, port: number, clientSocket: net.Socket, 
 
   serverSocket.on('error', (err) => {
     console.error(`Tunnel error to ${hostname}:${port}:`, err.message);
-    clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    clientSocket.destroy();
+  });
+
+  clientSocket.on('error', (err) => {
+    console.error(`Client socket error for ${hostname}:${port}:`, err.message);
+    serverSocket.destroy();
   });
 }
 
