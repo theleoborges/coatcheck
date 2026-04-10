@@ -3,6 +3,9 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { handleVaultRequest, VaultDeps } from './vault-handler.js';
 import { TokenStore } from './token-store.js';
 
+// Save real fetch before any tests can mock it
+const realFetch = globalThis.fetch;
+
 // --- Helpers ---
 
 function mockSecretFetcher(secrets: Record<string, string>) {
@@ -10,6 +13,7 @@ function mockSecretFetcher(secrets: Record<string, string>) {
     get: vi.fn(async (name: string) => secrets[name] ?? null),
     exists: vi.fn(async (name: string) => name in secrets),
     listSecrets: vi.fn(async () => Object.keys(secrets)),
+    put: vi.fn(async (name: string, value: string) => { secrets[name] = value; }),
   };
 }
 
@@ -36,14 +40,15 @@ async function listen(server: http.Server): Promise<number> {
   });
 }
 
-async function fetchJSON(port: number, path: string): Promise<{ status: number; body: Record<string, unknown> }> {
-  const res = await fetch(`http://127.0.0.1:${port}${path}`);
+async function fetchJSON(port: number, path: string, method = 'GET'): Promise<{ status: number; body: Record<string, unknown> }> {
+  // Always use the real fetch (not a mock) for test server requests
+  const res = await realFetch(`http://127.0.0.1:${port}${path}`, { method });
   const body = await res.json();
   return { status: res.status, body: body as Record<string, unknown> };
 }
 
 async function fetchText(port: number, path: string): Promise<{ status: number; body: string; contentType: string }> {
-  const res = await fetch(`http://127.0.0.1:${port}${path}`);
+  const res = await realFetch(`http://127.0.0.1:${port}${path}`);
   const body = await res.text();
   return { status: res.status, body, contentType: res.headers.get('content-type') ?? '' };
 }
@@ -245,7 +250,7 @@ describe('Vault Handler', () => {
 
   it('returns false for non-vault paths', async () => {
     await setup({});
-    const res = await fetch(`http://127.0.0.1:${port}/not-vault`);
+    const res = await realFetch(`http://127.0.0.1:${port}/not-vault`);
     expect(res.status).toBe(404);
     const text = await res.text();
     expect(text).toBe('Not a vault request');
@@ -260,5 +265,131 @@ describe('Vault Handler', () => {
     const url = `https://api.trello.com/1/boards?key=${b1.token}&token=${b2.token}`;
     const swapped = tokenStore.replaceAll(url);
     expect(swapped).toBe('https://api.trello.com/1/boards?key=trello-key-123&token=trello-tok-456');
+  });
+
+  // --- OAuth Refresh ---
+
+  describe('/_vault/{name}/refresh', () => {
+    const googleSecret = JSON.stringify({
+      access_token: 'ya29.old-token',
+      refresh_token: '1//old-refresh',
+      expires_at: 1000,
+      token_url: 'https://oauth2.googleapis.com/token',
+      client_id: 'test-client-id',
+      client_secret: 'test-client-secret',
+      provider: 'google',
+      _cleartext: ['provider', 'token_url', 'client_id'],
+    });
+
+    it('returns 404 for missing secret', async () => {
+      await setup({});
+      const { status, body } = await fetchJSON(port, '/_vault/google/refresh', 'POST');
+      expect(status).toBe(404);
+      expect(body.error).toContain('not found');
+    });
+
+    it('returns 400 for non-JSON secret', async () => {
+      await setup({ google: 'simple-string' });
+      const { status, body } = await fetchJSON(port, '/_vault/google/refresh', 'POST');
+      expect(status).toBe(400);
+      expect(body.error).toContain('not a multi-value');
+    });
+
+    it('returns 400 for secret missing required refresh fields', async () => {
+      await setup({ google: JSON.stringify({ access_token: 'ya29.tok' }) });
+      const { status, body } = await fetchJSON(port, '/_vault/google/refresh', 'POST');
+      expect(status).toBe(400);
+      expect(body.error).toContain('missing required fields');
+    });
+
+    it('returns 502 when upstream refresh fails', async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 400,
+        text: async () => '{"error":"invalid_grant"}',
+      }) as unknown as typeof fetch;
+
+      try {
+        await setup({ google: googleSecret });
+        const { status, body } = await fetchJSON(port, '/_vault/google/refresh', 'POST');
+        expect(status).toBe(502);
+        expect(body.error).toContain('refresh failed');
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('refreshes token, updates vault, and returns tok_*', async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          access_token: 'ya29.new-token',
+          expires_in: 3600,
+          token_type: 'Bearer',
+        }),
+      }) as unknown as typeof fetch;
+
+      try {
+        const secrets: Record<string, string> = { google: googleSecret };
+        const deps = await setup(secrets);
+        const { status, body } = await fetchJSON(port, '/_vault/google/refresh', 'POST');
+
+        expect(status).toBe(200);
+        expect(body.token).toMatch(/^tok_/);
+        expect(body.expires_in).toBe(300);
+
+        // The tok_* should resolve to the new access token
+        expect(tokenStore.resolve(body.token as string)).toBe('ya29.new-token');
+
+        // Vault should have been updated
+        const putMock = deps.secretFetcher.put as ReturnType<typeof vi.fn>;
+        expect(putMock).toHaveBeenCalledOnce();
+        const [name, value] = putMock.mock.calls[0];
+        expect(name).toBe('google');
+        const updated = JSON.parse(value);
+        expect(updated.access_token).toBe('ya29.new-token');
+        expect(updated.refresh_token).toBe('1//old-refresh'); // unchanged
+        expect(updated.expires_at).toBeGreaterThan(Math.floor(Date.now() / 1000));
+
+        // Verify the fetch call to Google token endpoint
+        const fetchCall = vi.mocked(globalThis.fetch).mock.calls[0];
+        expect(fetchCall[0]).toBe('https://oauth2.googleapis.com/token');
+        const fetchBody = fetchCall[1]?.body as string;
+        expect(fetchBody).toContain('refresh_token=1%2F%2Fold-refresh');
+        expect(fetchBody).toContain('client_id=test-client-id');
+        expect(fetchBody).toContain('grant_type=refresh_token');
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('handles refresh token rotation (new refresh_token in response)', async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          access_token: 'ya29.rotated-token',
+          refresh_token: '1//new-refresh',
+          expires_in: 3600,
+          token_type: 'Bearer',
+        }),
+      }) as unknown as typeof fetch;
+
+      try {
+        const secrets: Record<string, string> = { google: googleSecret };
+        const deps = await setup(secrets);
+        const { status } = await fetchJSON(port, '/_vault/google/refresh', 'POST');
+        expect(status).toBe(200);
+
+        // Vault should have the rotated refresh token
+        const putMock = deps.secretFetcher.put as ReturnType<typeof vi.fn>;
+        const updated = JSON.parse(putMock.mock.calls[0][1]);
+        expect(updated.refresh_token).toBe('1//new-refresh');
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
   });
 });

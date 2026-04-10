@@ -129,5 +129,104 @@ export function handleVaultRequest(
     return true;
   }
 
+  // Refresh an OAuth token
+  const refreshMatch = url.match(/^\/_vault\/([^/?]+)\/refresh$/);
+  if (refreshMatch && req.method === 'POST') {
+    const secretName = decodeURIComponent(refreshMatch[1]);
+    handleOAuthRefresh(secretName, res, deps).catch(err => {
+      console.error('Error refreshing token:', err);
+      if (!res.writableEnded) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Failed to refresh token' }));
+      }
+    });
+    return true;
+  }
+
   return false;
+}
+
+/**
+ * Handle OAuth token refresh server-side.
+ * Reads refresh_token + credentials from vault, exchanges with provider,
+ * stores new tokens back in vault, returns a tok_* to the agent.
+ */
+async function handleOAuthRefresh(
+  secretName: string,
+  res: http.ServerResponse,
+  deps: VaultDeps,
+): Promise<void> {
+  const { tokenStore, secretFetcher } = deps;
+
+  const raw = await secretFetcher.get(secretName);
+  if (raw === null) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `Secret '${secretName}' not found` }));
+    return;
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Secret is not a multi-value JSON secret' }));
+    return;
+  }
+
+  const refreshToken = parsed.refresh_token as string | undefined;
+  const tokenUrl = parsed.token_url as string | undefined;
+  const clientId = parsed.client_id as string | undefined;
+  const clientSecret = parsed.client_secret as string | undefined;
+
+  if (!refreshToken || !tokenUrl || !clientId || !clientSecret) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'Secret missing required fields for refresh (refresh_token, token_url, client_id, client_secret)',
+    }));
+    return;
+  }
+
+  // Exchange refresh token for new access token
+  const body = new URLSearchParams({
+    refresh_token: refreshToken,
+    client_id: clientId,
+    client_secret: clientSecret,
+    grant_type: 'refresh_token',
+  });
+
+  const tokenRes = await fetch(tokenUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+
+  if (!tokenRes.ok) {
+    const errorText = await tokenRes.text();
+    console.error(`OAuth refresh failed for ${secretName}:`, tokenRes.status, errorText);
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Token refresh failed', status: tokenRes.status }));
+    return;
+  }
+
+  const tokens = await tokenRes.json() as {
+    access_token: string;
+    refresh_token?: string;
+    expires_in: number;
+  };
+
+  // Update vault secret with new tokens
+  const updated = { ...parsed };
+  updated.access_token = tokens.access_token;
+  updated.expires_at = Math.floor(Date.now() / 1000) + tokens.expires_in;
+  if (tokens.refresh_token) {
+    updated.refresh_token = tokens.refresh_token;
+  }
+
+  await secretFetcher.put(secretName, JSON.stringify(updated));
+
+  // Issue a tok_* for the new access token
+  const tok = tokenStore.issue(`${secretName}:access_token`, tokens.access_token);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ token: tok.id, expires_in: tok.ttlSeconds }));
 }

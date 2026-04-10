@@ -2,6 +2,7 @@ import {
   SSMClient,
   GetParameterCommand,
   GetParametersByPathCommand,
+  PutParameterCommand,
 } from '@aws-sdk/client-ssm';
 import { STSClient, AssumeRoleCommand } from '@aws-sdk/client-sts';
 
@@ -131,6 +132,19 @@ export class SecretFetcher {
       }
       throw err;
     }
+  }
+
+  /** Update a secret value in the vault (overwrite) and invalidate cache */
+  async put(name: string, value: string): Promise<void> {
+    const ssm = await this.getSSMClient();
+    await ssm.send(new PutParameterCommand({
+      Name: this.basePath + name,
+      Value: value,
+      Type: 'SecureString',
+      Overwrite: true,
+    }));
+    // Invalidate cache so next get() reads the fresh value
+    this.cache.delete(name);
   }
 
   /** List all secret names in the user's vault */
