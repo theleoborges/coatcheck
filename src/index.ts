@@ -110,7 +110,7 @@ server.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head:
    * and token-swapped (not raw-piped).
    */
   function processClientData() {
-    while (true) {
+    for (;;) {
       const headerEnd = requestData.indexOf('\r\n\r\n');
       if (headerEnd === -1) return; // need more data
 
