@@ -99,33 +99,73 @@ server.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head:
 
   // Read the decrypted HTTP request from the client
   let requestData = Buffer.from(head);
+  let realSocket: tls.TLSSocket | null = null;
+  let upstreamReady = false;
+  let pendingWrites: Buffer[] = [];
+
+  /**
+   * Process buffered client data, extracting complete HTTP requests and
+   * swapping tokens in each one. Handles HTTP keep-alive: after the first
+   * request, subsequent requests on the same connection are also parsed
+   * and token-swapped (not raw-piped).
+   */
+  function processClientData() {
+    while (true) {
+      const headerEnd = requestData.indexOf('\r\n\r\n');
+      if (headerEnd === -1) return; // need more data
+
+      const headerStr = requestData.subarray(0, headerEnd).toString();
+
+      // Determine Content-Length to know how much body to consume
+      const clMatch = headerStr.match(/content-length:\s*(\d+)/i);
+      const contentLength = clMatch ? parseInt(clMatch[1], 10) : 0;
+      const totalLength = headerEnd + 4 + contentLength;
+
+      if (requestData.length < totalLength) return; // need more data for body
+
+      const body = requestData.subarray(headerEnd + 4, totalLength);
+      requestData = requestData.subarray(totalLength); // remainder for next request
+
+      // Swap tokens in headers
+      const swapped = swapTokensInRawHeaders(headerStr, hostname);
+
+      const outBuf = Buffer.concat([
+        Buffer.from(swapped + '\r\n\r\n'),
+        body,
+      ]);
+
+      if (realSocket && upstreamReady) {
+        realSocket.write(outBuf);
+      } else {
+        pendingWrites.push(outBuf);
+      }
+    }
+  }
+
   tlsSocket.on('data', (chunk: Buffer) => {
     requestData = Buffer.concat([requestData, chunk]);
+    processClientData();
+  });
 
-    // Check if we have a complete HTTP request (headers end with \r\n\r\n)
-    const headerEnd = requestData.indexOf('\r\n\r\n');
-    if (headerEnd === -1) return;
+  // Connect to the real server once (reused for keep-alive)
+  realSocket = tls.connect({ host: hostname, port, servername: hostname }, () => {
+    upstreamReady = true;
+    // Flush any requests that were parsed before the upstream connected
+    for (const buf of pendingWrites) {
+      realSocket!.write(buf);
+    }
+    pendingWrites = [];
 
-    const headerStr = requestData.subarray(0, headerEnd).toString();
-    const body = requestData.subarray(headerEnd + 4);
+    // Responses flow back to the client unmodified
+    realSocket!.pipe(tlsSocket);
 
-    // Swap tokens in headers and reconstruct
-    const swapped = swapTokensInRawHeaders(headerStr, hostname);
+    // Process any data that arrived during connection setup
+    processClientData();
+  });
 
-    // Connect to the real server and forward
-    const realSocket = tls.connect({ host: hostname, port, servername: hostname }, () => {
-      realSocket.write(swapped + '\r\n\r\n');
-      if (body.length > 0) realSocket.write(body);
-
-      // Pipe bidirectionally for the rest of the connection
-      tlsSocket.pipe(realSocket);
-      realSocket.pipe(tlsSocket);
-    });
-
-    realSocket.on('error', (err) => {
-      console.error(`Upstream TLS error for ${hostname}:`, err.message);
-      tlsSocket.destroy();
-    });
+  realSocket.on('error', (err) => {
+    console.error(`Upstream TLS error for ${hostname}:`, err.message);
+    tlsSocket.destroy();
   });
 });
 
