@@ -116,7 +116,11 @@ server.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head:
 
       const headerStr = requestData.subarray(0, headerEnd).toString();
 
-      // Determine Content-Length to know how much body to consume
+      // Determine Content-Length to know how much body to consume.
+      // TODO: Transfer-Encoding: chunked is not handled — body length will be
+      // wrong for chunked requests, potentially misaligning the request parser.
+      // Not an issue today (Google APIs use Content-Length; Browserbase bypasses
+      // the proxy), but revisit if we proxy chunked POST/PUT requests.
       const clMatch = headerStr.match(/content-length:\s*(\d+)/i);
       const contentLength = clMatch ? parseInt(clMatch[1], 10) : 0;
       const totalLength = headerEnd + 4 + contentLength;
