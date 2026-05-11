@@ -10,6 +10,16 @@ export interface VaultDeps {
 }
 
 /**
+ * Fleet-wide secrets the agent is permitted to request via /_secret/{name}.
+ * These live at `liv/{name}` in AWS Secrets Manager. Adding a name here grants
+ * every agent the ability to mint short-lived tokens for it — only add secrets
+ * that are fleet-shared API keys consumed by skill or OpenClaw code paths.
+ */
+const FLEET_SECRET_ALLOWLIST = new Set<string>([
+  'browserbase-api-key',
+]);
+
+/**
  * Handle vault API requests (/_health, /_ca, /_vault).
  * Returns true if the request was handled, false if it should be forwarded as a proxy request.
  */
@@ -125,6 +135,34 @@ export function handleVaultRequest(
       console.error('Error fetching secret:', err);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Failed to fetch secret' }));
+    });
+    return true;
+  }
+
+  // Fleet-wide secret issuance (e.g. Browserbase API key).
+  // Per-user vault entries use /_vault/{name}; this is the parallel surface
+  // for shared API keys that live in AWS Secrets Manager.
+  const fleetMatch = url.match(/^\/_secret\/([^/?]+)$/);
+  if (fleetMatch && req.method === 'GET') {
+    const secretName = decodeURIComponent(fleetMatch[1]);
+    if (!FLEET_SECRET_ALLOWLIST.has(secretName)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Secret '${secretName}' is not in the fleet allowlist` }));
+      return true;
+    }
+    secretFetcher.fetchFleetSecret(secretName).then(value => {
+      if (value === null) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Secret 'liv/${secretName}' not found in Secrets Manager` }));
+        return;
+      }
+      const token = tokenStore.issue(`fleet:${secretName}`, value);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds }));
+    }).catch(err => {
+      console.error(`Error fetching fleet secret '${secretName}':`, err);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Failed to fetch fleet secret' }));
     });
     return true;
   }

@@ -8,12 +8,13 @@ const realFetch = globalThis.fetch;
 
 // --- Helpers ---
 
-function mockSecretFetcher(secrets: Record<string, string>) {
+function mockSecretFetcher(secrets: Record<string, string>, fleetSecrets: Record<string, string> = {}) {
   return {
     get: vi.fn(async (name: string) => secrets[name] ?? null),
     exists: vi.fn(async (name: string) => name in secrets),
     listSecrets: vi.fn(async () => Object.keys(secrets)),
     put: vi.fn(async (name: string, value: string) => { secrets[name] = value; }),
+    fetchFleetSecret: vi.fn(async (name: string) => fleetSecrets[name] ?? null),
   };
 }
 
@@ -65,11 +66,11 @@ describe('Vault Handler', () => {
     server?.close();
   });
 
-  async function setup(secrets: Record<string, string>) {
+  async function setup(secrets: Record<string, string>, fleetSecrets: Record<string, string> = {}) {
     tokenStore = new TokenStore();
     const deps: VaultDeps = {
       tokenStore,
-      secretFetcher: mockSecretFetcher(secrets) as unknown as VaultDeps['secretFetcher'],
+      secretFetcher: mockSecretFetcher(secrets, fleetSecrets) as unknown as VaultDeps['secretFetcher'],
       ca: mockCa() as unknown as VaultDeps['ca'],
     };
     server = createTestServer(deps);
@@ -265,6 +266,43 @@ describe('Vault Handler', () => {
     const url = `https://api.trello.com/1/boards?key=${b1.token}&token=${b2.token}`;
     const swapped = tokenStore.replaceAll(url);
     expect(swapped).toBe('https://api.trello.com/1/boards?key=trello-key-123&token=trello-tok-456');
+  });
+
+  // --- Fleet secrets (/_secret/{name}) ---
+
+  describe('/_secret/{name}', () => {
+    it('issues token for allowlisted fleet secret', async () => {
+      await setup({}, { 'browserbase-api-key': 'bb_live_real_key_xyz' });
+      const { status, body } = await fetchJSON(port, '/_secret/browserbase-api-key');
+      expect(status).toBe(200);
+      expect(body.token).toMatch(/^tok_/);
+      expect(body.expires_in).toBe(300);
+      expect(tokenStore.resolve(body.token as string)).toBe('bb_live_real_key_xyz');
+    });
+
+    it('returns 403 for non-allowlisted secret name', async () => {
+      await setup({}, { 'litellm-master-key': 'sk-master-xxx' });
+      const { status, body } = await fetchJSON(port, '/_secret/litellm-master-key');
+      expect(status).toBe(403);
+      expect(body.error).toContain('not in the fleet allowlist');
+      // No token issued — even though the upstream secret exists, the proxy refuses to mint
+      expect(tokenStore.size).toBe(0);
+    });
+
+    it('returns 404 when secret is not in Secrets Manager', async () => {
+      await setup({}, {});
+      const { status, body } = await fetchJSON(port, '/_secret/browserbase-api-key');
+      expect(status).toBe(404);
+      expect(body.error).toContain('not found');
+    });
+
+    it('issued fleet-secret tokens are swappable in headers', async () => {
+      await setup({}, { 'browserbase-api-key': 'bb_live_xyz_real' });
+      const { body } = await fetchJSON(port, '/_secret/browserbase-api-key');
+      const header = `x-bb-api-key: ${body.token}\r\n`;
+      const swapped = tokenStore.replaceAll(header);
+      expect(swapped).toBe('x-bb-api-key: bb_live_xyz_real\r\n');
+    });
   });
 
   // --- OAuth Refresh ---

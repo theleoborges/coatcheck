@@ -5,6 +5,10 @@ import {
   PutParameterCommand,
 } from '@aws-sdk/client-ssm';
 import { STSClient, AssumeRoleCommand } from '@aws-sdk/client-sts';
+import {
+  SecretsManagerClient,
+  GetSecretValueCommand,
+} from '@aws-sdk/client-secrets-manager';
 
 const SECRET_CACHE_TTL_MS = 300_000; // 5 minutes
 const CREDENTIALS_REFRESH_MS = 2_700_000; // 45 minutes (STS session is 1h by default)
@@ -50,11 +54,11 @@ export class SecretFetcher {
     return opts;
   }
 
-  /** Get an SSM client, assuming the proxy role if configured */
-  private async getSSMClient(): Promise<SSMClient> {
+  /** Resolve AWS client options, assuming the proxy role if configured */
+  private async getAwsClientOptions(): Promise<Record<string, unknown>> {
     if (!this.proxyRoleArn) {
       // No role to assume — use default credentials (task role or env creds)
-      return new SSMClient(this.ssmBaseOptions);
+      return this.ssmBaseOptions;
     }
 
     // Refresh assumed credentials if expired or not yet assumed
@@ -79,14 +83,44 @@ export class SecretFetcher {
       console.log(`Assumed proxy role: ${this.proxyRoleArn}`);
     }
 
-    return new SSMClient({
+    return {
       ...this.ssmBaseOptions,
       credentials: {
         accessKeyId: this.assumedCreds.accessKeyId,
         secretAccessKey: this.assumedCreds.secretAccessKey,
         sessionToken: this.assumedCreds.sessionToken,
       },
-    });
+    };
+  }
+
+  private async getSSMClient(): Promise<SSMClient> {
+    return new SSMClient(await this.getAwsClientOptions());
+  }
+
+  private async getSecretsManagerClient(): Promise<SecretsManagerClient> {
+    return new SecretsManagerClient(await this.getAwsClientOptions());
+  }
+
+  /**
+   * Fetch a fleet-wide secret from AWS Secrets Manager at `liv/{name}`.
+   * Used for shared API keys (e.g. Browserbase) — distinct from per-user vault entries
+   * which live in SSM Parameter Store at /liv/agents/{label}/user-secrets/.
+   */
+  async fetchFleetSecret(name: string): Promise<string | null> {
+    const sm = await this.getSecretsManagerClient();
+    try {
+      const result = await sm.send(new GetSecretValueCommand({
+        SecretId: `liv/${name}`,
+      }));
+      return result.SecretString ?? null;
+    } catch (err: unknown) {
+      // SecretsManager error name varies by SDK version (err.name vs err.Code).
+      const errName = (err instanceof Error ? err.name : '') || (err as { Code?: string })?.Code || '';
+      if (errName === 'ResourceNotFoundException') {
+        return null;
+      }
+      throw err;
+    }
   }
 
   /** Get a secret value by name, or null if not found */
