@@ -2,7 +2,7 @@ import http from 'node:http';
 import net from 'node:net';
 import tls from 'node:tls';
 import { URL } from 'node:url';
-import { TokenStore } from './token-store.js';
+import { TokenStore, TOKEN_LITERAL_PATTERN, type SwapInfo } from './token-store.js';
 import { SecretFetcher } from './secret-fetcher.js';
 import { CertAuthority } from './ca.js';
 import { handleVaultRequest } from './vault-handler.js';
@@ -77,9 +77,11 @@ server.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head:
 
   // Check if we have any active tokens — if not, just tunnel directly (no MITM needed)
   if (tokenStore.size === 0) {
+    console.log(`[connect] host=${hostname}:${port} mode=passthrough store_size=0`);
     tunnelDirect(hostname, port, clientSocket, head);
     return;
   }
+  console.log(`[connect] host=${hostname}:${port} mode=mitm store_size=${tokenStore.size}`);
 
   // MITM: terminate TLS from client, inspect/modify, re-encrypt to server
   clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
@@ -195,37 +197,67 @@ function tunnelDirect(hostname: string, port: number, clientSocket: net.Socket, 
 // --- Token swapping logic ---
 
 function swapTokensInRequest(proxyReq: http.ClientRequest, parsed: URL): void {
+  const allSwaps: SwapInfo[] = [];
+  let postSwapBytes = '';
+
   // Swap tokens in URL (query params)
-  let urlChanged = false;
-  const newUrl = tokenStore.replaceAll(parsed.href);
-  if (newUrl !== parsed.href) {
-    urlChanged = true;
-    const newParsed = new URL(newUrl);
+  const urlResult = tokenStore.replaceAll(parsed.href);
+  postSwapBytes += urlResult.output;
+  if (urlResult.output !== parsed.href) {
+    const newParsed = new URL(urlResult.output);
     proxyReq.path = newParsed.pathname + newParsed.search;
+    allSwaps.push(...urlResult.swaps);
   }
 
   // Swap tokens in headers
   const headers = proxyReq.getHeaders();
   for (const [key, value] of Object.entries(headers)) {
     if (typeof value === 'string') {
-      const swapped = tokenStore.replaceAll(value);
-      if (swapped !== value) {
-        proxyReq.setHeader(key, swapped);
+      const headerResult = tokenStore.replaceAll(value);
+      postSwapBytes += '\n' + headerResult.output;
+      if (headerResult.output !== value) {
+        proxyReq.setHeader(key, headerResult.output);
+        allSwaps.push(...headerResult.swaps);
       }
     }
   }
 
-  if (urlChanged) {
-    console.log(`Token swapped in URL for ${parsed.hostname}`);
-  }
+  logSwapOutcome('http', parsed.hostname, allSwaps, postSwapBytes);
 }
 
 function swapTokensInRawHeaders(headerStr: string, hostname: string): string {
-  const swapped = tokenStore.replaceAll(headerStr);
-  if (swapped !== headerStr) {
-    console.log(`Token swapped in HTTPS request to ${hostname}`);
+  const result = tokenStore.replaceAll(headerStr);
+  logSwapOutcome('https', hostname, result.swaps, result.output);
+  return result.output;
+}
+
+/**
+ * Emit a single structured line per outbound request describing the swap outcome.
+ * `postSwapText` is the text *after* swaps were applied — any `tok_<hex>` literal
+ * remaining in it is un-swapped (TTL-expired token, stale tunnel, or a literal
+ * the agent typed by mistake). Never logs token values, IDs, or request bodies.
+ */
+function logSwapOutcome(
+  scheme: 'http' | 'https',
+  hostname: string,
+  swaps: SwapInfo[],
+  postSwapText: string,
+): void {
+  if (swaps.length > 0) {
+    const secrets = swaps.map(s => s.secretName).join(',');
+    const maxAge = Math.max(...swaps.map(s => s.ageMs));
+    console.log(`[swap] scheme=${scheme} host=${hostname} result=hit secrets=${secrets} max_age_ms=${maxAge}`);
   }
-  return swapped;
+
+  // Reset regex state — TOKEN_LITERAL_PATTERN is a /g RegExp shared across calls.
+  TOKEN_LITERAL_PATTERN.lastIndex = 0;
+  const unswapped = (postSwapText.match(TOKEN_LITERAL_PATTERN) ?? []).length;
+  if (unswapped > 0) {
+    console.warn(
+      `[swap] scheme=${scheme} host=${hostname} result=miss unswapped_tok_literals=${unswapped} ` +
+      `(TTL expiry, passthrough tunnel, or never-issued token — request reaching upstream with tok_… intact)`
+    );
+  }
 }
 
 // --- Start ---

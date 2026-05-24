@@ -127,7 +127,7 @@ describe('Vault Handler', () => {
     const { status, body } = await fetchJSON(port, '/_vault/github');
     expect(status).toBe(200);
     expect(body.token).toMatch(/^tok_/);
-    expect(body.expires_in).toBe(300);
+    expect(body.expires_in).toBe(900);
 
     // Token resolves to the real value
     const resolved = tokenStore.resolve(body.token as string);
@@ -265,7 +265,7 @@ describe('Vault Handler', () => {
 
     const url = `https://api.trello.com/1/boards?key=${b1.token}&token=${b2.token}`;
     const swapped = tokenStore.replaceAll(url);
-    expect(swapped).toBe('https://api.trello.com/1/boards?key=trello-key-123&token=trello-tok-456');
+    expect(swapped.output).toBe('https://api.trello.com/1/boards?key=trello-key-123&token=trello-tok-456');
   });
 
   // --- Fleet secrets (/_secret/{name}) ---
@@ -276,7 +276,7 @@ describe('Vault Handler', () => {
       const { status, body } = await fetchJSON(port, '/_secret/browserbase-api-key');
       expect(status).toBe(200);
       expect(body.token).toMatch(/^tok_/);
-      expect(body.expires_in).toBe(300);
+      expect(body.expires_in).toBe(900);
       expect(tokenStore.resolve(body.token as string)).toBe('bb_live_real_key_xyz');
     });
 
@@ -301,7 +301,7 @@ describe('Vault Handler', () => {
       const { body } = await fetchJSON(port, '/_secret/browserbase-api-key');
       const header = `x-bb-api-key: ${body.token}\r\n`;
       const swapped = tokenStore.replaceAll(header);
-      expect(swapped).toBe('x-bb-api-key: bb_live_xyz_real\r\n');
+      expect(swapped.output).toBe('x-bb-api-key: bb_live_xyz_real\r\n');
     });
   });
 
@@ -376,7 +376,7 @@ describe('Vault Handler', () => {
 
         expect(status).toBe(200);
         expect(body.token).toMatch(/^tok_/);
-        expect(body.expires_in).toBe(300);
+        expect(body.expires_in).toBe(900);
 
         // The tok_* should resolve to the new access token
         expect(tokenStore.resolve(body.token as string)).toBe('ya29.new-token');

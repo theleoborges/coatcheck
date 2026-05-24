@@ -1,8 +1,11 @@
 import { randomBytes } from 'node:crypto';
 
 const TOKEN_PREFIX = 'tok_';
-const DEFAULT_TTL_SECONDS = 300; // 5 minutes
+const DEFAULT_TTL_SECONDS = 900; // 15 minutes — covers conversational latency between get-secret.sh and outbound call
 const CLEANUP_INTERVAL_MS = 30_000; // 30 seconds
+
+/** Matches any issued token ID (32-byte hex). Used to spot un-swapped literals in outbound traffic. */
+export const TOKEN_LITERAL_PATTERN = /tok_[a-f0-9]{64}/g;
 
 interface TokenEntry {
   id: string;
@@ -15,6 +18,16 @@ interface TokenEntry {
 export interface IssuedToken {
   id: string;
   ttlSeconds: number;
+}
+
+export interface SwapInfo {
+  secretName: string;
+  ageMs: number;
+}
+
+export interface SwapResult {
+  output: string;
+  swaps: SwapInfo[];
 }
 
 /**
@@ -62,11 +75,14 @@ export class TokenStore {
   /**
    * Replace all active token IDs in a string with their real values.
    * This is the core of the proxy — scans outbound data for tokens and swaps them.
+   * Returns the rewritten string plus per-secret swap info so the call site can log
+   * which secrets were swapped and how old the tokens were at swap time (diagnostic).
    */
-  replaceAll(input: string): string {
-    if (this.tokens.size === 0) return input;
+  replaceAll(input: string): SwapResult {
+    if (this.tokens.size === 0) return { output: input, swaps: [] };
 
     let result = input;
+    const swaps: SwapInfo[] = [];
     const now = Date.now();
 
     for (const [tokenId, entry] of this.tokens) {
@@ -76,10 +92,11 @@ export class TokenStore {
       }
       if (result.includes(tokenId)) {
         result = result.replaceAll(tokenId, entry.realValue);
+        swaps.push({ secretName: entry.secretName, ageMs: now - entry.createdAt });
       }
     }
 
-    return result;
+    return { output: result, swaps };
   }
 
   /** Number of active (non-expired) tokens */

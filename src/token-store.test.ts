@@ -12,7 +12,7 @@ describe('TokenStore', () => {
     store = new TokenStore();
     const token = store.issue('my-secret', 'real-value-123');
     expect(token.id).toMatch(/^tok_[a-f0-9]{64}$/);
-    expect(token.ttlSeconds).toBe(300);
+    expect(token.ttlSeconds).toBe(900);
   });
 
   it('resolves a valid token to its real value', () => {
@@ -33,7 +33,8 @@ describe('TokenStore', () => {
 
     const input = `https://api.trello.com/1/boards?key=${t1.id}&token=${t2.id}`;
     const result = store.replaceAll(input);
-    expect(result).toBe('https://api.trello.com/1/boards?key=sk-real-key&token=usr-real-token');
+    expect(result.output).toBe('https://api.trello.com/1/boards?key=sk-real-key&token=usr-real-token');
+    expect(result.swaps.map(s => s.secretName).sort()).toEqual(['api-key', 'token']);
   });
 
   it('replaces tokens in headers', () => {
@@ -42,7 +43,8 @@ describe('TokenStore', () => {
 
     const header = `Authorization: Bearer ${token.id}`;
     const result = store.replaceAll(header);
-    expect(result).toBe('Authorization: Bearer secret_abc123');
+    expect(result.output).toBe('Authorization: Bearer secret_abc123');
+    expect(result.swaps).toEqual([{ secretName: 'notion-key', ageMs: expect.any(Number) }]);
   });
 
   it('returns input unchanged when no tokens match', () => {
@@ -50,13 +52,17 @@ describe('TokenStore', () => {
     store.issue('key', 'value');
 
     const input = 'no tokens here';
-    expect(store.replaceAll(input)).toBe(input);
+    const result = store.replaceAll(input);
+    expect(result.output).toBe(input);
+    expect(result.swaps).toEqual([]);
   });
 
   it('returns input unchanged when store is empty', () => {
     store = new TokenStore();
     const input = 'Authorization: Bearer tok_fake';
-    expect(store.replaceAll(input)).toBe(input);
+    const result = store.replaceAll(input);
+    expect(result.output).toBe(input);
+    expect(result.swaps).toEqual([]);
   });
 
   it('does not resolve expired tokens', async () => {
@@ -76,7 +82,9 @@ describe('TokenStore', () => {
     await new Promise(r => setTimeout(r, 10));
 
     const input = `key=${token.id}`;
-    expect(store.replaceAll(input)).toBe(input);
+    const result = store.replaceAll(input);
+    expect(result.output).toBe(input);
+    expect(result.swaps).toEqual([]);
   });
 
   it('tracks active token count', () => {
@@ -93,7 +101,9 @@ describe('TokenStore', () => {
     const token = store.issue('key', 'real');
 
     const input = `${token.id} and ${token.id}`;
-    expect(store.replaceAll(input)).toBe('real and real');
+    const result = store.replaceAll(input);
+    expect(result.output).toBe('real and real');
+    expect(result.swaps).toEqual([{ secretName: 'key', ageMs: expect.any(Number) }]);
   });
 
   it('uses custom TTL', () => {

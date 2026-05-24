@@ -122,12 +122,14 @@ export function handleVaultRequest(
           res.end(JSON.stringify({ value: fieldValue, cleartext: true }));
         } else {
           const token = tokenStore.issue(`${secretName}:${field}`, fieldValue);
+          console.log(`[issue] secret=${secretName}:${field} ttl_s=${token.ttlSeconds}`);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds }));
         }
       } else {
         // Simple secret — field param is ignored
         const token = tokenStore.issue(secretName, value);
+        console.log(`[issue] secret=${secretName} ttl_s=${token.ttlSeconds}`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds }));
       }
@@ -157,6 +159,7 @@ export function handleVaultRequest(
         return;
       }
       const token = tokenStore.issue(`fleet:${secretName}`, value);
+      console.log(`[issue] secret=fleet:${secretName} ttl_s=${token.ttlSeconds}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds }));
     }).catch(err => {
@@ -265,6 +268,7 @@ async function handleOAuthRefresh(
 
   // Issue a tok_* for the new access token
   const tok = tokenStore.issue(`${secretName}:access_token`, tokens.access_token);
+  console.log(`[issue] secret=${secretName}:access_token ttl_s=${tok.ttlSeconds} via=oauth_refresh`);
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ token: tok.id, expires_in: tok.ttlSeconds }));
 }
