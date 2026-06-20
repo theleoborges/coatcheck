@@ -170,6 +170,21 @@ export function handleVaultRequest(
     return true;
   }
 
+  // Mint session-scoped credential tokens for a web login (CDP injection).
+  // The credential is an ordinary multi-value secret (short handle like `coles`,
+  // since vault names can't be FQDNs) with `username` and `password` fields.
+  // Tokens are bound to the agent's CDP session so they only resolve on that
+  // session's WebSocket frames.
+  if (url === '/_vault/mint-tokens' && req.method === 'POST') {
+    readJsonBody(req).then(body => {
+      handleMintTokens(body, res, deps);
+    }).catch(() => {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+    });
+    return true;
+  }
+
   // Refresh an OAuth token
   const refreshMatch = url.match(/^\/_vault\/([^/?]+)\/refresh$/);
   if (refreshMatch && req.method === 'POST') {
@@ -185,6 +200,99 @@ export function handleVaultRequest(
   }
 
   return false;
+}
+
+/** Collect and JSON-parse a request body (rejects on malformed JSON). */
+function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', chunk => { raw += chunk; });
+    req.on('end', () => {
+      if (raw.trim() === '') return resolve({});
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        reject(new Error('invalid json'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+const MINT_DEFAULT_TTL_SECONDS = 600; // 10 minutes
+const MINT_MAX_TTL_SECONDS = 1800; // 30 minutes — cap to bound credential exposure
+
+/**
+ * Mint session-scoped username/password tokens for a stored web login.
+ *
+ * The credential is a normal multi-value secret (vault names are alphanumeric +
+ * dashes, so it's a short handle like `coles`, NOT a domain) with `username` +
+ * `password` fields. The user tells the agent which secret to use. Tokens are
+ * bound to the caller's CDP session id so they only substitute on that session's
+ * frames and are revoked when the session closes.
+ */
+function handleMintTokens(
+  body: Record<string, unknown>,
+  res: http.ServerResponse,
+  deps: VaultDeps,
+): void {
+  const { tokenStore, secretFetcher } = deps;
+  const secretName = typeof body.secretName === 'string' ? body.secretName : '';
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
+
+  if (!secretName || !sessionId) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Both `secretName` and `sessionId` are required' }));
+    return;
+  }
+
+  let ttl = MINT_DEFAULT_TTL_SECONDS;
+  if (typeof body.expires_in === 'number' && body.expires_in > 0) {
+    ttl = Math.min(body.expires_in, MINT_MAX_TTL_SECONDS);
+  }
+
+  secretFetcher.get(secretName).then(value => {
+    if (value === null) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: `No credential stored under '${secretName}'`,
+        vault_url: 'https://example.com/dashboard/integrations',
+      }));
+      return;
+    }
+
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      const obj = JSON.parse(value);
+      if (obj && typeof obj === 'object' && !Array.isArray(obj)) parsed = obj;
+    } catch {
+      // not JSON
+    }
+
+    const username = parsed?.username;
+    const password = parsed?.password;
+    if (!parsed || typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: `Secret '${secretName}' is not a web login — it must be a multi-value secret with 'username' and 'password' fields`,
+      }));
+      return;
+    }
+
+    const usernameToken = tokenStore.issueForSession(`${secretName}:username`, username, sessionId, ttl);
+    const passwordToken = tokenStore.issueForSession(`${secretName}:password`, password, sessionId, ttl);
+    console.log(`[mint] secret=${secretName} session=${sessionId} ttl_s=${ttl}`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      username_token: usernameToken.id,
+      password_token: passwordToken.id,
+      expires_in: ttl,
+    }));
+  }).catch(err => {
+    console.error(`Error minting tokens for '${secretName}':`, err);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Failed to mint tokens' }));
+  });
 }
 
 /**

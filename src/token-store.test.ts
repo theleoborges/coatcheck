@@ -112,4 +112,71 @@ describe('TokenStore', () => {
     expect(token.ttlSeconds).toBe(60);
     expect(store.resolve(token.id)).toBe('val');
   });
+
+  // --- Session-scoped tokens (CDP credential injection) ---
+
+  describe('session-scoped tokens', () => {
+    it('replaceAllForSession substitutes only its own session tokens', () => {
+      store = new TokenStore();
+      const a = store.issueForSession('site:password', 'pw-a', 'sess-1');
+      const b = store.issueForSession('site:password', 'pw-b', 'sess-2');
+
+      const input = `${a.id} ${b.id}`;
+      const r1 = store.replaceAllForSession(input, 'sess-1');
+      expect(r1.output).toBe(`pw-a ${b.id}`);
+      expect(r1.swaps.map(s => s.secretName)).toEqual(['site:password']);
+    });
+
+    it('replaceAll (HTTP path) never substitutes session-scoped tokens', () => {
+      store = new TokenStore();
+      const scoped = store.issueForSession('site:password', 'pw', 'sess-1');
+      const unscoped = store.issue('api-key', 'real-key');
+
+      const input = `${scoped.id} and ${unscoped.id}`;
+      const r = store.replaceAll(input);
+      // scoped token passes through untouched; only the unscoped one swaps
+      expect(r.output).toBe(`${scoped.id} and real-key`);
+      expect(r.swaps.map(s => s.secretName)).toEqual(['api-key']);
+    });
+
+    it('sessionValues returns active real values for the session only', () => {
+      store = new TokenStore();
+      store.issueForSession('site:username', 'alice', 'sess-1');
+      store.issueForSession('site:password', 'hunter2', 'sess-1');
+      store.issueForSession('other:password', 'nope', 'sess-2');
+
+      const values = store.sessionValues('sess-1').map(v => v.value).sort();
+      expect(values).toEqual(['alice', 'hunter2']);
+    });
+
+    it('sessionTokenIds returns active token ids for the session only', () => {
+      store = new TokenStore();
+      const a = store.issueForSession('site:username', 'alice', 'sess-1');
+      store.issueForSession('other:password', 'nope', 'sess-2');
+
+      expect(store.sessionTokenIds('sess-1')).toEqual([a.id]);
+    });
+
+    it('revokeSession evicts all of a session\'s tokens', () => {
+      store = new TokenStore();
+      const a = store.issueForSession('site:username', 'alice', 'sess-1');
+      const b = store.issueForSession('site:password', 'hunter2', 'sess-1');
+      const other = store.issueForSession('other:password', 'keep', 'sess-2');
+
+      const revoked = store.revokeSession('sess-1');
+      expect(revoked).toBe(2);
+      expect(store.resolve(a.id)).toBeNull();
+      expect(store.resolve(b.id)).toBeNull();
+      expect(store.resolve(other.id)).toBe('keep');
+    });
+
+    it('does not substitute expired session tokens', async () => {
+      store = new TokenStore();
+      const t = store.issueForSession('site:password', 'pw', 'sess-1', 0);
+      await new Promise(r => setTimeout(r, 10));
+      const r = store.replaceAllForSession(`x ${t.id}`, 'sess-1');
+      expect(r.output).toBe(`x ${t.id}`);
+      expect(store.sessionValues('sess-1')).toEqual([]);
+    });
+  });
 });

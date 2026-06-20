@@ -13,6 +13,17 @@ interface TokenEntry {
   realValue: string;
   createdAt: number;
   expiresAt: number;
+  /**
+   * When set, the token only substitutes on traffic for this CDP session
+   * (see replaceAllForSession). Unscoped tokens (sessionId undefined) keep the
+   * agent-wide behaviour used by the HTTP/platform paths.
+   */
+  sessionId?: string;
+}
+
+export interface SessionValue {
+  value: string;
+  secretName: string;
 }
 
 export interface IssuedToken {
@@ -61,6 +72,33 @@ export class TokenStore {
     return { id, ttlSeconds };
   }
 
+  /**
+   * Issue a token bound to a CDP session. The token only substitutes on traffic
+   * for that session (replaceAllForSession) and is dropped wholesale when the
+   * session closes (revokeSession). Used by the CDP credential-injection path so
+   * a token minted for one agent's browser session never resolves on another's.
+   */
+  issueForSession(
+    secretName: string,
+    realValue: string,
+    sessionId: string,
+    ttlSeconds = DEFAULT_TTL_SECONDS,
+  ): IssuedToken {
+    const id = TOKEN_PREFIX + randomBytes(32).toString('hex');
+    const now = Date.now();
+
+    this.tokens.set(id, {
+      id,
+      secretName,
+      realValue,
+      createdAt: now,
+      expiresAt: now + ttlSeconds * 1000,
+      sessionId,
+    });
+
+    return { id, ttlSeconds };
+  }
+
   /** Resolve a token to its real value, or null if expired/unknown */
   resolve(tokenId: string): string | null {
     const entry = this.tokens.get(tokenId);
@@ -90,6 +128,9 @@ export class TokenStore {
         this.tokens.delete(tokenId);
         continue;
       }
+      // Session-scoped tokens (CDP credential injection) must never substitute
+      // on the agent-wide HTTP/TLS path — they only resolve inside their WS session.
+      if (entry.sessionId !== undefined) continue;
       if (result.includes(tokenId)) {
         result = result.replaceAll(tokenId, entry.realValue);
         swaps.push({ secretName: entry.secretName, ageMs: now - entry.createdAt });
@@ -97,6 +138,78 @@ export class TokenStore {
     }
 
     return { output: result, swaps };
+  }
+
+  /**
+   * Like replaceAll, but only substitutes tokens minted for the given CDP
+   * session. Used on the CDP proxy's outbound (agent → Browserbase) leg so a
+   * session's credential tokens resolve only on that session's frames.
+   */
+  replaceAllForSession(input: string, sessionId: string): SwapResult {
+    if (this.tokens.size === 0) return { output: input, swaps: [] };
+
+    let result = input;
+    const swaps: SwapInfo[] = [];
+    const now = Date.now();
+
+    for (const [tokenId, entry] of this.tokens) {
+      if (now > entry.expiresAt) {
+        this.tokens.delete(tokenId);
+        continue;
+      }
+      if (entry.sessionId !== sessionId) continue;
+      if (result.includes(tokenId)) {
+        result = result.replaceAll(tokenId, entry.realValue);
+        swaps.push({ secretName: entry.secretName, ageMs: now - entry.createdAt });
+      }
+    }
+
+    return { output: result, swaps };
+  }
+
+  /**
+   * Active (non-expired) real values for a session, for the CDP proxy's inbound
+   * leg: the byte-level pre-scan / drop-frame floor and the echo-back redactor.
+   */
+  sessionValues(sessionId: string): SessionValue[] {
+    const out: SessionValue[] = [];
+    const now = Date.now();
+    for (const [tokenId, entry] of this.tokens) {
+      if (now > entry.expiresAt) {
+        this.tokens.delete(tokenId);
+        continue;
+      }
+      if (entry.sessionId !== sessionId) continue;
+      out.push({ value: entry.realValue, secretName: entry.secretName });
+    }
+    return out;
+  }
+
+  /** Active token ids minted for a session, for the keystroke fail-closed detector. */
+  sessionTokenIds(sessionId: string): string[] {
+    const out: string[] = [];
+    const now = Date.now();
+    for (const [tokenId, entry] of this.tokens) {
+      if (now > entry.expiresAt) {
+        this.tokens.delete(tokenId);
+        continue;
+      }
+      if (entry.sessionId !== sessionId) continue;
+      out.push(tokenId);
+    }
+    return out;
+  }
+
+  /** Evict every token minted for a session. Called when its WS connection closes. */
+  revokeSession(sessionId: string): number {
+    let revoked = 0;
+    for (const [tokenId, entry] of this.tokens) {
+      if (entry.sessionId === sessionId) {
+        this.tokens.delete(tokenId);
+        revoked++;
+      }
+    }
+    return revoked;
   }
 
   /** Number of active (non-expired) tokens */
