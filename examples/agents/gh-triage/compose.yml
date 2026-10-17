@@ -29,6 +29,7 @@ services:
       - NO_PROXY=coatcheck,localhost,127.0.0.1
       - NODE_USE_ENV_PROXY=1
       - GH_REPO=${GH_REPO:-theleoborges/coatcheck}
+      - AGENT_MAX_TURNS=${AGENT_MAX_TURNS:-30}
       - AGENT_TRANSCRIPT=/out/transcript.json
     volumes:
       - ./${TASK:-task.md}:/task.md:ro

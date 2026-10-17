@@ -15,7 +15,8 @@ RUN npm ci --omit=dev
 COPY harness/src/ ./src/
 COPY harness/system.md ./system.md
 COPY entrypoint.sh /usr/local/bin/agent-entrypoint
-RUN mkdir -p /work /out && chown node:node /work /out
+# ESM imports ignore NODE_PATH: expose the installed packages (playwright-core) to scripts in /work.
+RUN mkdir -p /work /out && ln -s /app/node_modules /work/node_modules && chown -h node:node /work /work/node_modules /out
 # Root only for update-ca-certificates in the entrypoint; the agent runs as `node`.
 ENTRYPOINT ["agent-entrypoint"]
 CMD ["node", "/app/src/agent.ts", "/task.md"]
