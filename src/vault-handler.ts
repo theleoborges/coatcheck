@@ -351,8 +351,9 @@ async function handleOAuthRefresh(
   });
 
   if (!tokenRes.ok) {
-    const errorText = await tokenRes.text();
-    console.error(`OAuth refresh failed for ${secretName}:`, tokenRes.status, errorText);
+    // Never log the body: providers can echo client ids or fragments of the grant.
+    const errorCode = oauthErrorCode(await tokenRes.text().catch(() => ''));
+    console.error(`OAuth refresh failed for ${secretName}: status=${tokenRes.status} error=${errorCode}`);
     res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Token refresh failed', status: tokenRes.status }));
     return;
@@ -379,4 +380,22 @@ async function handleOAuthRefresh(
   console.log(`[issue] secret=${secretName}:access_token ttl_s=${tok.ttlSeconds} via=oauth_refresh`);
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ token: tok.id, expires_in: tok.ttlSeconds }));
+}
+
+const OAUTH_ERROR_CODE_MAX = 64;
+
+/**
+ * Extract the RFC 6749 `error` code from a token-endpoint error body, safe to
+ * log: only `[A-Za-z0-9_.-]`, at most 64 chars. Anything else becomes `unknown`.
+ */
+export function oauthErrorCode(body: string): string {
+  let code: unknown;
+  try {
+    code = (JSON.parse(body) as { error?: unknown })?.error;
+  } catch {
+    return 'unparseable';
+  }
+  if (typeof code !== 'string' || code.length === 0) return 'unknown';
+  const safe = code.slice(0, OAUTH_ERROR_CODE_MAX);
+  return /^[A-Za-z0-9_.-]+$/.test(safe) ? safe : 'unknown';
 }

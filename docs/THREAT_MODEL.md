@@ -123,6 +123,7 @@ ticket into a request to any destination.
 | Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`src/mitm.ts`) |
 | CONNECT targets cannot reach a shell or the filesystem | Targets are parsed strictly (RFC 1123 DNS name or IP literal, port 1–65535; otherwise `400`) (`src/connect-target.ts`). Certificates are generated in-process with WebCrypto; leaf keys stay in memory (LRU, 1000 entries) and only the CA is written to disk, when `CA_DIR` is set (`src/ca.ts`). |
 | Logs carry no values | Swap logs record secret names, host, and ticket age only (`src/swap-log.ts`) |
+| OAuth refresh failures don't log provider bodies | Only the HTTP status and the RFC 6749 `error` code (sanitised to `[A-Za-z0-9_.-]`, at most 64 chars) are logged (`oauthErrorCode`, `src/vault-handler.ts`) |
 
 ## Known gaps
 
@@ -192,14 +193,6 @@ mildly protective. Related: `Transfer-Encoding: chunked` request bodies are not
 parsed (`mitm.ts`), so a chunked body can misalign the request parser
 on a keep-alive tunnel. The MITM also assumes HTTP/1.1 request/response:
 WebSocket upgrades or other protocols tunneled through a MITM'd CONNECT stall.
-
-### LOW: OAuth refresh failure logs the provider's response body
-
-`handleOAuthRefresh` logs `errorText` verbatim when the token endpoint returns
-non-2xx (`vault-handler.ts:353-355`). Providers usually return a short error
-JSON, but anything a provider echoes (client id, a fragment of the grant)
-lands in coatcheck's logs. Log status and a truncated, parsed `error` field
-instead.
 
 ### LOW: secret names are passed through to the store unvalidated
 

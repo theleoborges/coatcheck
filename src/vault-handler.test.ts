@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { handleVaultRequest, VaultDeps } from './vault-handler.js';
+import { oauthErrorCode, handleVaultRequest, VaultDeps } from './vault-handler.js';
 import { TokenStore } from './token-store.js';
 
 // Save real fetch before any tests can mock it
@@ -431,6 +431,31 @@ describe('Vault Handler', () => {
       }
     });
 
+    it('logs only the status and a sanitised error code when refresh fails', async () => {
+      const originalFetch = globalThis.fetch;
+      const echoed = JSON.stringify({
+        error: 'invalid_grant',
+        error_description: 'Bad refresh token 1//0g-real-refresh-token for client 123-secret.apps',
+        client_secret: 'echoed-client-secret',
+      });
+      globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 400, text: async () => echoed }) as unknown as typeof fetch;
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      try {
+        await setup({ google: googleSecret });
+        const { status } = await fetchJSON(port, '/_vault/google/refresh', 'POST');
+        expect(status).toBe(502);
+        const logged = errors.mock.calls.map(c => c.map(String).join(' ')).join('\n');
+        expect(logged).toContain('status=400 error=invalid_grant');
+        expect(logged).not.toContain('real-refresh-token');
+        expect(logged).not.toContain('echoed-client-secret');
+        expect(logged).not.toContain('error_description');
+      } finally {
+        errors.mockRestore();
+        globalThis.fetch = originalFetch;
+      }
+    });
+
     it('refreshes token, updates vault, and returns cct_*', async () => {
       const originalFetch = globalThis.fetch;
       globalThis.fetch = vi.fn().mockResolvedValue({
@@ -502,5 +527,19 @@ describe('Vault Handler', () => {
         globalThis.fetch = originalFetch;
       }
     });
+  });
+});
+
+describe('oauthErrorCode', () => {
+  it('returns the RFC 6749 error code', () => {
+    expect(oauthErrorCode('{"error":"invalid_grant","error_description":"x"}')).toBe('invalid_grant');
+  });
+
+  it('never returns free text from the body', () => {
+    expect(oauthErrorCode('not json, maybe a token 1//abc')).toBe('unparseable');
+    expect(oauthErrorCode('{"error_description":"secret"}')).toBe('unknown');
+    expect(oauthErrorCode('{"error":"bad grant 1//0g-secret"}')).toBe('unknown');
+    expect(oauthErrorCode('{"error":{"code":1}}')).toBe('unknown');
+    expect(oauthErrorCode(`{"error":"${'a'.repeat(200)}"}`)).toBe('a'.repeat(64));
   });
 });

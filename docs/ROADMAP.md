@@ -49,7 +49,7 @@ rejected, are in `docs/design/v1-decisions.md`.
    restart. (`ck_` was rejected because it collides with WooCommerce consumer
    keys.)
 
-5. **Stop logging OAuth error bodies.** On a non-2xx refresh,
+5. **[Done]** **Stop logging OAuth error bodies.** On a non-2xx refresh,
    `handleOAuthRefresh` logs the status and a parsed, truncated `error` code,
    and nothing else.
 
