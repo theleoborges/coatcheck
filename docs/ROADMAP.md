@@ -148,7 +148,7 @@ rejected, are in `docs/design/v1-decisions.md`.
     - after `101 Switching Protocols` the connection becomes a raw pipe, so
       WebSockets work through the MITM.
 
-11. **Authenticate the listeners.** `COATCHECK_API_TOKEN` is checked as a
+11. **[Done]** **Authenticate the listeners.** `COATCHECK_API_TOKEN` is checked as a
     bearer token on the vault API and as `Proxy-Authorization` on the proxy.
     Startup is refused on a non-loopback bind without it.
 

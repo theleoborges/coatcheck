@@ -548,6 +548,90 @@ describe('coatcheck server: MITM policy', () => {
   });
 });
 
+describe('coatcheck server: API token', () => {
+  const TOKEN = 'test-api-token-0123456789abcdef0123456789';
+  const basic = (user: string, pass: string) => `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
+  const provider = () => createMemoryProvider({ secrets: { 'github-token': 'ghp_REAL_VALUE' } });
+  const policy = parsePolicy(JSON.stringify({ secrets: { 'github-token': { allowed_hosts: ['api.github.com'] } } }), []);
+
+  /** CONNECT with optional extra header lines; resolves with the status line. */
+  function connectWith(proxyPort: number, target: string, extra = ''): Promise<{ status: string; socket: net.Socket }> {
+    return new Promise((resolve, reject) => {
+      const socket = net.connect(proxyPort, '127.0.0.1', () => {
+        socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n${extra}\r\n`);
+      });
+      cleanups.push(() => { socket.destroy(); });
+      socket.once('data', d => resolve({ status: d.toString().split('\r\n')[0], socket }));
+      socket.once('error', reject);
+    });
+  }
+
+  it('refuses to mint tickets without the bearer token (the open-listener attack)', async () => {
+    captureLogs();
+    const { tokenStore, port } = await startProxy({ provider: provider(), policy, apiToken: TOKEN });
+    const attempts: Array<[string, RequestInit]> = [
+      ['/_vault/github-token', {}],
+      ['/_vault/github-token', { headers: { authorization: 'Bearer wrong-token-0123456789abcdef0123456789' } }],
+      ['/_vault/github-token', { headers: { authorization: TOKEN } }], // no scheme
+      ['/_vault/github-token', { headers: { 'proxy-authorization': `Bearer ${TOKEN}` } }], // wrong header
+      ['/_vault', {}],
+      ['/_vault/github-token?check=1', {}],
+      ['/_vault/mint-tokens', { method: 'POST', body: '{"secretName":"github-token","sessionId":"s"}' }],
+      ['/_vault/github-token/refresh', { method: 'POST' }],
+      ['/_secret/github-token', {}],
+    ];
+    for (const [path, init] of attempts) {
+      const res = await fetch(`http://127.0.0.1:${port}${path}`, init);
+      expect(res.status, path).toBe(401);
+      expect(res.headers.get('www-authenticate')).toBe('Bearer realm="coatcheck"');
+    }
+    expect(tokenStore.size).toBe(0);
+
+    const ok = await fetch(`http://127.0.0.1:${port}/_vault/github-token`, { headers: { authorization: `Bearer ${TOKEN}` } });
+    expect(ok.status).toBe(200);
+    expect(tokenStore.size).toBe(1);
+  });
+
+  it('keeps /_health and /_ca open for probes and CA bootstrap', async () => {
+    const { port } = await startProxy({ apiToken: TOKEN });
+    expect((await fetch(`http://127.0.0.1:${port}/_health`)).status).toBe(200);
+    expect(await (await fetch(`http://127.0.0.1:${port}/_ca`)).text()).toBe(proxyCa.caCertPem);
+  });
+
+  it('refuses CONNECT without proxy credentials, before dialling the upstream', async () => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ apiToken: TOKEN, mitm: 'always' });
+    for (const extra of ['', `Proxy-Authorization: ${basic('coatcheck', 'wrong')}\r\n`, `Authorization: Bearer ${TOKEN}\r\n`]) {
+      const { status } = await connectWith(port, `127.0.0.1:${upstream.port}`, extra);
+      expect(status, extra).toBe('HTTP/1.1 407 Proxy Authentication Required');
+    }
+    expect(upstream.connections()).toBe(0);
+    expect(logs).toContainEqual(expect.stringContaining('[auth] rejected CONNECT'));
+    expect(logs.join('\n')).not.toContain(TOKEN);
+
+    // Basic with the token as password (what curl/requests send for http://user:token@proxy), or Bearer.
+    for (const header of [basic('coatcheck', TOKEN), basic('', TOKEN), `Bearer ${TOKEN}`]) {
+      const { status } = await connectWith(port, `127.0.0.1:${upstream.port}`, `Proxy-Authorization: ${header}\r\n`);
+      expect(status, header).toBe('HTTP/1.1 200 Connection Established');
+    }
+  });
+
+  it('refuses forward requests without proxy credentials and never forwards the credential', async () => {
+    captureLogs();
+    const upstream = await startHttpUpstream();
+    const { port } = await startProxy({ apiToken: TOKEN });
+    const denied = await viaProxy(port, `http://127.0.0.1:${upstream.port}/`);
+    expect(denied.status).toBe(407);
+    expect(denied.headers['proxy-authenticate']).toBe('Basic realm="coatcheck"');
+    expect(upstream.received).toHaveLength(0);
+
+    const ok = await viaProxy(port, `http://127.0.0.1:${upstream.port}/`, { 'proxy-authorization': basic('coatcheck', TOKEN) });
+    expect(ok.status).toBe(200);
+    expect(upstream.received[0].headers).not.toHaveProperty('proxy-authorization');
+  });
+});
+
 describe('coatcheck server: plain HTTP', () => {
   it('forwards requests and swaps tickets in the URL and headers', async () => {
     const received: Echo[] = [];

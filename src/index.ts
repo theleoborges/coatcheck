@@ -46,6 +46,7 @@ const coatcheck = createCoatcheck({
   allowUnboundSecrets: config.allowUnboundSecrets,
   mitm: config.mitm,
   passthroughHosts: config.passthroughHosts,
+  apiToken: config.apiToken,
 });
 
 const { port } = await coatcheck.listen(config.port, config.bindHost);
@@ -54,6 +55,9 @@ console.log(`Vault API: http://localhost:${port}/_vault`);
 console.log(config.policyFile
   ? `Policy: ${config.policyFile} (${config.policy.secrets.length} secret rule(s), ${config.policy.shared.size} shared secret(s))`
   : 'Policy: none (no shared secrets; set COATCHECK_POLICY_FILE)');
+console.log(config.apiToken
+  ? 'API token: required (vault API: Authorization: Bearer; proxy: Proxy-Authorization)'
+  : 'API token: none (listeners are open to anything on this host; loopback only)');
 console.log(`MITM: ${config.mitm}${config.passthroughHosts.length ? ` (${config.passthroughHosts.length} passthrough host pattern(s))` : ''}`);
 if (config.allowUnboundSecrets) {
   console.warn('WARNING: COATCHECK_ALLOW_UNBOUND_SECRETS=1: secrets with no allowed hosts get tickets that swap for ANY host');

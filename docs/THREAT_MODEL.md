@@ -179,14 +179,28 @@ rejects it). `COATCHECK_MITM=always` intercepts everything, and
 `COATCHECK_PASSTHROUGH_HOSTS` exempts cert-pinned hosts in both modes (tickets
 sent there are never swapped).
 
-### MEDIUM: vault endpoints are unauthenticated
+### LOW: listeners are open on loopback without a token
 
-`/_vault`, `/_vault/{name}`, `/_vault/mint-tokens`, `/_vault/{name}/refresh`,
-and `/_secret/{name}` accept any caller (`vault-handler.ts:26-203`). Isolation
-rests entirely on the listener binding to `127.0.0.1` (`index.ts`). Setting
-`COATCHECK_BIND_HOST=0.0.0.0` (intended for local dev) lets anything that can
-reach the port mint tickets and use them against each secret's allowed hosts. The CDP listener uses the same bind host and authenticates only by
-sid.
+Fixed in part by roadmap item 11. With `COATCHECK_API_TOKEN` set, the vault
+API requires `Authorization: Bearer` and the proxy requires
+`Proxy-Authorization` (Basic with the token as password, or Bearer); failures
+get `401`/`407` before any provider call or upstream dial, and the token is
+compared in constant time and never logged (`auth.ts`, `server.ts`).
+`loadConfig` refuses to start on a non-loopback bind (`0.0.0.0`, `::`, any
+non-`127/8` address or hostname) without a token. What remains:
+
+- Without a token (allowed on loopback only), any process that can reach the
+  loopback port, which in the sidecar pattern is anything in the agent's
+  network namespace, can mint tickets. That is the agent itself, so this is
+  the intended trust boundary, not a bypass; host binding limits what the
+  tickets can do.
+- `/_health` and `/_ca` are always open (health probes, CA bootstrap). They
+  reveal the active-ticket count and the public CA certificate.
+- The token is one shared secret with no per-client identity or scope; an
+  agent that is given it can do everything any other client can.
+- The CDP listener authenticates only by sid, a 96-bit capability delivered
+  inside an intercepted browser-service response (design §4, "API token
+  details").
 
 ### LOW: Host header not checked against the CONNECT target
 

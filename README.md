@@ -36,6 +36,7 @@ It works like a coat check. You hand over the coat and get a ticket. The ticket 
 > The only secret backend right now is **AWS**: SSM Parameter Store for named secrets and Secrets Manager for shared keys. For local use, the example points coatcheck at [LocalStack](https://github.com/localstack/localstack). An env/file provider is planned so you can run without AWS.
 
 ```bash
+export COATCHECK_API_TOKEN=$(openssl rand -hex 32)   # required: the demo listens on 0.0.0.0
 docker compose -f docker-compose.example.yml up --build
 ```
 
@@ -43,21 +44,21 @@ This starts coatcheck on `localhost:3128` and LocalStack. It also seeds two demo
 
 ```bash
 # 1. Get a ticket
-curl -s localhost:3128/_vault/example-api-key
+curl -s -H "Authorization: Bearer $COATCHECK_API_TOKEN" localhost:3128/_vault/example-api-key
 # {"token":"cct_3b1e…","expires_in":900,"allowed_hosts":["httpbin.org"]}
 
 # 2. Fetch coatcheck's CA
 curl -s localhost:3128/_ca > /tmp/coatcheck-ca.crt
 
-# 3. Use the ticket as if it were the real key
-curl -s --proxy http://localhost:3128 --cacert /tmp/coatcheck-ca.crt \
+# 3. Use the ticket as if it were the real key (the API token is the proxy password)
+curl -s --proxy http://coatcheck:$COATCHECK_API_TOKEN@localhost:3128 --cacert /tmp/coatcheck-ca.crt \
   -H "Authorization: Bearer cct_3b1e…" https://httpbin.org/headers
 ```
 
 httpbin echoes the request headers, so step 3 shows the **real** value arriving upstream. The demo policy (`examples/policy.example.json`) binds `example-api-key` to `httpbin.org`, so the same ticket sent anywhere else is refused:
 
 ```bash
-curl -s --proxy http://localhost:3128 --cacert /tmp/coatcheck-ca.crt \
+curl -s --proxy http://coatcheck:$COATCHECK_API_TOKEN@localhost:3128 --cacert /tmp/coatcheck-ca.crt \
   -H "Authorization: Bearer cct_3b1e…" https://example.org/
 # HTTP 403, X-Coatcheck-Denied: host-mismatch
 # {"error":"Secret 'example-api-key' is not allowed for host 'example.org'",…}
@@ -84,7 +85,7 @@ If `COATCHECK_AWS_ROLE_ARN` is set, coatcheck assumes that role through STS (1-h
 
 ## HTTP API
 
-The API is served on the proxy port (default `127.0.0.1:3128`). **It has no authentication.** Anything that can reach the port can mint tickets, so keep it on loopback inside the agent's network namespace.
+The API is served on the proxy port (default `127.0.0.1:3128`). With `COATCHECK_API_TOKEN` set, every route except `/_health` and `/_ca` needs `Authorization: Bearer <token>` (otherwise `401`), and the proxy needs `Proxy-Authorization` (otherwise `407`): `Basic` with the token as the password, which is what clients send for `HTTPS_PROXY=http://coatcheck:<token>@host:3128`, or `Bearer <token>`. Without a token anything that can reach the port can mint tickets, so coatcheck only starts without one on a loopback bind (`127.0.0.0/8`, `::1`, `localhost`). The CDP listener is authenticated by its unguessable session id, not the token.
 
 | Method & path | Response | Notes |
 |---|---|---|
@@ -101,7 +102,7 @@ The API is served on the proxy port (default `127.0.0.1:3128`). **It has no auth
 
 Secret names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` after URL-decoding; anything else (including `/` or a leading `.`) gets `400` before the backend is consulted. `refresh` returns `501` when the configured backend is read-only.
 
-Errors are JSON `{"error":…}` with status 400, 403, 404, 500, 501, or 502.
+Errors are JSON `{"error":…}` with status 400, 401, 403, 404, 500, 501, or 502.
 
 ## Configuration
 
@@ -110,7 +111,8 @@ Errors are JSON `{"error":…}` with status 400, 403, 404, 500, 501, or 502.
 | `COATCHECK_PROVIDER` | (required) | Secret backend. Currently `aws`. |
 | `COATCHECK_AGENT_ID` | (unset) | Optional agent identity: used in logs, in `{agentId}` templates, and in the default STS session name. Same character rules as secret names. |
 | `COATCHECK_PORT` | `3128` | Port for the proxy and the HTTP API. |
-| `COATCHECK_BIND_HOST` | `127.0.0.1` | Bind address for the proxy and the CDP proxy. Use `0.0.0.0` only for local docker-compose. |
+| `COATCHECK_BIND_HOST` | `127.0.0.1` | Bind address for the proxy and the CDP proxy. Any non-loopback address (including `0.0.0.0`) requires `COATCHECK_API_TOKEN`. |
+| `COATCHECK_API_TOKEN` | (unset) | Shared secret for the API (`Authorization: Bearer`) and the proxy (`Proxy-Authorization`, Basic with the token as password, or Bearer). At least 32 characters, no whitespace (`openssl rand -hex 32`). Required when the bind host isn't loopback; enforced on every route except `/_health` and `/_ca` whenever set. |
 | `COATCHECK_TICKET_TTL_SECONDS` | `900` | Lifetime of tickets from `/_vault` and `/_secret`. |
 | `COATCHECK_SECRET_CACHE_TTL_SECONDS` | `300` | How long backend reads are cached; `0` disables the cache. |
 | `COATCHECK_POLICY_FILE` | (unset) | JSON [policy file](#policy-file): allowed hosts per secret and the shared-secret allowlist. Read once at startup; an invalid file stops startup. |
@@ -254,7 +256,7 @@ coatcheck is **pre-1.0**. The HTTP API, ticket format (`cct_…`), and configura
 - **Request bodies are not substituted.** Only the request line (URL) and headers are. `Transfer-Encoding: chunked` request bodies on the MITM path are not parsed, which can misframe keep-alive connections.
 - **`HTTPS_PROXY` is advisory.** A process that ignores it bypasses coatcheck, which means no substitution and also no protection. Pair coatcheck with egress enforcement (network policy, firewall, or security group) so the agent can reach the internet only through the proxy.
 - **Interception follows the bindings, not the request.** In the default `bound` mode, a keep-alive tunnel opened to a host before any ticket for it existed (a host bound only by a secret's `_allowed_hosts`) stays a raw tunnel, so a ticket later sent down it reaches the upstream unswapped. Clients that pin certificates fail on intercepted hosts unless listed in `COATCHECK_PASSTHROUGH_HOSTS`. Intercepted tunnels speak HTTP/1.1 only (ALPN), and WebSocket frames after an upgrade are not inspected.
-- **The API is unauthenticated.** Any process that can reach the port can list secret names and mint tickets. Keep coatcheck on loopback.
+- **Without `COATCHECK_API_TOKEN`, any local process can mint tickets.** That is the intended sidecar setup (loopback, shared network namespace), and coatcheck refuses to start off loopback without a token. The token is one shared secret: there are no per-client identities or scopes.
 - **The secret backend is AWS-only**, with fixed path prefixes, pending a provider interface (env/file first, then others).
 - **Browserbase is the only browser adapter.** The `connectUrl` rewrite is tied to `api.browserbase.com`.
 - **CDP v1 limits:** one session at a time, no origin binding yet (login tickets record their allowed hosts, but a login ticket still fills any page in that session), no 2FA, no `page.type()` support, and no screenshot redaction.

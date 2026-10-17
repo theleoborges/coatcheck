@@ -51,6 +51,7 @@ describe('loadConfig', () => {
       COATCHECK_ALLOW_UNBOUND_SECRETS: '1',
       COATCHECK_MITM: 'always',
       COATCHECK_PASSTHROUGH_HOSTS: 'pinned.example.com, *.Pinned.example.org',
+      COATCHECK_API_TOKEN: 'a'.repeat(64),
     });
     expect(config).toEqual({
       provider: 'aws',
@@ -70,6 +71,7 @@ describe('loadConfig', () => {
         { kind: 'exact', host: 'pinned.example.com', plaintext: false },
         { kind: 'wildcard', host: 'pinned.example.org', plaintext: false },
       ],
+      apiToken: 'a'.repeat(64),
     });
   });
 
@@ -107,6 +109,25 @@ describe('loadConfig', () => {
     expect(found).toHaveLength(10);
     expect(found).toContain("COATCHECK_MITM must be 'bound' or 'always' (got 'sometimes')");
     expect(found).toContainEqual(expect.stringContaining("COATCHECK_PASSTHROUGH_HOSTS entry 'http://x.example.com': must not have a scheme"));
+  });
+
+  it('refuses a non-loopback bind without an API token', () => {
+    for (const host of ['0.0.0.0', '::', '[::]', '10.0.0.5', 'coatcheck', '128.0.0.1']) {
+      expect(problems({ ...base, COATCHECK_BIND_HOST: host }), host)
+        .toEqual([expect.stringContaining('COATCHECK_API_TOKEN is required when COATCHECK_BIND_HOST is not loopback')]);
+      expect(loadConfig({ ...base, COATCHECK_BIND_HOST: host, COATCHECK_API_TOKEN: 'x'.repeat(32) }).apiToken).toBe('x'.repeat(32));
+    }
+    for (const host of ['127.0.0.1', '127.1.2.3', '::1', '[::1]', 'localhost', 'LOCALHOST']) {
+      expect(loadConfig({ ...base, COATCHECK_BIND_HOST: host }).apiToken, host).toBeUndefined();
+    }
+  });
+
+  it('rejects weak API tokens without echoing them', () => {
+    for (const token of ['short-token', `${'a'.repeat(32)} b`]) {
+      const found = problems({ ...base, COATCHECK_API_TOKEN: token });
+      expect(found, token).toEqual([expect.stringContaining('COATCHECK_API_TOKEN must be at least 32 characters')]);
+      expect(found.join('\n')).not.toContain(token);
+    }
   });
 
   it('rejects an agent id that could escape a store path', () => {

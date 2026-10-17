@@ -317,6 +317,41 @@ When listing secrets, it ignores variables whose names don't map back. The
 provider's README and the core README both document this. The `file` provider
 uses core's name rules, because JSON keys need no mapping.
 
+### API token details (recorded while implementing roadmap item 11)
+
+- **Proxy credentials use Basic as well as Bearer.** `Proxy-Authorization:
+  Basic base64(user:TOKEN)` is accepted with any user name, and so is
+  `Bearer TOKEN`. Rationale: unmodified tools only send proxy credentials
+  taken from the proxy URL (`HTTPS_PROXY=http://coatcheck:$TOKEN@host:3128`),
+  and they send them as Basic. Bearer covers clients that set the header
+  themselves.
+- **The vault API takes `Authorization: Bearer TOKEN` only.** It is called
+  directly, not through a proxy, so the client always controls the header.
+- **`/_health` and `/_ca` stay open.** Orchestrator health checks (the
+  Dockerfile `HEALTHCHECK`, ECS, Kubernetes probes) can't easily carry a
+  secret, and the CA certificate is public by nature. Neither reveals a
+  secret; `/_health` reveals only the ticket count.
+- **Rejections:** `401` with `WWW-Authenticate: Bearer realm="coatcheck"` on
+  the vault API; `407` with `Proxy-Authenticate: Basic realm="coatcheck"` on
+  forward requests and `CONNECT`, which are refused before any upstream dial.
+  Comparison is constant-time over SHA-256 digests. The token is never
+  logged.
+- **When a token is set it is enforced on every bind host**, loopback
+  included. Without one, the listeners are open, which `loadConfig` allows
+  only on loopback (`127.0.0.0/8`, `::1`, `localhost`). Any other bind host,
+  including `0.0.0.0`, `::` and hostnames, needs a token.
+- **The token must be at least 32 characters with no whitespace.** A short
+  token on a network listener is guessable, and whitespace can't survive the
+  header and URL forms. Suggested: `openssl rand -hex 32`.
+- **The CDP listener stays authenticated by its sid.** The sid is a 96-bit
+  capability that only reaches the agent inside an intercepted, authenticated
+  browser-service response, and Playwright's `connectOverCDP` URL is the only
+  thing every client can carry. Revisit if a CDP adapter without that flow
+  appears.
+- The demo `docker-compose.example.yml` binds `0.0.0.0`, so it requires
+  `COATCHECK_API_TOKEN` from the environment instead of hard-coding one: a
+  published demo token would be no authentication at all.
+
 Policy file:
 
 ```json
