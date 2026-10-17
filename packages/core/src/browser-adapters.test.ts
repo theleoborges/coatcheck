@@ -46,11 +46,29 @@ describe('Browserbase adapter', () => {
     expect(body).toEqual({ keep: 'https://example.com/?wss=connect.example.org/x' });
   });
 
+  it('deletes seleniumRemoteUrl from a session response (an HTTP route past the CDP proxy)', () => {
+    const { body, changed } = rewrite({ id: 's1', status: 'RUNNING', seleniumRemoteUrl: 'https://connect.browserbase.com/webdriver', signingKey: 'SK' });
+    expect(changed).toBe(true);
+    expect(body).toEqual({ id: 's1', status: 'RUNNING' });
+  });
+
   it('leaves unrelated responses unchanged', () => {
-    const input = { id: 's1', status: 'RUNNING', region: 'us-west-2', seleniumRemoteUrl: 'http://connect.browserbase.com/webdriver' };
+    const input = { id: 's1', status: 'RUNNING', region: 'us-west-2', projectId: 'p' };
     const { body, changed } = rewrite({ ...input });
     expect(changed).toBe(false);
     expect(body).toEqual(input);
+  });
+
+  it('strips extensionId from a session-create request body (top level and browserSettings)', () => {
+    const body: Record<string, unknown> = { projectId: 'p', extensionId: 'ext-1', browserSettings: { extensionId: 'ext-2', viewport: { width: 1280, height: 720 } } };
+    const changed = browserbaseAdapter.rewriteRequestJson!(body);
+    expect(changed).toBe(true);
+    expect(body).toEqual({ projectId: 'p', browserSettings: { viewport: { width: 1280, height: 720 } } });
+  });
+
+  it('leaves a request body with no extension params unchanged', () => {
+    const body = { projectId: 'p', browserSettings: { viewport: { width: 1280, height: 720 } } };
+    expect(browserbaseAdapter.rewriteRequestJson!({ ...body, browserSettings: { ...body.browserSettings } })).toBe(false);
   });
 
   it('defaults to api.browserbase.com and allows a host override', () => {

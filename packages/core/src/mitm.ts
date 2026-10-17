@@ -43,6 +43,11 @@ export const MAX_HEAD_BYTES = 64 * 1024;
 /** Client bytes held before the upstream connects; past this the client is paused. */
 const MAX_PENDING_BYTES = 1024 * 1024;
 
+/** True for a JSON request content type (so a browser adapter can rewrite the body). */
+function isJsonContentType(ct: string | undefined): boolean {
+  return ct !== undefined && /^application\/(.*\+)?json\b/i.test(ct.trim());
+}
+
 /** The body of the request being read, after its head. */
 type BodyState =
   /** Forwarded as it arrives. */
@@ -58,6 +63,8 @@ type BodyState =
       raw: Buffer[];
       rawBytes: number;
       data: Buffer[];
+      /** Browser-adapter request-body rewrite (strip extension params); mutates parsed JSON in place. */
+      adapterReq?: (body: unknown) => boolean;
     };
 
 /**
@@ -238,9 +245,15 @@ export function createConnectHandler(deps: MitmDeps) {
         const remaining = framing.kind === 'length' ? framing.length : 0;
         const decoder = framing.kind === 'chunked' ? new ChunkedDecoder() : undefined;
         const hasBody = decoder !== undefined || remaining > 0;
-        if (hasBody && tokenStore.hasLiveBodyTicketFor(swapTarget)) {
+        // Buffer the body when a swap_body ticket could apply, or when a browser
+        // adapter wants to strip parameters from a JSON request body (e.g.
+        // extension params on a session-create POST).
+        const reqAdapter = cdp ? adapterFor(hostname) : undefined;
+        const wantsAdapterReq = !!reqAdapter?.rewriteRequestJson && isJsonContentType(head.header('content-type'));
+        if (hasBody && (tokenStore.hasLiveBodyTicketFor(swapTarget) || wantsAdapterReq)) {
           body = {
             mode: 'buffer', remaining, decoder, head, headOutcome: swapped, raw: [], rawBytes: 0, data: [],
+            adapterReq: wantsAdapterReq ? reqAdapter!.rewriteRequestJson!.bind(reqAdapter) : undefined,
           };
           continue;
         }
@@ -333,21 +346,38 @@ export function createConnectHandler(deps: MitmDeps) {
 
       let head = outcome.output;
       let outBody: Buffer = Buffer.concat(state.raw);
+      /** The decoded body as it stands (after any ticket body-swap). */
+      let effective: Buffer | null = null;
       if (bodySwap && bodySwap.result.swaps.length > 0) {
-        const swapped = bodySwap.body;
+        effective = bodySwap.body;
+      } else if (state.adapterReq) {
+        effective = decoded;
+      }
+
+      // Browser-adapter request rewrite: strip extension params from the JSON.
+      if (state.adapterReq && effective !== null) {
+        let parsed: unknown;
+        try { parsed = JSON.parse(effective.toString('utf8')); } catch { parsed = undefined; }
+        if (parsed !== undefined && state.adapterReq(parsed)) {
+          effective = Buffer.from(JSON.stringify(parsed), 'utf8');
+          console.log(`[connect] host=${hostname} adapter stripped request params`);
+        }
+      }
+
+      if (effective !== null) {
         if (state.decoder) {
           // One chunk, then the last chunk and the trailers as received.
           outBody = Buffer.concat([
-            Buffer.from(swapped.length > 0 ? `${swapped.length.toString(16)}\r\n` : ''),
-            swapped,
-            Buffer.from(swapped.length > 0 ? '\r\n0\r\n' : '0\r\n'),
+            Buffer.from(effective.length > 0 ? `${effective.length.toString(16)}\r\n` : ''),
+            effective,
+            Buffer.from(effective.length > 0 ? '\r\n0\r\n' : '0\r\n'),
             state.decoder.trailers,
           ]);
         } else {
           // Framing was validated (exactly one all-digit Content-Length), and
           // swapped header values can't hold CR/LF, so this is the only such line.
-          head = head.replace(/^(content-length:[ \t]*)\d+/im, `$1${swapped.length}`);
-          outBody = swapped;
+          head = head.replace(/^(content-length:[ \t]*)\d+/im, `$1${effective.length}`);
+          outBody = effective;
         }
       }
       sendUpstream(Buffer.concat([Buffer.from(head + '\r\n\r\n'), outBody]));
