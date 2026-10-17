@@ -18,7 +18,7 @@ export { TokenStore, TICKET_PREFIX, TICKET_PATTERN } from './token-store.js';
 export { CertAuthority, type CertAuthorityOptions } from './ca.js';
 export { CdpSessionStore } from './cdp-session-store.js';
 export { startCdpProxy, type CdpProxyOptions, type CdpProxyHandle } from './cdp/proxy.js';
-export { parsePolicy, EMPTY_POLICY, type Policy } from './policy.js';
+export { parsePolicy, EMPTY_POLICY, type Policy, type PolicyRule, type SharedRule } from './policy.js';
 export {
   browserbaseAdapter, createBrowserbaseAdapter, BUILTIN_BROWSER_ADAPTERS, BROWSERBASE_API_HOST,
   type BrowserAdapter,

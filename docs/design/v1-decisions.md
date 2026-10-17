@@ -221,6 +221,115 @@ by the agent is deferred, and if it is ever added it may only narrow.
   the parser can't interleave a synthetic response with in-flight upstream
   responses safely, and denial is an attack signal, not a normal outcome.
 
+### Request body substitution (recorded while implementing roadmap item 17)
+
+- **Off by default, opt-in per secret.** A body is where APIs echo input back
+  (validation errors, created resources), so swapping there widens what an
+  allowed host can reflect to the agent. Headers and the URL are swapped for
+  every ticket; the body only for tickets whose secret opts in.
+- **Two sources, deny wins.** `"swap_body": true` on a `secrets` or `shared`
+  entry in the policy file, or `"_swap_body": true` in a JSON secret. Either
+  one enables it; an explicit `false` in either source disables it, as the
+  allowed hosts take the intersection. Both must be booleans: a policy file
+  with anything else fails startup, an in-band value fails minting with
+  `500`. All fields of a multi-value secret share the setting, and the
+  refreshed OAuth access token inherits it.
+- **The ticket snapshots it at mint**, as it does its hosts
+  (`issue(name, value, { swapBody })`). Mint responses carry
+  `"swap_body": true` when it is on, so the agent knows a body ticket will
+  work.
+- **Host binding applies unchanged.** A body-swap ticket bound to another host
+  denies the whole request (`403 host-mismatch`, tunnel closed), the same as
+  in a header. A ticket in the body whose secret doesn't opt in is left as a
+  literal and doesn't deny: nothing is substituted, so nothing leaks. It is
+  logged as `[swap] result=body-skipped secrets=…`.
+- **Both paths.** On the MITM path the body comes from the item-16 framing;
+  on the forward path from Node's parser. Either way it is buffered whole.
+  When something is swapped:
+  - a `Content-Length` body gets a rewritten `Content-Length`;
+  - a chunked MITM body is re-sent as one chunk plus the last chunk and the
+    original trailers, so the framing headers stay as they were;
+  - the forward path always sends `Content-Length` (Node de-chunks the body).
+- **Encoding follows `Content-Type`.** JSON (`application/json`, `*/*+json`)
+  gets the value JSON-string-escaped, because a ticket in JSON sits inside a
+  string. `application/x-www-form-urlencoded` gets it percent-encoded. Every
+  other type gets the raw UTF-8 bytes. Rationale: a value holding `"` or `&`
+  would otherwise break the body or add a field. Rejected: escaping for
+  multipart and other formats, which have no single correct escaping.
+- **Encoded bodies are not scanned.** A body with a `Content-Encoding` other
+  than `identity` is forwarded as is; the ticket can't be found without
+  decompressing, and recompressing changes the bytes the client signed or
+  measured.
+- **Bytes outside tickets are preserved exactly** (the body is handled as
+  latin1, so binary bodies round-trip).
+
+### Swap-path hardening (recorded while implementing roadmap item 19)
+
+- **A real value must fit where its ticket sits.**
+  - *Header fields:* a value containing a control character other than tab
+    (CR, LF and NUL included; RFC 9110 §5.5) can't be a header value;
+    spliced in, it would add header lines (and could desync the
+    `Content-Length` rewrite). The request is refused before anything is
+    forwarded: `403` with `X-Coatcheck-Denied: invalid-value`, logged as
+    `[swap] result=invalid-value secrets=…`, tunnel closed on HTTPS. Same on
+    the forward path (before, Node threw and the client got `502`). Who can
+    plant such a value: the operator, or an OAuth token endpoint whose
+    `access_token` is written back on refresh. The agent can't write secrets.
+  - *MITM request line:* the swapped request target gets the same
+    percent-encoding the forward path applies (control, space, non-ASCII), so
+    a value with a space can't split the request line.
+  - *Bodies* are unchanged: JSON and form values are escaped, other types
+    get the raw bytes (the operator opted the secret in).
+- **Bodies stream unless a swap is possible.** At the end of a request head,
+  the body is buffered only when a live `swap_body` ticket could be swapped
+  for the target (bound to it, or unbound). Otherwise it is forwarded as it
+  arrives, as before item 17. A ticket minted after the head was read
+  doesn't apply to that body, and its literal passes through (fails closed).
+  In a streamed body nothing is scanned, so a `swap_body` ticket bound to
+  another host leaves as its literal instead of getting `403 host-mismatch`,
+  and no `body-skipped` line is logged. The value is never sent either way.
+- **A buffered body is capped** at `COATCHECK_MAX_SWAP_BODY_BYTES` (default
+  1 MiB, from 1 KiB to 64 MiB). Past the cap, coatcheck forwards what it has
+  buffered and streams the rest, unscanned, with the original framing,
+  logging `[swap] result=body-unscanned`. Rejected: `413`. It would break
+  large uploads to any host that also has a body-swap secret, and a ticket in
+  a body that large still fails closed as a literal.
+- **Chunked bodies are decoded incrementally.** The decoder keeps its state
+  between TLS records, so a chunked upload costs linear time. A streamed
+  chunked body is forwarded chunk framing and all; a malformed chunk found
+  mid-stream still gets `400 bad-framing` and closes both legs (the upstream
+  sees a truncated request).
+- **The header section is capped at 64 KiB.** A head that doesn't end within
+  it gets `431` and the tunnel is closed. Before, an endless head grew the
+  buffer without bound. 64 KiB is above common servers' defaults (Node: 16 KiB).
+- **One pattern scan per input.** The token store finds `cct_<64 hex>`
+  literals with `TICKET_PATTERN` and looks each one up, instead of a
+  substring search per live ticket. Cost: one pass over the input plus the
+  tickets present.
+- **Shared rules carry their own `swap_body`.** `Policy.shared` maps a name to
+  `{ allowedHosts, swapBody? }`, like a per-agent `PolicyRule`.
+- **The MITM parses each request head once** (`parseRequestHead`): framing,
+  `Content-Type`, `Content-Encoding` and `Upgrade` come from one parse. A
+  bare CR or LF inside the request line or a header line is malformed
+  (`400 bad-framing`): some servers treat it as a line break, so a
+  `Content-Length` hidden behind one would desync the framing.
+- **Substitution is one pass** over the input (`TICKET_PATTERN`), so a real
+  value that contains another ticket's literal is never substituted again.
+- **Flow control on the MITM tunnel.** Streaming moved bodies out of
+  coatcheck's buffers and into the upstream socket's write queue, which a
+  slow or stalled upstream lets grow without bound. coatcheck now pauses
+  reading from the client while the upstream socket is full (until
+  `drain`), while more than 1 MiB is held before the upstream connects, and
+  while more than 64 KiB arrives during a pending upgrade. TCP backpressure
+  then reaches the client. Attack tests use an upstream that never reads.
+- **`close()` destroys open tunnels.** CONNECT sockets leave the HTTP
+  server's connection tracking, and a tunnel paused for backpressure doesn't
+  see the client's EOF, so shutdown destroys them explicitly.
+  - Residual: there is no idle timeout on tunnels. A client that disconnects
+    while its tunnel is paused against an upstream that never reads again
+    holds both sockets until the upstream closes. The same is true of
+    passthrough tunnels today.
+
 ### Default: deny, at mint time
 
 - `/_vault/{name}` for an unbound secret returns `403` with an error naming the
@@ -327,6 +436,7 @@ file.
 | `COATCHECK_SECRET_CACHE_TTL_SECONDS` | `300` | `withCache` |
 | `COATCHECK_MITM` | `bound` | `bound`: MITM only hosts in the policy file, on live tickets, or on adapters. `always`: MITM every CONNECT (opt-in) |
 | `COATCHECK_PASSTHROUGH_HOSTS` | empty | never MITM (cert-pinned clients); exact or wildcard |
+| `COATCHECK_MAX_SWAP_BODY_BYTES` | `1048576` | largest body buffered for `swap_body`; larger ones stream unscanned (item 19) |
 | `COATCHECK_CA_DIR` | unset | unset: ephemeral in-memory CA. Set: persist the CA key and cert only |
 | `COATCHECK_CA_SUBJECT` | `CN=coatcheck CA,O=coatcheck` | |
 | `COATCHECK_MISSING_SECRET_URL` | unset | `vault_url` hint in 404s; omitted when unset |
@@ -348,6 +458,22 @@ file.
 |---|---|---|
 | `COATCHECK_ENV_PREFIX` | `COATCHECK_SECRET_` | shared secrets use `COATCHECK_SHARED_SECRET_` |
 | `COATCHECK_SECRETS_FILE` | required for `file` | `{"secrets":{…},"shared":{…}}`; `put` writes to a temp file, then renames |
+
+**`COATCHECK_AWS_EXTERNAL_ID` details (recorded while implementing roadmap item 18):**
+
+- Sent as `ExternalId` on every `AssumeRole` call for the broker role.
+- Set without `COATCHECK_AWS_ROLE_ARN`, startup fails: there is no role to
+  send it to, so it would protect nothing while looking configured.
+- Validated against STS's format (2–1224 characters of `[\w+=,.@:/-]`). The
+  error never echoes the value, because it is the credential that keeps the
+  agent out of the broker role.
+- The warning for `ROLE_ARN` without it is logged by the provider's default
+  export (`awsConfigWarnings`), not by core, which knows nothing about AWS.
+  It is a warning, not an error: a separate-task deployment can assume a role
+  safely without one.
+- Rejected: reading the value from a file or Secrets Manager inside the
+  provider. ECS container-level `secrets` already inject it into one
+  container from Secrets Manager, fetched by the execution role.
 
 **The env provider accepts only `[a-z0-9-]+` names.** That keeps the mapping
 reversible: `github-token` ↔ `COATCHECK_SECRET_GITHUB_TOKEN` (uppercase, `-` →
@@ -447,6 +573,39 @@ Policy file:
   stall. A test asserts the negotiated protocol.
 - After a `101 Switching Protocols` response, the connection switches to a raw
   pipe, so WebSockets work through the MITM.
+
+### Request framing details (recorded while implementing roadmap item 16)
+
+- **The MITM parser frames requests per RFC 9112 §6** (`http1-framing.ts`):
+  `Transfer-Encoding: chunked` is parsed chunk by chunk (size line, data,
+  last chunk, trailer section), otherwise `Content-Length`, otherwise no body.
+  The header section is swapped as before; the body, chunk framing included,
+  is forwarded byte for byte. Before this, a chunked request was read as
+  having no body, so chunk data containing a blank line was parsed as a new
+  "request" and tickets in it were swapped into what the upstream reads as
+  the body (body swapping is opt-in per secret, item 17).
+- **Ambiguous framing is refused, not normalised.** coatcheck can't know how
+  the upstream will read a request it doesn't understand, and the agent
+  controls both sides of a desync. Each of these gets `400`
+  (`X-Coatcheck-Denied: bad-framing`) and the tunnel is closed, without
+  forwarding anything from that request on:
+  - both `Transfer-Encoding` and `Content-Length`;
+  - a `Transfer-Encoding` other than exactly `chunked` (other codings, lists,
+    repeated headers);
+  - a `Content-Length` that isn't all digits, or repeated with any value;
+  - a header line that isn't `token ":"` (whitespace before the colon) or is
+    an obs-fold continuation line;
+  - a malformed chunk: a non-hex size, more than 16 hex digits, a size line
+    longer than 4 KiB, or data not followed by CRLF.
+  Header names are matched at the start of a line (the old unanchored regex
+  read `X-Content-Length` as `Content-Length`).
+- **Trailers are forwarded as received and never swapped.** Request trailers
+  are rare, and swapping them would need the header binding rules for a
+  second header section.
+- **Bodies are buffered whole**, as `Content-Length` bodies already were.
+  Superseded by item 19 (§3, "Bodies stream unless a swap is possible"):
+  only a body a `swap_body` ticket could apply to is buffered, up to
+  `COATCHECK_MAX_SWAP_BODY_BYTES`.
 
 ## 6. Browser adapters
 

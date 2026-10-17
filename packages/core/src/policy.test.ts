@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parsePolicy, policyHostsFor } from './policy.js';
+import { parsePolicy, policyHostsFor, policyRuleFor } from './policy.js';
 
 function parse(obj: unknown) {
   const problems: string[] = [];
@@ -18,7 +18,20 @@ describe('parsePolicy', () => {
     });
     expect(problems).toEqual([]);
     expect(policy.secrets.map(r => [r.name, r.wildcard])).toEqual([['github-token', false], ['google-', true]]);
-    expect(policy.shared.get('browserbase-api-key')).toEqual([{ kind: 'exact', host: 'api.browserbase.com', plaintext: false }]);
+    expect(policy.shared.get('browserbase-api-key')).toEqual({ allowedHosts: [{ kind: 'exact', host: 'api.browserbase.com', plaintext: false }] });
+  });
+
+  it('parses swap_body on secrets and shared entries, and only booleans', () => {
+    const { policy, problems } = parse({
+      secrets: { a: { allowed_hosts: ['a.example.com'], swap_body: true }, b: { allowed_hosts: ['b.example.com'] } },
+      shared: { s: { allowed_hosts: ['s.example.com'], swap_body: false } },
+    });
+    expect(problems).toEqual([]);
+    expect(policyRuleFor(policy, 'a')?.swapBody).toBe(true);
+    expect(policyRuleFor(policy, 'b')?.swapBody).toBeUndefined();
+    expect(policy.shared.get('s')?.swapBody).toBe(false);
+    expect(parse({ secrets: { a: { allowed_hosts: ['a.example.com'], swap_body: 'yes' } } }).problems)
+      .toEqual([expect.stringContaining('secrets["a"].swap_body must be true or false')]);
   });
 
   it('accepts an empty object', () => {

@@ -44,15 +44,19 @@ function viaProxy(proxyPort: number, url: string, headers: http.OutgoingHttpHead
 async function startHttpUpstream() {
   const received: Echo[] = [];
   const server = http.createServer((req, res) => {
-    received.push({ url: req.url ?? '', headers: req.headers });
-    res.end('ok');
+    const chunks: Buffer[] = [];
+    req.on('data', (d: Buffer) => chunks.push(d));
+    req.on('end', () => {
+      received.push({ url: req.url ?? '', headers: req.headers, body: Buffer.concat(chunks).toString() });
+      res.end('ok');
+    });
   });
   await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
   cleanups.push(() => new Promise<void>(r => { server.closeAllConnections(); server.close(() => r()); }));
   return { port: (server.address() as AddressInfo).port, received };
 }
 
-interface Echo { url: string; headers: http.IncomingHttpHeaders }
+interface Echo { url: string; headers: http.IncomingHttpHeaders; body?: string }
 
 let proxyCa: CertAuthority;
 let upstreamCa: CertAuthority;
@@ -89,9 +93,14 @@ async function startHttpsUpstream(body?: string) {
   const received: Echo[] = [];
   let tlsConnections = 0;
   const server = https.createServer({ key: leaf.key, cert: leaf.cert }, (req, res) => {
-    received.push({ url: req.url ?? '', headers: req.headers });
-    res.setHeader('content-type', 'application/json');
-    res.end(body ?? JSON.stringify({ url: req.url, headers: req.headers }));
+    const chunks: Buffer[] = [];
+    req.on('data', (d: Buffer) => chunks.push(d));
+    req.on('end', () => {
+      const reqBody = Buffer.concat(chunks).toString();
+      received.push({ url: req.url ?? '', headers: req.headers, body: reqBody });
+      res.setHeader('content-type', 'application/json');
+      res.end(body ?? JSON.stringify({ url: req.url, headers: req.headers, body: reqBody }));
+    });
   });
   server.on('secureConnection', () => { tlsConnections++; });
   await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
@@ -630,6 +639,394 @@ describe('coatcheck server: MITM policy', () => {
   });
 });
 
+describe('coatcheck server: request framing', () => {
+  async function tunnel() {
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy({ mitm: 'always' });
+    const tok = tokenStore.issue('k', 'real-key', { allowedHosts: hosts('127.0.0.1') }).id;
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    return { upstream, tok, t };
+  }
+
+  it('frames chunked bodies, so ticket-shaped chunk data is never parsed as a request (desync attack)', async () => {
+    captureLogs();
+    const { upstream, tok, t } = await tunnel();
+    // Chunk data holding a blank line and a header-looking ticket: the old
+    // parser read a chunked request as bodiless, parsed this data as a new
+    // "request", and swapped the ticket into what the upstream reads as the body.
+    const data = `x\r\n\r\nX-Smuggled: ${tok}\r\n\r\n`;
+    const chunk = `${Buffer.byteLength(data).toString(16)}\r\n${data}\r\n`;
+    const responses = readResponses(t, 2);
+    // Split mid-chunk to exercise the incomplete path.
+    t.write(`POST /up HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nX-Key: ${tok}\r\n\r\n${chunk.slice(0, 10)}`);
+    await new Promise(r => setTimeout(r, 20));
+    t.write(`${chunk.slice(10)}3;ext=1\r\nend\r\n0\r\n\r\n`);
+    t.write(`GET /next HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${tok}\r\n\r\n`);
+    const [r1, r2] = await responses;
+
+    const e1 = JSON.parse(r1.body) as Echo;
+    expect(e1.headers['x-key']).toBe('real-key');
+    expect(e1.body).toBe(`${data}end`);
+    expect(e1.body).not.toContain('real-key');
+    expect((JSON.parse(r2.body) as Echo).headers['x-key']).toBe('real-key');
+    expect(upstream.received.map(e => e.url)).toEqual(['/up', '/next']);
+  });
+
+  it.each([
+    ['Content-Length and Transfer-Encoding (CL.TE smuggling)', 'Content-Length: 4\r\nTransfer-Encoding: chunked\r\n', '0\r\n\r\n'],
+    ['a Transfer-Encoding other than chunked', 'Transfer-Encoding: gzip, chunked\r\n', '0\r\n\r\n'],
+    ['repeated Transfer-Encoding', 'Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n', '0\r\n\r\n'],
+    ['conflicting Content-Length', 'Content-Length: 1\r\nContent-Length: 4\r\n', 'abcd'],
+    ['a non-numeric Content-Length', 'Content-Length: +4\r\n', 'abcd'],
+    ['whitespace before the colon', 'Content-Length : 4\r\n', 'abcd'],
+    ['an obs-fold line', 'X-A: 1\r\n  folded\r\n', ''],
+    ['a malformed chunk size', 'Transfer-Encoding: chunked\r\n', 'zz\r\nabc\r\n0\r\n\r\n'],
+    ['chunk data longer than its size', 'Transfer-Encoding: chunked\r\n', '2\r\nabcd\r\n0\r\n\r\n'],
+  ])('refuses %s with 400 and closes the tunnel, forwarding nothing', async (_name, headers, body) => {
+    captureLogs();
+    const { upstream, tok, t } = await tunnel();
+    const closed = new Promise<void>(r => t.once('close', () => r()));
+    t.write(`POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${tok}\r\n${headers}\r\n${body}`);
+    t.write(`GET /smuggled HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${tok}\r\n\r\n`);
+    const [res] = await readResponses(t, 1);
+    expect(res.head).toMatch(/^HTTP\/1\.1 400 /);
+    expect(res.head).toMatch(/X-Coatcheck-Denied: bad-framing/i);
+    await closed;
+    expect(upstream.received).toEqual([]);
+  });
+
+  it('ignores empty lines before a request line (RFC 9112 §2.2)', async () => {
+    captureLogs();
+    const { upstream, tok, t } = await tunnel();
+    const responses = readResponses(t, 2);
+    // A stray CRLF after a body, as some clients send, must not be read as a request.
+    t.write('POST /a HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\nhi\r\n');
+    t.write(`GET /b HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${tok}\r\n\r\n`);
+    const [, r2] = await responses;
+    expect((JSON.parse(r2.body) as Echo).headers['x-key']).toBe('real-key');
+    expect(upstream.received.map(e => e.url)).toEqual(['/a', '/b']);
+  });
+
+  it('matches Content-Length only as a whole header name', async () => {
+    captureLogs();
+    const { upstream, t } = await tunnel();
+    const responses = readResponses(t, 2);
+    t.write('GET /a HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Content-Length: 50\r\n\r\n');
+    t.write('GET /b HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+    await responses;
+    expect(upstream.received.map(e => e.url)).toEqual(['/a', '/b']);
+  });
+});
+
+describe('coatcheck server: request body substitution', () => {
+  // A value with characters that break JSON and forms, and `$` replacement patterns.
+  const REAL = 'p"a&s s$&w\\rd';
+  const policy = parsePolicy(JSON.stringify({
+    secrets: {
+      'body-key': { allowed_hosts: ['127.0.0.1', 'http://127.0.0.1'], swap_body: true },
+      'header-key': { allowed_hosts: ['127.0.0.1', 'http://127.0.0.1'] },
+      'github-token': { allowed_hosts: ['api.github.com'], swap_body: true },
+      // The secret's in-band `_swap_body: false` wins over this.
+      'opted-*': { allowed_hosts: ['127.0.0.1'], swap_body: true },
+    },
+  }), []);
+  const provider = () => createMemoryProvider({
+    secrets: {
+      'body-key': REAL,
+      'header-key': 'real-header-key',
+      'github-token': 'ghp_REAL_VALUE',
+      'opted-out': JSON.stringify({ value: 'real-opted-out', _allowed_hosts: ['127.0.0.1'], _swap_body: false }),
+    },
+  });
+
+  async function mint(proxyPort: number, name: string) {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/_vault/${name}`);
+    expect(res.status).toBe(200);
+    return await res.json() as { token: string; swap_body?: boolean };
+  }
+
+  async function tunnel(upstreamPort: number, proxyPort: number) {
+    const { socket } = await connect(proxyPort, `127.0.0.1:${upstreamPort}`);
+    return startTls(socket, proxyCa.caCertPem);
+  }
+
+  it('swaps an opted-in ticket in a JSON body over HTTPS, escaping it and rewriting Content-Length', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ policy, provider: provider() });
+    const minted = await mint(port, 'body-key');
+    expect(minted.swap_body).toBe(true);
+
+    const t = await tunnel(upstream.port, port);
+    const body = JSON.stringify({ password: minted.token, note: 'kept' });
+    t.write(`POST /login HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+    const [res] = await readResponses(t, 1);
+    const echo = JSON.parse(res.body) as Echo;
+    expect(JSON.parse(echo.body!)).toEqual({ password: REAL, note: 'kept' });
+    expect(Number(echo.headers['content-length'])).toBe(Buffer.byteLength(echo.body!));
+  });
+
+  it('swaps in a chunked form body, percent-encoding the value, and keeps the tunnel framed', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ policy, provider: provider() });
+    const { token } = await mint(port, 'body-key');
+
+    const t = await tunnel(upstream.port, port);
+    const form = `user=me&password=${token}`;
+    const responses = readResponses(t, 2);
+    t.write(`POST /form HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-www-form-urlencoded\r\nTransfer-Encoding: chunked\r\n\r\n` +
+      `5\r\n${form.slice(0, 5)}\r\n${(form.length - 5).toString(16)}\r\n${form.slice(5)}\r\n0\r\n\r\n`);
+    t.write('GET /next HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+    const [r1] = await responses;
+    const echo = JSON.parse(r1.body) as Echo;
+    expect(new URLSearchParams(echo.body).get('password')).toBe(REAL);
+    expect(upstream.received.map(e => e.url)).toEqual(['/form', '/next']);
+  });
+
+  it.each([
+    ['scanned: a body ticket is live for the host, so the body is buffered', true],
+    ['streamed: no body ticket is live for the host', false],
+  ])('never swaps a ticket into the body unless its secret opts in (reflection attack, %s)', async (_name, bodyTicketLive) => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ policy, provider: provider() });
+    const headerKey = (await mint(port, 'header-key')).token;
+    const optedOut = (await mint(port, 'opted-out')).token;
+    if (bodyTicketLive) await mint(port, 'body-key');
+
+    // An allowed host that echoes its input: a swapped body would hand the value back to the agent.
+    const t = await tunnel(upstream.port, port);
+    const body = `{"a":"${headerKey}","b":"${optedOut}"}`;
+    t.write(`POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${headerKey}\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n${body}`);
+    const [res] = await readResponses(t, 1);
+    expect(res.body).not.toContain('real-opted-out');
+    const echo = JSON.parse(res.body) as Echo;
+    expect(echo.headers['x-key']).toBe('real-header-key');
+    expect(echo.body).toBe(body);
+    if (bodyTicketLive) expect(logs).toContainEqual(expect.stringContaining('result=body-skipped secrets=header-key,opted-out'));
+    expect(logs.join('\n')).not.toContain('real-header-key');
+  });
+
+  it('denies a body ticket bound to another host and forwards nothing (exfiltration attack)', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ policy, provider: provider(), mitm: 'always' });
+    const { token } = await mint(port, 'github-token');
+    await mint(port, 'body-key'); // a body ticket live for this host: the body is scanned
+
+    const t = await tunnel(upstream.port, port);
+    const body = `{"stolen":"${token}"}`;
+    t.write(`POST /collect HTTP/1.1\r\nHost: api.github.com\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n${body}`);
+    const [res] = await readResponses(t, 1);
+    expect(res.head).toMatch(/^HTTP\/1\.1 403 /);
+    expect(res.head).toMatch(/X-Coatcheck-Denied: host-mismatch/i);
+    expect(upstream.received).toEqual([]);
+  });
+
+  it('streams a body when no body ticket is live for the host: a mis-bound one leaves only as a literal', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ policy, provider: provider(), mitm: 'always' });
+    const { token } = await mint(port, 'github-token');
+
+    const t = await tunnel(upstream.port, port);
+    const body = `{"stolen":"${token}"}`;
+    t.write(`POST /collect HTTP/1.1\r\nHost: api.github.com\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n${body}`);
+    const [res] = await readResponses(t, 1);
+    expect(res.body).not.toContain('ghp_REAL_VALUE');
+    expect((JSON.parse(res.body) as Echo).body).toBe(body);
+  });
+
+  it('leaves content-encoded bodies alone', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ policy, provider: provider() });
+    const { token } = await mint(port, 'body-key');
+    const t = await tunnel(upstream.port, port);
+    t.write(`POST /z HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Encoding: br\r\nContent-Length: ${token.length}\r\n\r\n${token}`);
+    const [res] = await readResponses(t, 1);
+    expect((JSON.parse(res.body) as Echo).body).toBe(token);
+  });
+
+  it('swaps opted-in body tickets on the plain-HTTP forward path, and denies mis-bound ones', async () => {
+    captureLogs();
+    const upstream = await startHttpUpstream();
+    const { port } = await startProxy({ policy, provider: provider() });
+    const body = (await mint(port, 'body-key')).token;
+    const header = (await mint(port, 'header-key')).token;
+    const github = (await mint(port, 'github-token')).token;
+
+    const post = (payload: string) => new Promise<number>((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1', port, method: 'POST', path: `http://127.0.0.1:${upstream.port}/p`,
+        headers: { 'content-type': 'text/plain' },
+      }, res => { res.resume(); res.on('end', () => resolve(res.statusCode ?? 0)); });
+      req.on('error', reject);
+      req.end(payload); // chunked: no Content-Length
+    });
+
+    expect(await post(`a=${body};b=${header}`)).toBe(200);
+    expect(upstream.received[0].body).toBe(`a=${REAL};b=${header}`);
+    expect(Number(upstream.received[0].headers['content-length'])).toBe(Buffer.byteLength(upstream.received[0].body!));
+    expect(upstream.received[0].headers['transfer-encoding']).toBeUndefined();
+
+    expect(await post(`x=${github}`)).toBe(403);
+    expect(upstream.received).toHaveLength(1);
+  });
+});
+
+describe('coatcheck server: swap-path hardening', () => {
+  it('refuses a value with CR/LF in a header instead of injecting header lines (CL desync attack)', async () => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy({ mitm: 'always' });
+    const allowedHosts = hosts('127.0.0.1');
+    // E.g. an access_token a hostile OAuth endpoint wrote back on refresh.
+    const evil = tokenStore.issue('oauth:access_token', 'x\r\nContent-Length: 0\r\nX-Injected: 1', { allowedHosts }).id;
+
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(`POST /a HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer ${evil}\r\nContent-Length: 4\r\n\r\nGET `);
+    const [res] = await readResponses(t, 1);
+    expect(res.head).toMatch(/^HTTP\/1\.1 403 /);
+    expect(res.head).toMatch(/X-Coatcheck-Denied: invalid-value/i);
+    expect(upstream.received).toEqual([]);
+    expect(logs).toContainEqual(expect.stringContaining('result=invalid-value secrets=oauth:access_token'));
+    expect(logs.join('\n')).not.toContain('X-Injected');
+  });
+
+  it('percent-encodes a value swapped into the MITM request line, so a space cannot split it', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy();
+    const tok = tokenStore.issue('k', 'real value é HTTP/1.1', { allowedHosts: hosts('127.0.0.1') }).id;
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(`GET /p?k=${tok} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n`);
+    const [res] = await readResponses(t, 1);
+    expect((JSON.parse(res.body) as Echo).url).toBe('/p?k=real%20value%20%C3%A9%20HTTP/1.1');
+  });
+
+  it('answers 431 and closes the tunnel when a header section never ends (memory exhaustion)', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ mitm: 'always' });
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    const closed = new Promise<void>(r => t.once('close', () => r()));
+    t.write(`GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Pad: ${'a'.repeat(70 * 1024)}`);
+    const [res] = await readResponses(t, 1);
+    expect(res.head).toMatch(/^HTTP\/1\.1 431 /);
+    await closed;
+    expect(upstream.received).toEqual([]);
+  });
+
+  it('streams a body when no body ticket is live: the upstream sees the head before the body ends', async () => {
+    captureLogs();
+    const upstream = await startRawTlsUpstream();
+    const { tokenStore, port } = await startProxy();
+    const tok = tokenStore.issue('k', 'real-key', { allowedHosts: hosts('127.0.0.1') }).id;
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(`POST /up HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${tok}\r\nContent-Length: 100000\r\n\r\n${'x'.repeat(1000)}`);
+    await vi.waitFor(() => expect(upstream.heads).toHaveLength(1));
+    expect(upstream.heads[0]).toContain('X-Key: real-key');
+  });
+
+  it.each([
+    ['Content-Length', (b: string) => `Content-Length: ${b.length}\r\n\r\n${b}`],
+    ['chunked', (b: string) => `Transfer-Encoding: chunked\r\n\r\n${[b.slice(0, 1500), b.slice(1500)].map(c => `${c.length.toString(16)}\r\n${c}\r\n`).join('')}0\r\n\r\n`],
+  ])('streams a %s body past COATCHECK_MAX_SWAP_BODY_BYTES unscanned: the ticket stays a literal', async (_name, frame) => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy({ maxSwapBodyBytes: 1024 });
+    const tok = tokenStore.issue('k', 'real-key', { allowedHosts: hosts('127.0.0.1'), swapBody: true }).id;
+    const body = `${'x'.repeat(2000)}${tok}`;
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    const responses = readResponses(t, 2);
+    t.write(`POST /big HTTP/1.1\r\nHost: 127.0.0.1\r\n${frame(body)}`);
+    t.write(`POST /small HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${tok.length}\r\n\r\n${tok}`);
+    const [big, small] = await responses;
+    expect((JSON.parse(big.body) as Echo).body).toBe(body);
+    expect((JSON.parse(small.body) as Echo).body).toBe('real-key');
+    expect(logs).toContainEqual(expect.stringContaining('result=body-unscanned reason=too-large max_bytes=1024'));
+  });
+
+  it('forward path: refuses CR/LF values, and streams bodies past the cap unscanned', async () => {
+    const logs = captureLogs();
+    const upstream = await startHttpUpstream();
+    const { tokenStore, port } = await startProxy({ maxSwapBodyBytes: 1024 });
+    const allowedHosts = hosts('http://127.0.0.1');
+    const tok = tokenStore.issue('k', 'real-key', { allowedHosts, swapBody: true }).id;
+    const post = (payload: string) => new Promise<number>((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: `http://127.0.0.1:${upstream.port}/p` },
+        res => { res.resume(); res.on('end', () => resolve(res.statusCode ?? 0)); });
+      req.on('error', reject);
+      req.end(payload);
+    });
+    const big = `${'x'.repeat(3000)}${tok}`;
+    expect(await post(big)).toBe(200);
+    expect(upstream.received[0].body).toBe(big);
+    expect(logs).toContainEqual(expect.stringContaining('scheme=http host=127.0.0.1 result=body-unscanned'));
+    expect(await post(`a=${tok}`)).toBe(200);
+    expect(upstream.received[1].body).toBe('a=real-key');
+  });
+
+  /** A TLS upstream that accepts connections but never reads from them. */
+  async function startStalledUpstream() {
+    const leaf = await upstreamCa.getCertForHost('127.0.0.1');
+    const sockets: tls.TLSSocket[] = [];
+    const server = tls.createServer({ key: leaf.key, cert: leaf.cert }, sock => {
+      sockets.push(sock);
+      sock.on('error', () => {});
+      sock.pause();
+    });
+    await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+    cleanups.push(() => new Promise<void>(r => { sockets.forEach(s => s.destroy()); server.close(() => r()); }));
+    return (server.address() as AddressInfo).port;
+  }
+
+  /** Write `total` bytes without waiting; resolve with what the client still holds after the proxy had time to read. */
+  async function unflushedAfter(t: tls.TLSSocket, total: number): Promise<number> {
+    const chunk = Buffer.alloc(64 * 1024, 0x78);
+    for (let sent = 0; sent < total; sent += chunk.length) t.write(chunk);
+    await new Promise(r => setTimeout(r, 1500));
+    return t.writableLength;
+  }
+
+  // Sizes: well past socket buffers, and small enough that without flow
+  // control coatcheck reads it all within the wait.
+  it.each([
+    ['a streamed upload to an upstream that stops reading', 48 * 1024 * 1024, (len: number) =>
+      `POST /up HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${len}\r\n\r\n`],
+    ['bytes sent while an upgrade is pending', 8 * 1024 * 1024, () =>
+      'GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'],
+  ])('applies backpressure to %s instead of buffering it (memory exhaustion)', async (_name, total, head) => {
+    captureLogs();
+    const upstreamPort = await startStalledUpstream();
+    const { port } = await startProxy({ mitm: 'always' });
+    const { socket } = await connect(port, `127.0.0.1:${upstreamPort}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(head(total));
+    // Without flow control coatcheck reads all of it into memory and the
+    // client's buffer drains; with it, most of it stays with the client.
+    expect(await unflushedAfter(t, total)).toBeGreaterThan(total / 2);
+  }, 20_000);
+
+  it('applies swap_body from a shared secret\'s policy entry', async () => {
+    captureLogs();
+    const policy = parsePolicy(JSON.stringify({
+      shared: { 'shared-key': { allowed_hosts: ['127.0.0.1'], swap_body: true } },
+    }), []);
+    const { port } = await startProxy({ policy, provider: createMemoryProvider({ shared: { 'shared-key': 'real-shared' } }) });
+    const res = await fetch(`http://127.0.0.1:${port}/_secret/shared-key`);
+    expect(await res.json()).toMatchObject({ swap_body: true, allowed_hosts: ['127.0.0.1'] });
+  });
+});
+
 describe('coatcheck server: API token', () => {
   const TOKEN = 'test-api-token-0123456789abcdef0123456789';
   const basic = (user: string, pass: string) => `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
@@ -783,9 +1180,15 @@ describe('coatcheck server: plain HTTP', () => {
     expect(ok.status).toBe(200);
     expect(upstream.received[0].url).toBe('/p?k=real%20value%20%C3%A9');
 
-    // A real value Node refuses in a header must not throw out of the request handler.
+    // A real value that can't be a header value is refused before anything is sent.
     const crlf = tokenStore.issue('h', 'bad\r\nx-injected: 1', { allowedHosts }).id;
-    expect((await viaProxy(port, `http://127.0.0.1:${upstream.port}/`, { 'x-key': crlf })).status).toBe(502);
+    const refused = await viaProxy(port, `http://127.0.0.1:${upstream.port}/`, { 'x-key': crlf });
+    expect(refused.status).toBe(403);
+    expect(refused.headers['x-coatcheck-denied']).toBe('invalid-value');
+    expect(upstream.received).toHaveLength(1);
+    // A value Node still refuses (above U+00FF) must not throw out of the request handler.
+    const wide = tokenStore.issue('w', 'value \u2603', { allowedHosts }).id;
+    expect((await viaProxy(port, `http://127.0.0.1:${upstream.port}/`, { 'x-key': wide })).status).toBe(502);
     expect((await fetch(`http://127.0.0.1:${port}/_health`)).status).toBe(200);
   });
 

@@ -77,6 +77,13 @@ is a different principal. Property 2 is violated. Ways to close it:
 - Block the agent container from the credentials endpoint (`169.254.170.2`)
   with egress rules, if nothing in the agent needs cloud credentials.
 
+provider-aws supports the second option: `COATCHECK_AWS_EXTERNAL_ID` is sent as
+`ExternalId` on `AssumeRole`, and coatcheck warns at startup when
+`COATCHECK_AWS_ROLE_ARN` is set without it. [docs/deploy/aws-ecs.md](deploy/aws-ecs.md)
+is the reference deployment for all three: task definition, IAM policies, the
+per-launch-type limits on blocking `169.254.170.2`, egress rules, and CA key
+handling.
+
 ### The `env` and `file` providers
 
 Property 1 then means the agent cannot read the broker's environment or the
@@ -226,14 +233,32 @@ target (the actual upstream, verified by upstream TLS), never on `Host` or
 SNI, so a mismatched `Host` can't widen a ticket's reach; it only reaches the
 upstream as a confusing request.
 
-### LOW: request bodies are not swapped
+### LOW: request bodies are swapped only on opt-in
 
-Only headers and URL are rewritten (`mitm.ts`, `forward.ts`). Body
-bytes pass through. This is a functional limitation (tickets in JSON or
-form bodies do not work) and narrows the substitution surface, which is
-mildly protective. Related: `Transfer-Encoding: chunked` request bodies are not
-parsed (`mitm.ts`), so a chunked body can misalign the request parser
-on a keep-alive tunnel. The MITM speaks HTTP/1.1 only and advertises
+Headers and URL are rewritten for every ticket (`mitm.ts`, `forward.ts`).
+Bodies are rewritten only for secrets with `swap_body` (policy) or
+`_swap_body` (in-band), because a body is where an allowed host is most
+likely to echo input back to the agent (validation errors, created
+objects). Opting in accepts that reflection risk for that secret: an agent
+that can get an allowed host to echo a request body can read the value.
+A body is only buffered and scanned when a live `swap_body` ticket could be
+swapped for the host, and only up to `COATCHECK_MAX_SWAP_BODY_BYTES`; other
+bodies stream unscanned, so their tickets leave as literals (fail closed).
+In a scanned body host binding applies (a mis-bound ticket denies the
+request; test in `server.test.ts`), and a ticket of a secret that hasn't
+opted in reaches the upstream as a literal. Content-encoded bodies are not
+scanned. A real value with a control character (CR/LF) is never spliced
+into a header, where it would inject header lines and could desync framing
+with the upstream: the request is refused with `403 invalid-value` (attack
+test in `server.test.ts`). Values in the request line are percent-encoded.
+The header section is capped at 64 KiB (`431`), and buffered bodies at the
+cap above, so one tunnel can't grow coatcheck's memory without bound. The MITM parser frames `Transfer-Encoding: chunked` and
+`Content-Length` bodies per RFC 9112 (`http1-framing.ts`), so body bytes can't
+be parsed as a new request whose header tickets would be swapped. Ambiguous
+framing (both headers, codings other than `chunked`, repeated or malformed
+`Content-Length`, whitespace before a colon, obs-fold, malformed chunks) gets
+`400` and the tunnel is closed, which refuses request smuggling between
+coatcheck and the upstream. Request trailers pass through unswapped. The MITM speaks HTTP/1.1 only and advertises
 just `http/1.1` over ALPN. After a `101 Switching Protocols` response the
 tunnel becomes a raw pipe, so WebSocket frames are neither swapped nor
 inspected.

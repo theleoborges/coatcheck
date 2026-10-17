@@ -1,6 +1,7 @@
 {
   "secrets": {
     "example-api-key": { "allowed_hosts": ["httpbin.org"] },
+    "example-echo-key": { "allowed_hosts": ["postman-echo.com"] },
     "example-login": { "allowed_hosts": ["*.example.com"] },
     "github-*": { "allowed_hosts": ["api.github.com", "github.com"] }
   },

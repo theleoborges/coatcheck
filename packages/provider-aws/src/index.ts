@@ -17,6 +17,7 @@ const DEFAULT_SHARED_PREFIX = 'coatcheck/';
 const SSM_PREFIX = /^\/(?:[A-Za-z0-9_.-]+\/)*$/;
 const SHARED_PREFIX = /^[A-Za-z0-9_./+=@-]*$/;
 const ROLE_SESSION_NAME = /^[\w+=,.@-]{2,64}$/;
+const EXTERNAL_ID = /^[\w+=,.@:/-]{2,1224}$/;
 const CREDENTIALS_REFRESH_MS = 2_700_000; // 45 minutes (STS session is 1h by default)
 
 interface AssumedCredentials {
@@ -34,6 +35,12 @@ export interface AwsProviderConfig {
   /** Broker role to assume before any call; unset uses the default credential chain. */
   roleArn?: string;
   roleSessionName: string;
+  /**
+   * `sts:ExternalId` sent with AssumeRole. Inject it into the coatcheck
+   * container only, so an agent sharing the task role can't assume the broker
+   * role (docs/deploy/aws-ecs.md).
+   */
+  externalId?: string;
 }
 
 /**
@@ -50,6 +57,7 @@ export function loadAwsConfig(ctx: ProviderContext): AwsProviderConfig {
     r.string('COATCHECK_AWS_ROLE_SESSION_NAME') ?? (ctx.agentId ? 'coatcheck-{agentId}' : 'coatcheck'),
     ctx.agentId, 'COATCHECK_AWS_ROLE_SESSION_NAME', r.problems);
   const roleArn = r.string('COATCHECK_AWS_ROLE_ARN');
+  const externalId = r.string('COATCHECK_AWS_EXTERNAL_ID');
 
   if (r.problems.length === 0) {
     if (!SSM_PREFIX.test(ssmPrefix)) {
@@ -65,9 +73,36 @@ export function loadAwsConfig(ctx: ProviderContext): AwsProviderConfig {
   if (roleArn !== undefined && !/^arn:aws[a-z-]*:iam::\d{12}:role\/.+$/.test(roleArn)) {
     r.problems.push('COATCHECK_AWS_ROLE_ARN must be an IAM role ARN');
   }
+  if (externalId !== undefined) {
+    // Never echo the value: it is the credential that keeps the agent out of the broker role.
+    if (!EXTERNAL_ID.test(externalId)) r.problems.push('COATCHECK_AWS_EXTERNAL_ID must be 2-1224 characters of [\\w+=,.@:/-]');
+    if (roleArn === undefined) r.problems.push('COATCHECK_AWS_EXTERNAL_ID is set but COATCHECK_AWS_ROLE_ARN is not');
+  }
 
   if (r.problems.length > 0) throw new ConfigError(r.problems);
-  return { ssmPrefix, sharedPrefix, roleArn, roleSessionName };
+  return { ssmPrefix, sharedPrefix, roleArn, roleSessionName, ...(externalId === undefined ? {} : { externalId }) };
+}
+
+/** Startup warnings for a deployment shape that doesn't keep the agent out of the broker role. */
+export function awsConfigWarnings(config: AwsProviderConfig): string[] {
+  if (config.roleArn && !config.externalId) {
+    return [
+      'COATCHECK_AWS_ROLE_ARN is set without COATCHECK_AWS_EXTERNAL_ID: if the agent shares this task role ' +
+      '(an ECS sidecar), it can assume the broker role itself. Require an sts:ExternalId in the role\'s trust ' +
+      'policy and inject it into the coatcheck container only, or run coatcheck as a separate task (docs/deploy/aws-ecs.md)',
+    ];
+  }
+  return [];
+}
+
+/** The AssumeRole request for the broker role. */
+export function assumeRoleInput(config: AwsProviderConfig & { roleArn: string }) {
+  return {
+    RoleArn: config.roleArn,
+    RoleSessionName: config.roleSessionName,
+    DurationSeconds: 3600,
+    ...(config.externalId ? { ExternalId: config.externalId } : {}),
+  };
 }
 
 /**
@@ -107,11 +142,7 @@ class AwsBackend {
     // Refresh assumed credentials if expired or not yet assumed
     if (!this.assumedCreds || Date.now() - this.assumedCreds.assumedAt > CREDENTIALS_REFRESH_MS) {
       const sts = new STSClient({});
-      const result = await sts.send(new AssumeRoleCommand({
-        RoleArn: this.opts.roleArn,
-        RoleSessionName: this.opts.roleSessionName,
-        DurationSeconds: 3600,
-      }));
+      const result = await sts.send(new AssumeRoleCommand(assumeRoleInput({ ...this.opts, roleArn: this.opts.roleArn })));
 
       if (!result.Credentials?.AccessKeyId || !result.Credentials.SecretAccessKey || !result.Credentials.SessionToken) {
         throw new Error('STS AssumeRole did not return credentials');
@@ -244,5 +275,9 @@ export function createAwsProvider(config: AwsProviderConfig): SecretProvider {
 }
 
 /** `COATCHECK_PROVIDER=aws`: core loads this module and calls its default export. */
-const createProvider: CreateProvider = async ctx => createAwsProvider(loadAwsConfig(ctx));
+const createProvider: CreateProvider = async ctx => {
+  const config = loadAwsConfig(ctx);
+  for (const warning of awsConfigWarnings(config)) console.warn(`WARNING: ${warning}`);
+  return createAwsProvider(config);
+};
 export default createProvider;

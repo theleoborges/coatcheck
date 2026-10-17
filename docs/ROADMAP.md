@@ -214,14 +214,14 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 ## Phase 6: swap coverage and deployment
 
-16. **Chunked request bodies.** Parse `Transfer-Encoding: chunked` in the MITM
+16. **[Done]** **Chunked request bodies.** Parse `Transfer-Encoding: chunked` in the MITM
     request parser so that keep-alive framing stays correct.
 
-17. **Request body substitution.** Opt in per secret, with `swap_body` in the
+17. **[Done]** **Request body substitution.** Opt in per secret, with `swap_body` in the
     policy file or `_swap_body` in-band. Host binding applies, and
     `Content-Length` is rewritten.
 
-18. **`docs/deploy/aws-ecs.md` and `ExternalId` in provider-aws.** The
+18. **[Done]** **`docs/deploy/aws-ecs.md` and `ExternalId` in provider-aws.** The
     reference deployment covers:
     - the sidecar task definition;
     - health-gated startup;
@@ -235,6 +235,25 @@ rejected, are in `docs/design/v1-decisions.md`.
 
     provider-aws supports `COATCHECK_AWS_EXTERNAL_ID` and warns at startup when
     `COATCHECK_AWS_ROLE_ARN` is set without it.
+
+19. **[Done]** **Production hardening of the swap paths** (from the Phase 6 review):
+    - Real values that can't be represented where the ticket sits are
+      refused: a control character (CR, LF, NUL, …) in a header gets the
+      request denied. Values in
+      the MITM request line are percent-encoded, as on the forward path.
+    - Bodies stream unless a live `swap_body` ticket could be swapped for
+      the target. A buffered body is capped by
+      `COATCHECK_MAX_SWAP_BODY_BYTES`; past the cap it streams unscanned.
+    - The MITM parser decodes chunked bodies incrementally (linear time) and
+      caps the header section.
+    - The token store finds tickets with one pattern scan instead of one
+      substring search per live ticket.
+    - The policy keeps a shared secret's hosts and `swap_body` in one rule,
+      and the MITM parses each request head once (bare CR/LF in a line is
+      malformed).
+    - The MITM tunnel applies backpressure: it stops reading from the client
+      while the upstream can't take more, or while an upgrade is pending.
+      `close()` destroys open tunnels.
 
 Done: the unused `http-proxy` dependency was removed during extraction.
 

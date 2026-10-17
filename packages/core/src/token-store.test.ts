@@ -72,6 +72,14 @@ describe('TokenStore', () => {
     expect(result.swaps.map(s => s.secretName).sort()).toEqual(['api-key', 'token']);
   });
 
+  it('substitutes in one pass: a value holding another ticket literal is not swapped again', () => {
+    store = new TokenStore();
+    const t2 = store.issue('token', 'usr-real-token');
+    const t1 = store.issue('api-key', `prefix-${t2.id}`);
+    const result = store.replaceAll(`a=${t1.id}&b=${t2.id}`, ANY_HOST);
+    expect(result.output).toBe(`a=prefix-${t2.id}&b=usr-real-token`);
+  });
+
   it('replaces tokens in headers', () => {
     store = new TokenStore();
     const token = store.issue('notion-key', 'secret_abc123');
@@ -192,6 +200,71 @@ describe('TokenStore', () => {
       store.issue('elsewhere', 'x', { allowedHosts: hosts('other.example.com') });
       const t = store.issue('k', 'real', { allowedHosts: hosts('api.example.com') });
       expect(store.replaceAll(t.id, ANY_HOST)).toMatchObject({ output: 'real', denied: [] });
+    });
+  });
+
+  it('inserts values literally, never expanding $ replacement patterns', () => {
+    store = new TokenStore();
+    const t = store.issue('k', "a$&b$'c$`d$$e");
+    expect(store.replaceAll(`x ${t.id} y`, ANY_HOST).output).toBe("x a$&b$'c$`d$$e y");
+  });
+
+  it('finds tickets by pattern: only live ids present in the input are considered', () => {
+    store = new TokenStore();
+    for (let i = 0; i < 500; i++) store.issue(`n${i}`, `v${i}`);
+    const t = store.issue('k', 'real');
+    const r = store.replaceAll(`a ${t.id} b ${t.id} ${TICKET_PREFIX}${'0'.repeat(64)}`, ANY_HOST);
+    expect(r.output).toBe(`a real b real ${TICKET_PREFIX}${'0'.repeat(64)}`);
+    expect(r.swaps.map(s => s.secretName)).toEqual(['k']);
+  });
+
+  it('reports values an encoder refuses as invalid and swaps nothing', () => {
+    store = new TokenStore();
+    const good = store.issue('good', 'ok');
+    const bad = store.issue('bad', 'x\r\ny');
+    const r = store.replaceAll(`${good.id} ${bad.id}`, ANY_HOST, v => (v.includes('\r') ? null : v));
+    expect(r.output).toBe(`${good.id} ${bad.id}`);
+    expect(r.swaps).toEqual([]);
+    expect(r.invalid?.map(s => s.secretName)).toEqual(['bad']);
+  });
+
+  it('knows when a body ticket could be swapped for a target', () => {
+    store = new TokenStore();
+    store.issue('plain', 'x', { allowedHosts: hosts('api.example.com') });
+    expect(store.hasLiveBodyTicketFor(ANY_HOST)).toBe(false);
+    store.issue('elsewhere', 'x', { allowedHosts: hosts('other.example.com'), swapBody: true });
+    expect(store.hasLiveBodyTicketFor(ANY_HOST)).toBe(false);
+    store.issue('body', 'x', { allowedHosts: hosts('api.example.com'), swapBody: true });
+    expect(store.hasLiveBodyTicketFor(ANY_HOST)).toBe(true);
+  });
+
+  describe('body swapping', () => {
+    it('swaps only opted-in tickets, encoding the value, and reports the rest as skipped', () => {
+      store = new TokenStore();
+      const body = store.issue('body', 'v"1', { swapBody: true });
+      const header = store.issue('header', 'v2');
+      const r = store.replaceAllInBody(`${body.id} ${header.id}`, ANY_HOST, v => JSON.stringify(v).slice(1, -1));
+      expect(r.output).toBe(`v\\"1 ${header.id}`);
+      expect(r.swaps.map(s => s.secretName)).toEqual(['body']);
+      expect(r.skipped?.map(s => s.secretName)).toEqual(['header']);
+      // Headers are unaffected by the flag.
+      expect(store.replaceAll(`${body.id} ${header.id}`, ANY_HOST).output).toBe('v"1 v2');
+    });
+
+    it('applies host binding to opted-in tickets, but never denies on a skipped one', () => {
+      store = new TokenStore();
+      const bound = store.issue('gh', 'ghp_real', { allowedHosts: hosts('api.github.com'), swapBody: true });
+      const r = store.replaceAllInBody(bound.id, ANY_HOST, v => v);
+      expect(r).toMatchObject({ output: bound.id, swaps: [], denied: [{ secretName: 'gh' }] });
+
+      const plain = store.issue('plain', 'x', { allowedHosts: hosts('api.github.com') });
+      expect(store.replaceAllInBody(plain.id, ANY_HOST, v => v)).toMatchObject({ output: plain.id, denied: [], skipped: [{ secretName: 'plain' }] });
+    });
+
+    it('never swaps session-scoped tickets in a body', () => {
+      store = new TokenStore();
+      const t = store.issue('login:password', 'pw', { sessionId: 'sid', swapBody: true });
+      expect(store.replaceAllInBody(t.id, ANY_HOST, v => v)).toMatchObject({ output: t.id, swaps: [], skipped: [] });
     });
   });
 

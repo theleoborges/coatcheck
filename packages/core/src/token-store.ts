@@ -32,6 +32,8 @@ interface TokenEntry {
   sessionId?: string;
   /** Hosts this ticket may be swapped for, snapshotted at mint. Undefined = unbound. */
   allowedHosts?: readonly HostPattern[];
+  /** Also swapped in request bodies (opt-in per secret), snapshotted at mint. */
+  swapBody: boolean;
 }
 
 export interface IssueOptions {
@@ -41,6 +43,8 @@ export interface IssueOptions {
   allowedHosts?: readonly HostPattern[];
   /** Bind to a CDP session: substitutes only on that session's frames, revoked when it closes. */
   sessionId?: string;
+  /** Also substitute in HTTP(S) request bodies (see replaceAllInBody). Default false. */
+  swapBody?: boolean;
 }
 
 export interface SessionValue {
@@ -69,6 +73,30 @@ export interface SwapResult {
    * must not forward the request.
    */
   denied: SwapInfo[];
+  /**
+   * replaceAllInBody only: tickets present in the body whose secret doesn't
+   * opt in to body swapping. Left as literals; they never deny.
+   */
+  skipped?: SwapInfo[];
+  /**
+   * Tickets whose real value the encoder refused (it can't be represented
+   * where the ticket sits, e.g. CR/LF in a header). When non-empty, nothing is
+   * swapped and the caller must not forward the request.
+   */
+  invalid?: SwapInfo[];
+}
+
+/** Adapts a real value to where it lands; null = it can't be represented there. */
+export type ValueEncoder = (value: string) => string | null;
+
+/**
+ * Replace every ticket id in one pass, so a real value that happens to contain
+ * another ticket literal is never substituted again. A replacer function keeps
+ * `$&` etc. in values literal.
+ */
+function substitute(input: string, replacements: ReadonlyMap<string, string>): string {
+  if (replacements.size === 0) return input;
+  return input.replace(TICKET_PATTERN, id => replacements.get(id) ?? id);
 }
 
 /**
@@ -106,6 +134,7 @@ export class TokenStore {
       expiresAt: now + ttlSeconds * 1000,
       sessionId: opts.sessionId,
       allowedHosts: opts.allowedHosts,
+      swapBody: opts.swapBody ?? false,
     });
 
     return { id, ttlSeconds };
@@ -130,37 +159,59 @@ export class TokenStore {
    * which secrets were swapped and how old the tokens were at swap time (diagnostic).
    * If any ticket present is bound to other hosts, nothing is swapped and the
    * ticket is reported in `denied`: one denied ticket denies the whole request.
+   * `encode` adapts each real value to where it lands (percent-encoding in a
+   * URL); when it returns null the value can't be represented there, nothing
+   * is swapped, and the ticket is reported in `invalid`.
    */
-  replaceAll(input: string, target: MatchTarget): SwapResult {
-    if (this.tokens.size === 0) return { output: input, swaps: [], denied: [] };
+  replaceAll(input: string, target: MatchTarget, encode: ValueEncoder = v => v): SwapResult {
+    return this.replaceHttp(input, target, false, encode);
+  }
 
-    let result = input;
+  /**
+   * Like replaceAll, for a request body: only tickets whose secret opts in to
+   * body swapping (`swapBody`) are candidates, and each real value goes
+   * through `encode` (escaping for the body's content type). Tickets of other
+   * secrets are reported in `skipped` and left as literals.
+   */
+  replaceAllInBody(input: string, target: MatchTarget, encode: ValueEncoder): SwapResult {
+    return this.replaceHttp(input, target, true, encode);
+  }
+
+  private replaceHttp(input: string, target: MatchTarget, body: boolean, encode: ValueEncoder): SwapResult {
     const swaps: SwapInfo[] = [];
     const denied: SwapInfo[] = [];
+    const invalid: SwapInfo[] = [];
+    const skipped: SwapInfo[] = [];
+    const replacements = new Map<string, string>();
     const now = Date.now();
 
-    for (const [tokenId, entry] of this.tokens) {
-      if (now > entry.expiresAt) {
-        this.tokens.delete(tokenId);
-        continue;
-      }
+    for (const [tokenId, entry] of this.ticketsIn(input, now)) {
       // Session-scoped tokens (CDP credential injection) must never substitute
       // on the agent-wide HTTP/TLS path — they only resolve inside their WS session.
       if (entry.sessionId !== undefined) continue;
-      if (!input.includes(tokenId)) continue;
       const info: SwapInfo = { secretName: entry.secretName, ageMs: now - entry.createdAt };
+      if (body && !entry.swapBody) {
+        skipped.push(info);
+        continue;
+      }
       if (entry.allowedHosts === undefined) {
         info.unbound = true;
       } else if (!matchesHost(entry.allowedHosts, target)) {
         denied.push(info);
         continue;
       }
-      result = result.replaceAll(tokenId, entry.realValue);
+      const value = encode(entry.realValue);
+      if (value === null) {
+        invalid.push(info);
+        continue;
+      }
+      replacements.set(tokenId, value);
       swaps.push(info);
     }
 
-    if (denied.length > 0) return { output: input, swaps: [], denied };
-    return { output: result, swaps, denied };
+    const extra = { ...(body ? { skipped } : {}), ...(invalid.length > 0 ? { invalid } : {}) };
+    if (denied.length > 0 || invalid.length > 0) return { output: input, swaps: [], denied, ...extra };
+    return { output: substitute(input, replacements), swaps, denied, ...extra };
   }
 
   /**
@@ -169,12 +220,45 @@ export class TokenStore {
    * swap on HTTP(S)). Drives the `COATCHECK_MITM=bound` decision.
    */
   hasLiveTicketFor(target: MatchTarget): boolean {
+    return this.hasLiveHttpTicket(target, false);
+  }
+
+  /**
+   * True when a live `swapBody` ticket could be swapped in a body for
+   * `target`: decides whether a request body is buffered or streamed.
+   */
+  hasLiveBodyTicketFor(target: MatchTarget): boolean {
+    return this.hasLiveHttpTicket(target, true);
+  }
+
+  private hasLiveHttpTicket(target: MatchTarget, swapBodyOnly: boolean): boolean {
     const now = Date.now();
     for (const entry of this.tokens.values()) {
+      if (swapBodyOnly && !entry.swapBody) continue;
       if (now > entry.expiresAt || entry.sessionId !== undefined) continue;
       if (entry.allowedHosts === undefined || matchesHost(entry.allowedHosts, target)) return true;
     }
     return false;
+  }
+
+  /**
+   * Live tickets whose ids appear in `input`, found with one pattern scan
+   * rather than a substring search per live ticket. Expired ones met on the
+   * way are evicted.
+   */
+  private ticketsIn(input: string, now: number): Array<[string, TokenEntry]> {
+    if (this.tokens.size === 0 || !input.includes(TICKET_PREFIX)) return [];
+    const out: Array<[string, TokenEntry]> = [];
+    for (const id of new Set(input.match(TICKET_PATTERN) ?? [])) {
+      const entry = this.tokens.get(id);
+      if (!entry) continue;
+      if (now > entry.expiresAt) {
+        this.tokens.delete(id);
+        continue;
+      }
+      out.push([id, entry]);
+    }
+    return out;
   }
 
   /**
@@ -186,20 +270,13 @@ export class TokenStore {
    * swap on any known origin.
    */
   replaceAllForSession(input: string, sessionId: string, origin: MatchTarget | null): SwapResult {
-    if (this.tokens.size === 0) return { output: input, swaps: [], denied: [] };
-
-    let result = input;
     const swaps: SwapInfo[] = [];
     const denied: SwapInfo[] = [];
+    const replacements = new Map<string, string>();
     const now = Date.now();
 
-    for (const [tokenId, entry] of this.tokens) {
-      if (now > entry.expiresAt) {
-        this.tokens.delete(tokenId);
-        continue;
-      }
+    for (const [tokenId, entry] of this.ticketsIn(input, now)) {
       if (entry.sessionId !== sessionId) continue;
-      if (!input.includes(tokenId)) continue;
       const info: SwapInfo = { secretName: entry.secretName, ageMs: now - entry.createdAt };
       if (origin === null) {
         denied.push(info);
@@ -211,12 +288,12 @@ export class TokenStore {
         denied.push(info);
         continue;
       }
-      result = result.replaceAll(tokenId, entry.realValue);
+      replacements.set(tokenId, entry.realValue);
       swaps.push(info);
     }
 
     if (denied.length > 0) return { output: input, swaps: [], denied };
-    return { output: result, swaps, denied };
+    return { output: substitute(input, replacements), swaps, denied };
   }
 
   /**

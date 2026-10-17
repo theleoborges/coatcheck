@@ -43,7 +43,11 @@ export interface Config {
   passthroughHosts: HostPattern[];
   /** `COATCHECK_API_TOKEN`: vault API bearer token and proxy credential. Required off loopback. */
   apiToken?: string;
+  /** `COATCHECK_MAX_SWAP_BODY_BYTES`: largest body buffered for `swap_body`; larger ones stream unscanned. */
+  maxSwapBodyBytes: number;
 }
+
+export const DEFAULT_MAX_SWAP_BODY_BYTES = 1024 * 1024;
 
 /** Minimum `COATCHECK_API_TOKEN` length (e.g. `openssl rand -hex 32` gives 64). */
 export const MIN_API_TOKEN_LENGTH = 32;
@@ -214,6 +218,7 @@ export function loadConfig(env: Env, readFile?: ReadFile): Config {
     mitm: mitmRaw === 'always' ? 'always' : 'bound',
     passthroughHosts,
     apiToken,
+    maxSwapBodyBytes: r.int('COATCHECK_MAX_SWAP_BODY_BYTES', DEFAULT_MAX_SWAP_BODY_BYTES, 1024, 64 * 1024 * 1024),
   };
 
   if (r.problems.length > 0) throw new ConfigError(r.problems);
