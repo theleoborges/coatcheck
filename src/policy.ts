@@ -44,12 +44,13 @@ export function parsePolicy(text: string, problems: string[], source = 'policy f
   for (const [name, entry] of section(raw.secrets, 'secrets', source, problems)) {
     const wildcard = name.endsWith('*');
     const base = wildcard ? name.slice(0, -1) : name;
-    if (base.includes('*') || !(wildcard ? base === '' || /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(base) : isValidSecretName(base))) {
-      problems.push(`${source}: secrets["${name}"]: invalid secret name or pattern (a trailing '*' is the only wildcard)`);
-      continue;
-    }
     if (wildcard && base === '') {
       problems.push(`${source}: secrets["*"]: a bare '*' would bind every secret; list names or prefixes`);
+      continue;
+    }
+    // A non-empty prefix of a valid name is itself a valid name, so one check covers both forms.
+    if (!isValidSecretName(base)) {
+      problems.push(`${source}: secrets["${name}"]: invalid secret name or pattern (a trailing '*' is the only wildcard)`);
       continue;
     }
     const hosts = allowedHosts(entry, `secrets["${name}"]`, source, problems);

@@ -64,10 +64,12 @@ describe('parsePolicy', () => {
         '../x': { allowed_hosts: ['a.example.com'] },
         'a*b': { allowed_hosts: ['a.example.com'] },
         '*suffix': { allowed_hosts: ['a.example.com'] },
+        // A prefix longer than any valid name could never match.
+        [`${'a'.repeat(129)}*`]: { allowed_hosts: ['a.example.com'] },
       },
       shared: { 'shared-*': { allowed_hosts: ['a.example.com'] } },
     });
-    expect(problems).toHaveLength(5);
+    expect(problems).toHaveLength(6);
   });
 });
 

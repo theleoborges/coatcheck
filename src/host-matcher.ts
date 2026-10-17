@@ -40,8 +40,14 @@ export function parseHostPattern(entry: string): HostPattern | string {
   if (rest.includes('://')) return 'only the http:// scheme prefix is allowed (HTTPS is implied)';
   if (rest.includes('/')) return 'must not contain a path';
 
-  if (rest.startsWith('[') && rest.endsWith(']')) rest = rest.slice(1, -1);
-  if (net.isIP(rest)) return { kind: 'exact', host: rest.toLowerCase(), plaintext };
+  if (rest.startsWith('[') && rest.endsWith(']')) {
+    const ip = normaliseHost(rest.slice(1, -1));
+    return ip !== null && net.isIPv6(ip) ? { kind: 'exact', host: ip, plaintext } : 'brackets are only allowed around an IPv6 address';
+  }
+  if (net.isIP(rest)) {
+    const ip = normaliseHost(rest);
+    return ip === null ? 'is not a valid IP address (IPv6 zone IDs are not allowed)' : { kind: 'exact', host: ip, plaintext };
+  }
   if (rest.includes(':')) return 'must not contain a port (ports are ignored when matching)';
 
   let kind: HostPattern['kind'] = 'exact';
@@ -60,10 +66,19 @@ export function parseHostPattern(entry: string): HostPattern | string {
   return { kind, host, plaintext };
 }
 
-/** Lowercase, strip one trailing dot, convert to punycode, validate. Null if invalid. */
+/**
+ * Lowercase, strip one trailing dot, convert to punycode, validate. IPv6 is
+ * canonicalised the way the WHATWG URL parser does it (`2001:0DB8::0001` ->
+ * `2001:db8::1`), so patterns and targets compare equal; zone IDs are refused.
+ * Null if invalid.
+ */
 export function normaliseHost(host: string): string | null {
   const trimmed = host.toLowerCase().replace(/\.$/, '');
-  if (net.isIP(trimmed)) return trimmed;
+  if (net.isIPv6(trimmed)) {
+    const canonical = domainToASCII(`[${trimmed}]`);
+    return canonical === '' ? null : canonical.slice(1, -1);
+  }
+  if (net.isIPv4(trimmed)) return trimmed;
   // domainToASCII parses its input as a URL host and silently drops anything
   // after a delimiter ('api.example.com/evil' -> 'api.example.com'), so refuse
   // URL syntax before converting.

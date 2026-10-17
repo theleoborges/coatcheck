@@ -79,6 +79,20 @@ describe('matchesHost', () => {
     expect(matchesHost(patterns('[::1]'), https('[::1]'))).toBe(true);
   });
 
+  it('canonicalises IPv6 on both sides so equivalent spellings match', () => {
+    expect(parseHostPattern('2001:0DB8:0:0::0001')).toMatchObject({ host: '2001:db8::1' });
+    expect(matchesHost(patterns('2001:0db8::0001'), https('[2001:db8::1]'))).toBe(true);
+    expect(matchesHost(patterns('2001:db8::1'), https('2001:0db8:0::1'))).toBe(true);
+    expect(matchesHost(patterns('::ffff:1.2.3.4'), https('[::ffff:102:304]'))).toBe(true);
+  });
+
+  it('rejects IPv6 zone IDs and bracketed non-IPv6 entries', () => {
+    for (const e of ['fe80::1%eth0', '[fe80::1%eth0]', '[api.example.com]', '[10.0.0.5]']) {
+      expect(typeof parseHostPattern(e), e).toBe('string');
+    }
+    expect(matchesHost(patterns('fe80::1'), https('fe80::1%eth0'))).toBe(false);
+  });
+
   it('matches IDN targets against punycode patterns', () => {
     expect(matchesHost(patterns('bücher.example'), https('xn--bcher-kva.example'))).toBe(true);
     expect(matchesHost(patterns('xn--bcher-kva.example'), https('bücher.example'))).toBe(true);
