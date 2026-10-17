@@ -77,6 +77,13 @@ is a different principal. Property 2 is violated. Ways to close it:
 - Block the agent container from the credentials endpoint (`169.254.170.2`)
   with egress rules, if nothing in the agent needs cloud credentials.
 
+provider-aws supports the second option: `COATCHECK_AWS_EXTERNAL_ID` is sent as
+`ExternalId` on `AssumeRole`, and coatcheck warns at startup when
+`COATCHECK_AWS_ROLE_ARN` is set without it. [docs/deploy/aws-ecs.md](deploy/aws-ecs.md)
+is the reference deployment for all three: task definition, IAM policies, the
+per-launch-type limits on blocking `169.254.170.2`, egress rules, and CA key
+handling.
+
 ### The `env` and `file` providers
 
 Property 1 then means the agent cannot read the broker's environment or the

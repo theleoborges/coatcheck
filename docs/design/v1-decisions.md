@@ -391,6 +391,22 @@ file.
 | `COATCHECK_ENV_PREFIX` | `COATCHECK_SECRET_` | shared secrets use `COATCHECK_SHARED_SECRET_` |
 | `COATCHECK_SECRETS_FILE` | required for `file` | `{"secrets":{…},"shared":{…}}`; `put` writes to a temp file, then renames |
 
+**`COATCHECK_AWS_EXTERNAL_ID` details (recorded while implementing roadmap item 18):**
+
+- Sent as `ExternalId` on every `AssumeRole` call for the broker role.
+- Set without `COATCHECK_AWS_ROLE_ARN`, startup fails: there is no role to
+  send it to, so it would protect nothing while looking configured.
+- Validated against STS's format (2–1224 characters of `[\w+=,.@:/-]`). The
+  error never echoes the value, because it is the credential that keeps the
+  agent out of the broker role.
+- The warning for `ROLE_ARN` without it is logged by the provider's default
+  export (`awsConfigWarnings`), not by core, which knows nothing about AWS.
+  It is a warning, not an error: a separate-task deployment can assume a role
+  safely without one.
+- Rejected: reading the value from a file or Secrets Manager inside the
+  provider. ECS container-level `secrets` already inject it into one
+  container from Secrets Manager, fetched by the execution role.
+
 **The env provider accepts only `[a-z0-9-]+` names.** That keeps the mapping
 reversible: `github-token` ↔ `COATCHECK_SECRET_GITHUB_TOKEN` (uppercase, `-` →
 `_`). If a name is outside that set, the provider rejects it as a bad request.

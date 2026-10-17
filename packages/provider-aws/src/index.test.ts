@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { awsErrorCode, loadAwsConfig } from './index.js';
+import { describe, it, expect, vi } from 'vitest';
+import createProvider, { assumeRoleInput, awsConfigWarnings, awsErrorCode, loadAwsConfig } from './index.js';
 import { ConfigError } from '@coatcheck/core';
 
 describe('awsErrorCode', () => {
@@ -64,5 +64,46 @@ describe('loadAwsConfig', () => {
     ]) {
       expect(() => load(env), JSON.stringify(env)).toThrow(ConfigError);
     }
+  });
+});
+
+describe('COATCHECK_AWS_EXTERNAL_ID', () => {
+  const ROLE = 'arn:aws:iam::123456789012:role/coatcheck-broker';
+  const load = (env: Record<string, string>) => loadAwsConfig({ env });
+
+  it('is sent as sts:ExternalId when assuming the broker role', () => {
+    const config = load({ COATCHECK_AWS_ROLE_ARN: ROLE, COATCHECK_AWS_EXTERNAL_ID: 'ext-0123456789abcdef' });
+    expect(assumeRoleInput({ ...config, roleArn: ROLE })).toEqual({
+      RoleArn: ROLE, RoleSessionName: 'coatcheck', DurationSeconds: 3600, ExternalId: 'ext-0123456789abcdef',
+    });
+    expect(assumeRoleInput({ ...load({ COATCHECK_AWS_ROLE_ARN: ROLE }), roleArn: ROLE })).not.toHaveProperty('ExternalId');
+  });
+
+  it('warns at startup when a role is assumed without it (the shared-task-role pitfall)', async () => {
+    expect(awsConfigWarnings(load({ COATCHECK_AWS_ROLE_ARN: ROLE }))).toEqual([expect.stringContaining('without COATCHECK_AWS_EXTERNAL_ID')]);
+    expect(awsConfigWarnings(load({ COATCHECK_AWS_ROLE_ARN: ROLE, COATCHECK_AWS_EXTERNAL_ID: 'ext-1' }))).toEqual([]);
+    expect(awsConfigWarnings(load({}))).toEqual([]);
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await createProvider({ env: { COATCHECK_AWS_ROLE_ARN: ROLE } });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('can assume the broker role itself'));
+      warn.mockClear();
+      await createProvider({ env: { COATCHECK_AWS_ROLE_ARN: ROLE, COATCHECK_AWS_EXTERNAL_ID: 'ext-1' } });
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('rejects a malformed value without echoing it, and a value with no role to assume', () => {
+    expect(() => load({ COATCHECK_AWS_ROLE_ARN: ROLE, COATCHECK_AWS_EXTERNAL_ID: 'has space secret-value' }))
+      .toThrow(/COATCHECK_AWS_EXTERNAL_ID must be/);
+    try {
+      load({ COATCHECK_AWS_ROLE_ARN: ROLE, COATCHECK_AWS_EXTERNAL_ID: 'has space secret-value' });
+    } catch (err) {
+      expect(String((err as Error).message)).not.toContain('secret-value');
+    }
+    expect(() => load({ COATCHECK_AWS_EXTERNAL_ID: 'ext-1' })).toThrow(/COATCHECK_AWS_ROLE_ARN is not/);
   });
 });

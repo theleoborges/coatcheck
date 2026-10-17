@@ -221,7 +221,7 @@ rejected, are in `docs/design/v1-decisions.md`.
     policy file or `_swap_body` in-band. Host binding applies, and
     `Content-Length` is rewritten.
 
-18. **`docs/deploy/aws-ecs.md` and `ExternalId` in provider-aws.** The
+18. **[Done]** **`docs/deploy/aws-ecs.md` and `ExternalId` in provider-aws.** The
     reference deployment covers:
     - the sidecar task definition;
     - health-gated startup;

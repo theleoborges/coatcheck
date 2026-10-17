@@ -10,7 +10,10 @@
 #     -H "Authorization: Bearer cct_..." https://httpbin.org/headers
 #
 # httpbin echoes the real value back: the demo policy binds example-api-key to
-# httpbin.org. The same ticket sent to any other host gets 403. Demo only.
+# httpbin.org. The same ticket sent to postman-echo.com (bound to
+# example-echo-key, so coatcheck intercepts it) gets 403 host-mismatch, and an
+# example-echo-key ticket gets 403 at httpbin.org. A host no secret is bound to
+# is tunnelled untouched: only the useless literal ticket reaches it. Demo only.
 services:
   coatcheck:
     build:

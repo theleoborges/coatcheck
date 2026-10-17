@@ -40,7 +40,7 @@ export COATCHECK_API_TOKEN=$(openssl rand -hex 32)   # required: the demo listen
 docker compose -f examples/docker-compose.env.yml up --build
 ```
 
-This starts coatcheck on `localhost:3128` with two demo secrets set in the compose file: `example-api-key` (single value, `COATCHECK_SECRET_EXAMPLE_API_KEY`) and `example-login` (a username/password pair, `COATCHECK_SECRET_EXAMPLE_LOGIN`).
+This starts coatcheck on `localhost:3128` with three demo secrets set in the compose file: `example-api-key` and `example-echo-key` (single values, `COATCHECK_SECRET_EXAMPLE_API_KEY` and `COATCHECK_SECRET_EXAMPLE_ECHO_KEY`) and `example-login` (a username/password pair, `COATCHECK_SECRET_EXAMPLE_LOGIN`).
 
 ```bash
 # 1. Get a ticket
@@ -55,14 +55,16 @@ curl -s --proxy http://coatcheck:$COATCHECK_API_TOKEN@localhost:3128 --cacert /t
   -H "Authorization: Bearer cct_3b1e…" https://httpbin.org/headers
 ```
 
-httpbin echoes the request headers, so step 3 shows the **real** value arriving upstream. The demo policy (`examples/policy.example.json`) binds `example-api-key` to `httpbin.org`, so the same ticket sent anywhere else is refused:
+httpbin echoes the request headers, so step 3 shows the **real** value arriving upstream. The demo policy (`examples/policy.example.json`) binds `example-api-key` to `httpbin.org` and `example-echo-key` to `postman-echo.com`. The `example-api-key` ticket sent to `postman-echo.com` is refused:
 
 ```bash
 curl -s --proxy http://coatcheck:$COATCHECK_API_TOKEN@localhost:3128 --cacert /tmp/coatcheck-ca.crt \
-  -H "Authorization: Bearer cct_3b1e…" https://example.org/
+  -H "Authorization: Bearer cct_3b1e…" https://postman-echo.com/headers
 # HTTP 403, X-Coatcheck-Denied: host-mismatch
-# {"error":"Secret 'example-api-key' is not allowed for host 'example.org'",…}
+# {"error":"Secret 'example-api-key' is not allowed for host 'postman-echo.com'",…}
 ```
+
+coatcheck only intercepts hosts that some secret is bound to (`COATCHECK_MITM=bound`, the default). Sent to a host nothing is bound to, such as `example.org`, the ticket travels through an untouched tunnel and only the useless `cct_…` literal arrives.
 
 To add a secret, add `COATCHECK_SECRET_<NAME>` to the compose file's environment and restart (see [Secret providers](#secret-providers) for the name mapping).
 
@@ -114,7 +116,7 @@ aws --endpoint-url http://localhost:4566 --region us-east-1 ssm put-parameter \
 
 Both prefixes may contain `{agentId}`, replaced with `COATCHECK_AGENT_ID` (for example `/acme/agents/{agentId}/secrets/`); coatcheck refuses to start if a prefix uses `{agentId}` and it is unset. coatcheck caches backend reads in memory for `COATCHECK_SECRET_CACHE_TTL_SECONDS` (default 5 minutes), so a rotated secret can take that long to show up.
 
-If `COATCHECK_AWS_ROLE_ARN` is set, coatcheck assumes that role through STS (1-hour sessions, renewed every 45 minutes) before reading secrets. The intended deployment gives backend read access to that role only, and gives the agent's own identity none.
+If `COATCHECK_AWS_ROLE_ARN` is set, coatcheck assumes that role through STS (1-hour sessions, renewed every 45 minutes) before reading secrets. The intended deployment gives backend read access to that role only, and gives the agent's own identity none. On ECS a sidecar shares the agent's task role, so the role's trust policy must also require an `sts:ExternalId` that only the coatcheck container holds (`COATCHECK_AWS_EXTERNAL_ID`), or coatcheck must run as a separate task: [docs/deploy/aws-ecs.md](docs/deploy/aws-ecs.md) is the reference deployment.
 
 ## HTTP API
 
@@ -164,6 +166,7 @@ Errors are JSON `{"error":…}` with status 400, 401, 403, 404, 500, 501, or 502
 | `COATCHECK_AWS_SSM_PREFIX` | `/coatcheck/secrets/` | SSM path prefix for named secrets (`aws` provider). Must start and end with `/`; may contain `{agentId}`. |
 | `COATCHECK_AWS_SHARED_PREFIX` | `coatcheck/` | Secrets Manager name prefix for shared keys (`aws` provider); may contain `{agentId}`. |
 | `COATCHECK_AWS_ROLE_ARN` | (unset) | IAM role to assume before reading secrets. If unset, the default AWS credential chain is used. |
+| `COATCHECK_AWS_EXTERNAL_ID` | (unset) | `sts:ExternalId` sent when assuming `COATCHECK_AWS_ROLE_ARN`. Inject it into the coatcheck container only (ECS container `secrets`), so an agent sharing the task role can't assume the broker role. coatcheck warns at startup when a role ARN is set without it, and refuses to start when it is set without a role ARN. See [docs/deploy/aws-ecs.md](docs/deploy/aws-ecs.md). |
 | `COATCHECK_AWS_ROLE_SESSION_NAME` | `coatcheck-{agentId}`, or `coatcheck` | STS session name when assuming the role. |
 
 Region, endpoint (`AWS_REGION`, `AWS_ENDPOINT_URL` for LocalStack) and credentials come from the standard AWS SDK chain; there is no built-in default region.

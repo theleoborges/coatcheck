@@ -10,5 +10,9 @@ awslocal ssm put-parameter --type SecureString --overwrite \
   --value "sk-demo-not-a-real-key"
 
 awslocal ssm put-parameter --type SecureString --overwrite \
+  --name "${PREFIX}example-echo-key" \
+  --value "sk-demo-echo-not-a-real-key"
+
+awslocal ssm put-parameter --type SecureString --overwrite \
   --name "${PREFIX}example-login" \
   --value '{"username":"demo@example.com","password":"hunter2","_cleartext":["username"]}'
