@@ -555,7 +555,7 @@ describe('Vault Handler', () => {
       expect(body.expires_in).toBe(600);
 
       // Tokens resolve only within their session
-      const swap = tokenStore.replaceAllForSession(`${body.username_token} ${body.password_token}`, sid);
+      const swap = tokenStore.replaceAllForSession(`${body.username_token} ${body.password_token}`, sid, https('login.example.com'));
       expect(swap.output).toBe('alice@example.com hunter2');
       // ...and not on the HTTP path
       const httpSwap = tokenStore.replaceAll(`${body.password_token}`, https('login.example.com'));

@@ -179,14 +179,18 @@ export class TokenStore {
 
   /**
    * Like replaceAll, but only substitutes tokens minted for the given CDP
-   * session. Used on the CDP proxy's outbound (agent → Browserbase) leg so a
-   * session's credential tokens resolve only on that session's frames.
+   * session, for a page at `origin` (the session's committed main-frame
+   * origin, or null when unknown). Used on the CDP proxy's outbound leg.
+   * A ticket bound to other hosts, or any ticket while the origin is unknown,
+   * is reported in `denied` and nothing is swapped. Unbound session tickets
+   * swap on any known origin.
    */
-  replaceAllForSession(input: string, sessionId: string): SwapResult {
+  replaceAllForSession(input: string, sessionId: string, origin: MatchTarget | null): SwapResult {
     if (this.tokens.size === 0) return { output: input, swaps: [], denied: [] };
 
     let result = input;
     const swaps: SwapInfo[] = [];
+    const denied: SwapInfo[] = [];
     const now = Date.now();
 
     for (const [tokenId, entry] of this.tokens) {
@@ -195,14 +199,24 @@ export class TokenStore {
         continue;
       }
       if (entry.sessionId !== sessionId) continue;
-      if (result.includes(tokenId)) {
-        result = result.replaceAll(tokenId, entry.realValue);
-        swaps.push({ secretName: entry.secretName, ageMs: now - entry.createdAt });
+      if (!input.includes(tokenId)) continue;
+      const info: SwapInfo = { secretName: entry.secretName, ageMs: now - entry.createdAt };
+      if (origin === null) {
+        denied.push(info);
+        continue;
       }
+      if (entry.allowedHosts === undefined) {
+        info.unbound = true;
+      } else if (!matchesHost(entry.allowedHosts, origin)) {
+        denied.push(info);
+        continue;
+      }
+      result = result.replaceAll(tokenId, entry.realValue);
+      swaps.push(info);
     }
 
-    // Origin binding on the CDP path is roadmap item 15; nothing is denied here yet.
-    return { output: result, swaps, denied: [] };
+    if (denied.length > 0) return { output: input, swaps: [], denied };
+    return { output: result, swaps, denied };
   }
 
   /**

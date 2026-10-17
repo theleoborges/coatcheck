@@ -3,6 +3,7 @@ import type { AddressInfo } from 'node:net';
 import type { TokenStore } from '../token-store.js';
 import type { CdpSessionStore } from '../cdp-session-store.js';
 import { substituteOutbound, substituteInbound } from './substitution.js';
+import { OriginTracker } from './origin-tracker.js';
 import { KeystrokeDetector } from './keystroke-detector.js';
 
 const DEFAULT_PORT = 8444;
@@ -67,6 +68,8 @@ export function startCdpProxy(opts: CdpProxyOptions): Promise<CdpProxyHandle> {
     console.log(`[cdp] session sid=${sid} adapter=${cdpSessionStore.adapterName(sid) ?? 'unknown'} connected, dialling upstream`);
 
     const detector = new KeystrokeDetector();
+    // Committed main-frame origin per flattened CDP session (Input.insertText binding).
+    const origins = new OriginTracker();
     const upstream = new WebSocket(realConnectUrl);
     const pending: Array<{ payload: string | Buffer; isBinary: boolean }> = [];
     let upstreamOpen = false;
@@ -106,12 +109,13 @@ export function startCdpProxy(opts: CdpProxyOptions): Promise<CdpProxyHandle> {
         if (text !== null) {
           const matched = detector.inspect(text, tokenStore.sessionTokenIds(sid!));
           if (matched) {
-            const id = extractFrameId(raw);
+            const { id, sessionId } = extractFrameRouting(raw);
             console.warn(`[cdp] sid=${sid} FAIL-CLOSED: page.type() detected on a vault token`);
             sendCdpError(
               clientWs,
               id,
               'credential-flow violation: page.type() detected on a vault token; use page.fill() instead',
+              sessionId,
             );
             return; // drop the frame — never forward the literal token upstream
           }
@@ -120,11 +124,23 @@ export function startCdpProxy(opts: CdpProxyOptions): Promise<CdpProxyHandle> {
         return;
       }
 
-      const result = substituteOutbound(raw, tokenStore, sid!);
+      if (raw.indexOf('"Page.navigate') !== -1 || raw.indexOf('"Page.reload"') !== -1) {
+        const parsed = parseJson(raw);
+        if (parsed) origins.onOutbound(parsed);
+      }
+
+      const result = substituteOutbound(raw, tokenStore, sid!, cdpSessionId => origins.originFor(cdpSessionId));
+      if (result.denial) {
+        const { id, sessionId, secretNames, message } = result.denial;
+        console.warn(`[cdp] sid=${sid} FAIL-CLOSED: origin binding refused Input.insertText secrets=${secretNames.join(',')}`);
+        sendCdpError(clientWs, id, message, sessionId);
+        return; // drop the frame — the ticket never reaches the browser
+      }
       if (result.unsupportedTokenMethod) {
-        console.warn(
-          `[cdp] sid=${sid} token observed in unsupported method ${result.unsupportedTokenMethod} (not substituted)`,
-        );
+        // Runtime.* carrying a ticket is normal (Playwright's fill passes the
+        // value to its injected script); it is forwarded unsubstituted by design.
+        const log = result.unsupportedTokenMethod.startsWith('Runtime.') ? console.log : console.warn;
+        log(`[cdp] sid=${sid} token observed in ${result.unsupportedTokenMethod} (not substituted)`);
       }
       if (result.substitutions > 0) {
         console.log(`[cdp] sid=${sid} outbound substitutions=${result.substitutions}`);
@@ -165,7 +181,12 @@ export function startCdpProxy(opts: CdpProxyOptions): Promise<CdpProxyHandle> {
         if (!closed) clientWs.send(data, { binary: true });
         return;
       }
-      const result = substituteInbound(data.toString(), tokenStore, sid!);
+      const raw = data.toString();
+      if (raw.indexOf('"Page.frame') !== -1 || raw.indexOf('"Target.detachedFromTarget"') !== -1 || origins.awaitingNavigateResponse) {
+        const parsed = parseJson(raw);
+        if (parsed) origins.onInbound(parsed);
+      }
+      const result = substituteInbound(raw, tokenStore, sid!);
       if (result.dropped) {
         console.warn(`[cdp] sid=${sid} inbound frame dropped (real value present)`);
         return; // do not forward — echo-back floor
@@ -216,19 +237,32 @@ function extractKeyEventText(raw: string): string | null {
   return null;
 }
 
-function extractFrameId(raw: string): number | null {
+function parseJson(raw: string): Record<string, unknown> | null {
   try {
-    const parsed = JSON.parse(raw) as { id?: unknown };
-    return typeof parsed.id === 'number' ? parsed.id : null;
+    const parsed: unknown = JSON.parse(raw);
+    return parsed !== null && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
   } catch {
     return null;
   }
 }
 
-function sendCdpError(clientWs: WebSocket, id: number | null, message: string): void {
+/** The `id` and flattened `sessionId` of a request, so an error reaches the waiting call. */
+function extractFrameRouting(raw: string): { id: unknown; sessionId?: string } {
+  const parsed = parseJson(raw);
+  return {
+    id: parsed?.id ?? null,
+    sessionId: typeof parsed?.sessionId === 'string' ? parsed.sessionId : undefined,
+  };
+}
+
+function sendCdpError(clientWs: WebSocket, id: unknown, message: string, sessionId?: string): void {
   if (clientWs.readyState !== WebSocket.OPEN) return;
   clientWs.send(
-    JSON.stringify({ id: id ?? 0, error: { code: CDP_ERROR_CODE, message } }),
+    JSON.stringify({
+      id: typeof id === 'number' || typeof id === 'string' ? id : 0,
+      ...(sessionId !== undefined ? { sessionId } : {}),
+      error: { code: CDP_ERROR_CODE, message },
+    }),
     { binary: false },
   );
 }

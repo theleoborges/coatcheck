@@ -1,11 +1,16 @@
 import { TICKET_PREFIX, type TokenStore } from '../token-store.js';
+import type { MatchTarget } from '../host-matcher.js';
 
 /**
  * CDP frame substitution (design: docs/design/cdp-injection.md).
  *
- * Outbound (agent → Browserbase): replace session-scoped `cct_*` tokens with
- *   their real values in the small set of CDP methods a login flow can reach.
- * Inbound (Browserbase → agent): defend echo-back. Redact any real value to a
+ * Outbound (agent → browser): replace session-scoped `cct_*` tokens with their
+ *   real values in `Input.insertText` only (what `page.fill()` sends), and only
+ *   when the CDP session's committed main-frame origin is one of the ticket's
+ *   allowed hosts. Otherwise the frame is dropped and answered with a CDP error.
+ *   `Runtime.evaluate` / `Runtime.callFunctionOn` are never substitution sites:
+ *   an expression could send the value anywhere.
+ * Inbound (browser → agent): defend echo-back. Redact any real value to a
  *   `[REDACTED:<secretName>]` marker; if a frame still carries a real value after
  *   redaction (unparseable / binary-ish), drop it entirely (the byte-level floor).
  *
@@ -14,11 +19,25 @@ import { TICKET_PREFIX, type TokenStore } from '../token-store.js';
  * JSON parsing entirely.
  */
 
+/** A CDP session's origin for the binding check (see `OriginTracker.originFor`). */
+export type OriginLookup = (cdpSessionId: string | undefined) => { target: MatchTarget } | { unknown: string };
+
+export interface OutboundDenial {
+  /** The request's `id` and `sessionId`, so the CDP error reaches the waiting call. */
+  id: unknown;
+  sessionId?: string;
+  secretNames: string[];
+  /** CDP error message: names and host only, never a value. */
+  message: string;
+}
+
 export interface OutboundResult {
   payload: string;
   substitutions: number;
-  /** A supported-but-unlisted method that still carried a `cct_*` literal. */
+  /** A method other than `Input.insertText` that still carried a `cct_*` literal (forwarded unchanged). */
   unsupportedTokenMethod?: string;
+  /** Set when the frame must be dropped and answered with a CDP error. */
+  denial?: OutboundDenial;
 }
 
 export interface InboundResult {
@@ -28,69 +47,43 @@ export interface InboundResult {
   dropped: boolean;
 }
 
-/** Substitute outbound `cct_*` tokens for the given session. */
+/** Substitute outbound `cct_*` tokens for the given session, gated on the page origin. */
 export function substituteOutbound(
   raw: string,
   tokenStore: TokenStore,
   sessionId: string,
+  originFor: OriginLookup,
 ): OutboundResult {
   // Pre-filter: no token literal, nothing to do.
   if (raw.indexOf(TICKET_PREFIX) === -1) return { payload: raw, substitutions: 0 };
 
-  let parsed: { method?: string; params?: Record<string, unknown> };
+  let parsed: { id?: unknown; sessionId?: unknown; method?: string; params?: Record<string, unknown> };
   try {
     parsed = JSON.parse(raw);
   } catch {
     return { payload: raw, substitutions: 0 };
   }
 
-  // Collect (container, key) targets to scan, by CDP method. Only the methods a
-  // form-fill login realistically reaches are handled; anything else is left
-  // untouched (and flagged below so we learn about gaps without leaking).
-  const targets: Array<{ container: Record<string, unknown>; key: string }> = [];
-  const method = parsed.method;
   const params = parsed.params;
-  if (method === 'Input.insertText' && params) {
-    targets.push({ container: params, key: 'text' });
-  } else if (method === 'Runtime.evaluate' && params) {
-    targets.push({ container: params, key: 'expression' });
-  } else if (method === 'Runtime.callFunctionOn' && params) {
-    targets.push({ container: params, key: 'functionDeclaration' });
-    // Playwright pads `arguments` with internal context entries before the
-    // user's args — iterate the whole array, never index-assume.
-    const args = params.arguments;
-    if (Array.isArray(args)) {
-      for (const arg of args) {
-        if (arg && typeof arg === 'object') {
-          targets.push({ container: arg as Record<string, unknown>, key: 'value' });
-        }
-      }
-    }
+  if (parsed.method !== 'Input.insertText' || !params || typeof params.text !== 'string') {
+    // Not a substitution site. Surface it (names only, via the caller's log)
+    // so production tells us about uncovered code paths.
+    return { payload: raw, substitutions: 0, unsupportedTokenMethod: parsed.method ?? '(response)' };
   }
 
-  let substitutions = 0;
-  let mutated = false;
-  for (const { container, key } of targets) {
-    const current = container[key];
-    if (typeof current !== 'string') continue;
-    const r = tokenStore.replaceAllForSession(current, sessionId);
-    if (r.swaps.length > 0) {
-      container[key] = r.output;
-      substitutions += r.swaps.length;
-      mutated = true;
-    }
+  const cdpSessionId = typeof parsed.sessionId === 'string' ? parsed.sessionId : undefined;
+  const origin = originFor(cdpSessionId);
+  const r = tokenStore.replaceAllForSession(params.text, sessionId, 'target' in origin ? origin.target : null);
+  if (r.denied.length > 0) {
+    const secretNames = r.denied.map(d => d.secretName);
+    const message = 'target' in origin
+      ? `credential-origin violation: ${secretNames.join(', ')} not allowed on ${origin.target.scheme}://${origin.target.host}`
+      : `credential-origin violation: page origin unknown (${origin.unknown}); ${secretNames.join(', ')} not filled`;
+    return { payload: raw, substitutions: 0, denial: { id: parsed.id, sessionId: cdpSessionId, secretNames, message } };
   }
-
-  // A `cct_*` literal survived in a method we don't substitute. Don't leak it,
-  // but surface it so production tells us about an uncovered code path.
-  const unsupportedTokenMethod =
-    !mutated && targets.length === 0 ? method : undefined;
-
-  return {
-    payload: mutated ? JSON.stringify(parsed) : raw,
-    substitutions,
-    unsupportedTokenMethod,
-  };
+  if (r.swaps.length === 0) return { payload: raw, substitutions: 0 };
+  params.text = r.output;
+  return { payload: JSON.stringify(parsed), substitutions: r.swaps.length };
 }
 
 /** Redact inbound echo-back of real values; drop the frame if it can't be cleaned. */

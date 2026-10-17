@@ -188,7 +188,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 14. **[Done]** **Validate `mint-tokens` sessions.** Give `VaultDeps` the
     `CdpSessionStore`. An unknown or expired sid gets `404`.
 
-15. **CDP origin binding.**
+15. **[Done]** **CDP origin binding.**
     - Track each CDP session's committed main-frame URL from
       `Page.frameNavigated`.
     - `Input.insertText` substitutes a session-bound ticket only when that host

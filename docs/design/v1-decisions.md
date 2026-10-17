@@ -475,6 +475,59 @@ export interface BrowserAdapter {
 - `CdpSessionStore.register(url, adapterName)` records the adapter name for
   logging.
 
+### CDP origin binding details (recorded while implementing roadmap item 15)
+
+- **Origin state is per flattened CDP `sessionId`** (the top-level
+  `sessionId` field of a frame; frames without one share a root entry). It
+  holds the main frame's id and committed URL from `Page.frameNavigated`
+  with no `parentId`, and is dropped on `Target.detachedFromTarget`.
+- **A navigation in progress makes the origin unknown.** Otherwise a fill
+  sent right after a navigation to another site is checked against the old
+  origin and can land on the new page (time of check vs. time of use). The
+  origin is unknown:
+  - from an outbound `Page.navigate`, `Page.reload` or
+    `Page.navigateToHistoryEntry` on that session until the next main-frame
+    `Page.frameNavigated`, a main-frame `Page.frameStoppedLoading`, or a
+    `Page.navigate` response with no `loaderId` (same-document) or an
+    `errorText`;
+  - from an inbound main-frame `Page.frameStartedLoading` until the next
+    main-frame `Page.frameNavigated` or `Page.frameStoppedLoading`.
+
+  A navigation started by page script, or by a click whose start event hasn't
+  reached coatcheck yet, can still race a fill; that is documented with the
+  script-on-allowed-origin risk.
+- **Only `http:` and `https:` origins can match.** `about:blank`, `data:`,
+  `chrome-error:` and the like are unknown origins. The page URL's scheme is
+  passed to `matchesHost`, so an `http://` page needs an `http://` entry, as
+  on the HTTP path.
+- **Unbound session tickets** (`COATCHECK_ALLOW_UNBOUND_SECRETS=1`) substitute
+  on any known origin, never on an unknown one.
+- **A denial drops the whole frame.** coatcheck answers with a CDP error
+  carrying the request's `id` and `sessionId` (so Playwright routes it to the
+  waiting call), code `-32000`, message `credential-origin violation: …`
+  naming the secret and the page host, never a value. The keystroke
+  detector's error gains the `sessionId` too. Playwright retries an action
+  on any CDP error that isn't a JavaScript or session-closed error, so a
+  refused `page.fill` is refused on every retry and surfaces as a
+  `TimeoutError` after the action timeout; the reason is in coatcheck's log
+  (`FAIL-CLOSED: origin binding refused …`). Accepted: no CDP error shape
+  makes Playwright stop retrying, and the refusal is what matters.
+- **No substitution in `Runtime.evaluate` or `Runtime.callFunctionOn`.**
+  Playwright's `fill` passes the value to its injected script through
+  `callFunctionOn.arguments`, but for text, email and password inputs the
+  script only selects the field and returns `needsinput`; the value itself
+  goes out as `Input.insertText`. So the injected script sees the ticket, and
+  no `callFunctionOn` substitution is needed. Tickets seen in `Runtime.*`
+  frames are logged (names only) and forwarded unchanged. The e2e test
+  proves this on text, email and password inputs.
+- **E2E test:** `playwright` (exact pin, core devDependency) launches local
+  Chromium with `--remote-debugging-port` and
+  `--host-resolver-rules` mapping two test hostnames to a local HTTP server;
+  the test registers the browser's CDP URL as a sid, connects through the CDP
+  proxy with `connectOverCDP`, and checks the submitted form. CI installs
+  Chromium with `npx playwright install --with-deps chromium`. The test runs
+  in the normal `npm test`.
+
 ### `mint-tokens` session details (recorded while implementing roadmap item 14)
 
 - **A sid is live from `register` until its 10-minute TTL if no client

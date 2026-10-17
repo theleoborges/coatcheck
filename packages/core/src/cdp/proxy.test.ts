@@ -4,6 +4,9 @@ import type { AddressInfo } from 'node:net';
 import { TokenStore } from '../token-store.js';
 import { CdpSessionStore } from '../cdp-session-store.js';
 import { startCdpProxy, type CdpProxyHandle } from './proxy.js';
+import { parseHostPattern, type HostPattern } from '../host-matcher.js';
+
+const hosts = (...entries: string[]) => entries.map(e => parseHostPattern(e) as HostPattern);
 
 function once<T = unknown>(emitter: { once(event: string, cb: (...a: unknown[]) => void): unknown }, event: string): Promise<T> {
   return new Promise(resolve => emitter.once(event, (...args: unknown[]) => resolve(args[0] as T)));
@@ -68,15 +71,60 @@ describe('CDP proxy', () => {
     expect(code).toBe(1008);
   });
 
-  it('substitutes an outbound token (page.fill) before it reaches upstream', async () => {
-    const sid = await setup();
-    const tok = tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid }).id;
+  /** The browser reports a committed main-frame navigation on flattened session T1. */
+  async function navigated(url: string, sessionId = 'T1') {
+    upstream.pushToClient(JSON.stringify({ method: 'Page.frameNavigated', sessionId, params: { frame: { id: 'F1', url } } }));
+    await once(client, 'message');
+  }
 
-    client.send(JSON.stringify({ id: 1, method: 'Input.insertText', params: { text: tok } }));
+  it('substitutes an outbound token (page.fill) on an allowed origin before it reaches upstream', async () => {
+    const sid = await setup();
+    const tok = tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid, allowedHosts: hosts('login.example.com') }).id;
+    await navigated('https://login.example.com/signin');
+
+    client.send(JSON.stringify({ id: 1, sessionId: 'T1', method: 'Input.insertText', params: { text: tok } }));
     await new Promise(r => setTimeout(r, 50));
 
     expect(upstream.received).toHaveLength(1);
     expect(JSON.parse(upstream.received[0]).params.text).toBe('real-secret-42');
+  });
+
+  // Attack (roadmap item 15): fill a login ticket into a page on another origin.
+  it('refuses a fill on another origin: nothing reaches upstream, the caller gets a CDP error', async () => {
+    const sid = await setup();
+    const tok = tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid, allowedHosts: hosts('login.example.com') }).id;
+    await navigated('https://attacker.example/fake-login');
+
+    const errP = once<Buffer>(client, 'message');
+    client.send(JSON.stringify({ id: 9, sessionId: 'T1', method: 'Input.insertText', params: { text: tok } }));
+    const err = JSON.parse((await errP).toString());
+    expect(err).toEqual({
+      id: 9,
+      sessionId: 'T1',
+      error: { code: -32000, message: 'credential-origin violation: site:password not allowed on https://attacker.example' },
+    });
+    await new Promise(r => setTimeout(r, 50));
+    expect(upstream.received).toHaveLength(0);
+  });
+
+  it('refuses a fill when no navigation was seen, and during a navigation', async () => {
+    const sid = await setup();
+    const tok = tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid, allowedHosts: hosts('login.example.com') }).id;
+
+    let errP = once<Buffer>(client, 'message');
+    client.send(JSON.stringify({ id: 1, sessionId: 'T1', method: 'Input.insertText', params: { text: tok } }));
+    expect(JSON.parse((await errP).toString()).error.message).toContain('page origin unknown');
+
+    // On the login page, the agent starts navigating away and fills immediately.
+    await navigated('https://login.example.com/signin');
+    client.send(JSON.stringify({ id: 2, sessionId: 'T1', method: 'Page.navigate', params: { url: 'https://attacker.example/' } }));
+    errP = once<Buffer>(client, 'message');
+    client.send(JSON.stringify({ id: 3, sessionId: 'T1', method: 'Input.insertText', params: { text: tok } }));
+    expect(JSON.parse((await errP).toString()).error.message).toContain('a navigation is in progress');
+
+    await new Promise(r => setTimeout(r, 50));
+    expect(upstream.received.map(f => JSON.parse(f).method)).toEqual(['Page.navigate']);
+    expect(upstream.received.join('')).not.toContain('real-secret-42');
   });
 
   it('redacts an inbound echo-back of the real value', async () => {

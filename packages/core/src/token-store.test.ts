@@ -204,9 +204,47 @@ describe('TokenStore', () => {
       const b = store.issue('site:password', 'pw-b', { sessionId: 'sess-2' });
 
       const input = `${a.id} ${b.id}`;
-      const r1 = store.replaceAllForSession(input, 'sess-1');
+      const r1 = store.replaceAllForSession(input, 'sess-1', ANY_HOST);
       expect(r1.output).toBe(`pw-a ${b.id}`);
       expect(r1.swaps.map(s => s.secretName)).toEqual(['site:password']);
+    });
+
+    it('replaceAllForSession swaps a bound ticket only when the page origin matches', () => {
+      store = new TokenStore();
+      const allowedHosts = [parseHostPattern('login.example.com') as HostPattern];
+      const t = store.issue('site:password', 'pw', { sessionId: 'sess-1', allowedHosts });
+      const ok = store.replaceAllForSession(`v=${t.id}`, 'sess-1', { host: 'login.example.com', scheme: 'https' });
+      expect(ok.output).toBe('v=pw');
+      expect(ok.denied).toEqual([]);
+
+      // Attack: same ticket, page on another origin, or a plaintext page for an https-only entry.
+      for (const origin of [{ host: 'attacker.example', scheme: 'https' as const }, { host: 'login.example.com', scheme: 'http' as const }]) {
+        const r = store.replaceAllForSession(`v=${t.id}`, 'sess-1', origin);
+        expect(r.output).toBe(`v=${t.id}`);
+        expect(r.swaps).toEqual([]);
+        expect(r.denied.map(d => d.secretName)).toEqual(['site:password']);
+      }
+    });
+
+    it('replaceAllForSession denies every ticket, bound or not, when the origin is unknown', () => {
+      store = new TokenStore();
+      const unbound = store.issue('site:username', 'alice', { sessionId: 'sess-1' });
+      const r = store.replaceAllForSession(`${unbound.id}`, 'sess-1', null);
+      expect(r.output).toBe(unbound.id);
+      expect(r.denied).toHaveLength(1);
+      // ...while an unbound ticket swaps on any known origin.
+      expect(store.replaceAllForSession(`${unbound.id}`, 'sess-1', ANY_HOST).swaps[0]).toMatchObject({ unbound: true });
+      // Text without tickets is never denied.
+      expect(store.replaceAllForSession('plain', 'sess-1', null).denied).toEqual([]);
+    });
+
+    it('one denied ticket denies the whole frame', () => {
+      store = new TokenStore();
+      const a = store.issue('a', 'va', { sessionId: 's', allowedHosts: [parseHostPattern('a.example') as HostPattern] });
+      const b = store.issue('b', 'vb', { sessionId: 's', allowedHosts: [parseHostPattern('b.example') as HostPattern] });
+      const r = store.replaceAllForSession(`${a.id} ${b.id}`, 's', { host: 'a.example', scheme: 'https' });
+      expect(r.output).toBe(`${a.id} ${b.id}`);
+      expect(r.denied.map(d => d.secretName)).toEqual(['b']);
     });
 
     it('replaceAll (HTTP path) never substitutes session-scoped tokens', () => {
@@ -256,7 +294,7 @@ describe('TokenStore', () => {
       store = new TokenStore();
       const t = store.issue('site:password', 'pw', { sessionId: 'sess-1', ttlSeconds: 0 });
       await new Promise(r => setTimeout(r, 10));
-      const r = store.replaceAllForSession(`x ${t.id}`, 'sess-1');
+      const r = store.replaceAllForSession(`x ${t.id}`, 'sess-1', ANY_HOST);
       expect(r.output).toBe(`x ${t.id}`);
       expect(store.sessionValues('sess-1')).toEqual([]);
     });
