@@ -36,7 +36,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 ## Phase 2: foundations
 
-3. **Make the proxy testable.** Split `src/index.ts` into a side-effect-free
+3. **[Done]** **Make the proxy testable.** Split `src/index.ts` into a side-effect-free
    `createCoatcheck(deps)` factory and modules for the MITM handler, the
    plain-HTTP forwarder, and swap logging. Add tests for keep-alive,
    passthrough vs MITM, `connectUrl` rewrite wiring, and the forward path.

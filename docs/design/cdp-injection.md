@@ -2,7 +2,7 @@
 
 Status: **implemented (v1)**, behind `CDP_PROXY_ENABLED=1`.
 Code: `src/cdp/proxy.ts`, `src/cdp/substitution.ts`, `src/cdp/keystroke-detector.ts`,
-`src/cdp-session-store.ts`, `src/browserbase-rewrite.ts`, wiring in `src/index.ts`,
+`src/cdp-session-store.ts`, `src/browserbase-rewrite.ts`, wiring in `src/mitm.ts` and `src/index.ts`,
 mint endpoint in `src/vault-handler.ts`.
 
 ## Problem
@@ -61,8 +61,8 @@ agent ── ws://127.0.0.1:8444/cdp/{sid} ──▶ coatcheck :8444 (CDP proxy)
 Both listeners run in one process and share the `TokenStore`. The CDP
 listener binds to the same host as the HTTP listener (`PROXY_BIND_HOST`,
 default `127.0.0.1`), port `CDP_PROXY_PORT` (default 8444)
-(`src/index.ts:20`, `src/index.ts:304-313`). If the CDP listener fails to bind,
-the process exits (`src/index.ts:307-309`), so a deployment that gates the agent
+(`src/index.ts`). If the CDP listener fails to bind,
+the process exits (`src/index.ts`), so a deployment that gates the agent
 on broker health also gates it on the CDP listener.
 
 ### Step 1: connectUrl rewrite
@@ -73,7 +73,7 @@ agent received that URL it could connect directly and bypass substitution.
 
 When the CDP proxy is enabled and the CONNECT target is the vendor API host,
 coatcheck replaces the plain response pipe with a streaming rewriter
-(`src/index.ts:184-195`). `createConnectUrlRewriter` (`src/browserbase-rewrite.ts`)
+(`src/mitm.ts`). `createConnectUrlRewriter` (`src/browserbase-rewrite.ts`)
 is a small HTTP/1.1 response parser:
 
 - Frames each response by `Content-Length`, or decodes `Transfer-Encoding:
@@ -91,7 +91,7 @@ The replacement is produced by `CdpSessionStore.register(realConnectUrl)`
 in the real URL never reaches the agent.
 
 The rewrite only happens on a MITM'd connection. The MITM is only engaged when
-the token store is non-empty at CONNECT time (`src/index.ts:95`); in practice
+the token store is non-empty at CONNECT time (`src/mitm.ts`); in practice
 the session-create request carries the API-key ticket, so the store is
 non-empty.
 
@@ -234,8 +234,8 @@ session remains the client's job.
 
 | Condition | Behaviour |
 |---|---|
-| `CDP_PROXY_ENABLED` unset | No CDP listener; `connectUrl` not rewritten; agent receives the real vendor URL (`src/index.ts:184`, `:311-313`). Credential injection unavailable. |
-| Token store empty at CONNECT time | Tunnel is passthrough; `connectUrl` not rewritten for that connection (`src/index.ts:95-99`). |
+| `CDP_PROXY_ENABLED` unset | No CDP listener; `connectUrl` not rewritten; agent receives the real vendor URL (`src/mitm.ts`, `src/index.ts`). Credential injection unavailable. |
+| Token store empty at CONNECT time | Tunnel is passthrough; `connectUrl` not rewritten for that connection (`src/mitm.ts`). |
 | sid unknown or expired (10 min) | WebSocket closed 1008. |
 | Second concurrent CDP connection | Closed 1013. |
 | Upstream does not open within 10 s | Torn down; session tickets revoked. |
@@ -291,7 +291,7 @@ session remains the client's job.
 The vendor-specific pieces are small:
 
 - the REST host whose responses are rewritten (`BROWSERBASE_API_HOST`,
-  `src/index.ts:26`), and
+  `src/server.ts`), and
 - the response rewriter that finds and replaces the CDP URL
   (`src/browserbase-rewrite.ts`, keyed on the JSON field `connectUrl`).
 

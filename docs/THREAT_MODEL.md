@@ -120,9 +120,9 @@ ticket into a request to any destination.
 | `curl -v` on the agent side shows only the ticket | Substitution happens after TLS termination, on coatcheck's upstream leg |
 | Session-bound (browser) tickets never resolve on HTTPS | `src/token-store.ts:133` |
 | Shared secrets are allowlisted | `/_secret/{name}` refuses names outside a hard-coded allowlist (`src/vault-handler.ts:18-20`, `:150-154`) |
-| Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`src/index.ts`) |
+| Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`src/mitm.ts`) |
 | CONNECT targets cannot reach a shell or the filesystem | Targets are parsed strictly (RFC 1123 DNS name or IP literal, port 1–65535; otherwise `400`) (`src/connect-target.ts`). Certificates are generated in-process with WebCrypto; leaf keys stay in memory (LRU, 1000 entries) and only the CA is written to disk, when `CA_DIR` is set (`src/ca.ts`). |
-| Logs carry no values | Swap logs record secret names, host, and ticket age only (`src/index.ts:269-290`) |
+| Logs carry no values | Swap logs record secret names, host, and ticket age only (`src/swap-log.ts`) |
 
 ## Known gaps
 
@@ -132,8 +132,8 @@ Severity reflects the attacker above. File references are to `src/`.
 
 `TokenStore.replaceAll` substitutes every active unscoped ticket into any
 request, whatever the destination (`token-store.ts:119-141`), on both the
-plain-HTTP forward path (`index.ts:41-77`, `:228-255`) and the HTTPS MITM path
-(`index.ts:152`, `:257-261`). So:
+plain-HTTP forward path (`forward.ts`) and the HTTPS MITM path
+(`mitm.ts`). So:
 
 ```bash
 TOK=$(curl -s http://127.0.0.1:3128/_vault/some-api-key | jq -r .token)
@@ -158,7 +158,7 @@ single-use option.
 
 ### MEDIUM: MITM engages only when the token store is non-empty
 
-At CONNECT time, an empty store means a raw TCP tunnel (`index.ts:94-99`). A
+At CONNECT time, an empty store means a raw TCP tunnel (`mitm.ts`). A
 tunnel opened before the first ticket was issued stays passthrough for its
 whole life, so a client with a keep-alive connection pool can later send a
 ticket down an un-MITM'd tunnel. It fails closed (the upstream sees `tok_…`
@@ -169,7 +169,7 @@ and any future allowlist would not apply to those tunnels.
 
 `/_vault`, `/_vault/{name}`, `/_vault/mint-tokens`, `/_vault/{name}/refresh`,
 and `/_secret/{name}` accept any caller (`vault-handler.ts:26-203`). Isolation
-rests entirely on the listener binding to `127.0.0.1` (`index.ts:295`). Setting
+rests entirely on the listener binding to `127.0.0.1` (`index.ts`). Setting
 `PROXY_BIND_HOST=0.0.0.0` (intended for local dev) lets anything that can
 reach the port mint tickets and, combined with the host-binding gap, read every
 secret. The CDP listener uses the same bind host and authenticates only by
@@ -178,18 +178,18 @@ sid.
 ### LOW: Host header not checked against the CONNECT target
 
 Inside a MITM'd tunnel the request's `Host` header is forwarded untouched
-while the upstream socket goes to the CONNECT hostname (`index.ts:173`). TLS
+while the upstream socket goes to the CONNECT hostname (`mitm.ts`). TLS
 SNI from the client is not compared either. Harmless today, but any future
 host-bound policy must key on the CONNECT target (the actual upstream), never
 on `Host`.
 
 ### LOW: request bodies are not swapped
 
-Only headers and URL are rewritten (`index.ts:148-157`, `:228-255`). Body
+Only headers and URL are rewritten (`mitm.ts`, `forward.ts`). Body
 bytes pass through. This is a functional limitation (tickets in JSON or
 form bodies do not work) and narrows the substitution surface, which is
 mildly protective. Related: `Transfer-Encoding: chunked` request bodies are not
-parsed (`index.ts:137-143`), so a chunked body can misalign the request parser
+parsed (`mitm.ts`), so a chunked body can misalign the request parser
 on a keep-alive tunnel. The MITM also assumes HTTP/1.1 request/response:
 WebSocket upgrades or other protocols tunneled through a MITM'd CONNECT stall.
 
