@@ -35,7 +35,7 @@ export class CertAuthority {
       execSync(`openssl genrsa -out ${caKeyPath} 2048 2>/dev/null`);
       execSync(
         `openssl req -new -x509 -key ${caKeyPath} -out ${caCertPath} -days 365 ` +
-        `-subj "/CN=Liv Secret Proxy CA/O=Liv4All" 2>/dev/null`
+        `-subj "/CN=coatcheck CA/O=coatcheck" 2>/dev/null`
       );
       this.caKey = fs.readFileSync(caKeyPath, 'utf8');
       this.caCert = fs.readFileSync(caCertPath, 'utf8');

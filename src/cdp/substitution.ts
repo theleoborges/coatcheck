@@ -1,8 +1,7 @@
 import type { TokenStore } from '../token-store.js';
 
 /**
- * CDP frame substitution, ported from the de-risk probe at
- * docs/future-work/cdp-credential-injection-probe/test.js.
+ * CDP frame substitution (design: docs/design/cdp-injection.md).
  *
  * Outbound (agent → Browserbase): replace session-scoped `tok_*` tokens with
  *   their real values in the small set of CDP methods a login flow can reach.

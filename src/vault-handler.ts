@@ -13,7 +13,7 @@ export interface VaultDeps {
  * Fleet-wide secrets the agent is permitted to request via /_secret/{name}.
  * These live at `liv/{name}` in AWS Secrets Manager. Adding a name here grants
  * every agent the ability to mint short-lived tokens for it — only add secrets
- * that are fleet-shared API keys consumed by skill or OpenClaw code paths.
+ * that are fleet-shared API keys consumed by agent tooling.
  */
 const FLEET_SECRET_ALLOWLIST = new Set<string>([
   'browserbase-api-key',
@@ -171,7 +171,7 @@ export function handleVaultRequest(
   }
 
   // Mint session-scoped credential tokens for a web login (CDP injection).
-  // The credential is an ordinary multi-value secret (short handle like `coles`,
+  // The credential is an ordinary multi-value secret (short handle like `example-login`,
   // since vault names can't be FQDNs) with `username` and `password` fields.
   // Tokens are bound to the agent's CDP session so they only resolve on that
   // session's WebSocket frames.
@@ -226,7 +226,7 @@ const MINT_MAX_TTL_SECONDS = 1800; // 30 minutes — cap to bound credential exp
  * Mint session-scoped username/password tokens for a stored web login.
  *
  * The credential is a normal multi-value secret (vault names are alphanumeric +
- * dashes, so it's a short handle like `coles`, NOT a domain) with `username` +
+ * dashes, so it's a short handle like `example-login`, NOT a domain) with `username` +
  * `password` fields. The user tells the agent which secret to use. Tokens are
  * bound to the caller's CDP session id so they only substitute on that session's
  * frames and are revoked when the session closes.

@@ -1,0 +1,46 @@
+# Local demo: coatcheck backed by LocalStack (SSM + Secrets Manager).
+#
+#   docker compose -f docker-compose.example.yml up --build
+#   curl -s localhost:3128/_vault/example-api-key        # -> {"token":"tok_...", ...}
+#   curl -s localhost:3128/_ca > /tmp/coatcheck-ca.crt
+#   curl -s --proxy http://localhost:3128 --cacert /tmp/coatcheck-ca.crt \
+#     -H "Authorization: Bearer tok_..." https://httpbin.org/headers
+#
+# httpbin echoes the real value back — exactly the exfiltration path that
+# host-bound tickets will close (see docs/THREAT_MODEL.md). Demo only.
+services:
+  coatcheck:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    environment:
+      - AGENT_LABEL=demo
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      # Published ports need a non-loopback bind. In production run as a
+      # sidecar and keep the default 127.0.0.1.
+      - PROXY_BIND_HOST=0.0.0.0
+      - CDP_PROXY_ENABLED=${CDP_PROXY_ENABLED:-0}
+      - CDP_PROXY_ADVERTISE_HOST=${CDP_PROXY_ADVERTISE_HOST:-127.0.0.1}
+      # No PROXY_ROLE_ARN: STS AssumeRole is skipped, static creds are used.
+    ports:
+      - '3128:3128'
+      - '8444:8444'
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+  localstack:
+    image: localstack/localstack:3.8
+    environment:
+      - SERVICES=ssm,secretsmanager,sts
+      - AGENT_LABEL=demo
+    volumes:
+      - ./examples/localstack-init.sh:/etc/localstack/init/ready.d/seed.sh:ro
+    healthcheck:
+      test: ['CMD', 'curl', '-sf', 'http://localhost:4566/_localstack/health']
+      interval: 5s
+      timeout: 3s
+      retries: 10

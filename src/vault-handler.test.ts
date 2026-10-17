@@ -291,8 +291,8 @@ describe('Vault Handler', () => {
     });
 
     it('returns 403 for non-allowlisted secret name', async () => {
-      await setup({}, { 'litellm-master-key': 'sk-master-xxx' });
-      const { status, body } = await fetchJSON(port, '/_secret/litellm-master-key');
+      await setup({}, { 'internal-admin-key': 'sk-master-xxx' });
+      const { status, body } = await fetchJSON(port, '/_secret/internal-admin-key');
       expect(status).toBe(403);
       expect(body.error).toContain('not in the fleet allowlist');
       // No token issued — even though the upstream secret exists, the proxy refuses to mint
@@ -321,9 +321,9 @@ describe('Vault Handler', () => {
     const login = JSON.stringify({ username: 'alice@example.com', password: 'hunter2' });
 
     it('mints session-scoped username/password tokens by secret name', async () => {
-      await setup({ coles: login });
+      await setup({ 'example-login': login });
       const { status, body } = await postJSON(port, '/_vault/mint-tokens', {
-        secretName: 'coles',
+        secretName: 'example-login',
         sessionId: 'sess-1',
       });
       expect(status).toBe(200);
@@ -342,7 +342,7 @@ describe('Vault Handler', () => {
     it('returns 404 when no credential is stored under that name', async () => {
       await setup({});
       const { status, body } = await postJSON(port, '/_vault/mint-tokens', {
-        secretName: 'coles',
+        secretName: 'example-login',
         sessionId: 'sess-1',
       });
       expect(status).toBe(404);
@@ -350,9 +350,9 @@ describe('Vault Handler', () => {
     });
 
     it('returns 400 when the secret lacks username/password fields', async () => {
-      await setup({ coles: JSON.stringify({ 'api-key': 'x' }) });
+      await setup({ 'example-login': JSON.stringify({ 'api-key': 'x' }) });
       const { status, body } = await postJSON(port, '/_vault/mint-tokens', {
-        secretName: 'coles',
+        secretName: 'example-login',
         sessionId: 'sess-1',
       });
       expect(status).toBe(400);
@@ -360,16 +360,16 @@ describe('Vault Handler', () => {
     });
 
     it('returns 400 when secretName or sessionId is missing', async () => {
-      await setup({ coles: login });
-      const { status, body } = await postJSON(port, '/_vault/mint-tokens', { secretName: 'coles' });
+      await setup({ 'example-login': login });
+      const { status, body } = await postJSON(port, '/_vault/mint-tokens', { secretName: 'example-login' });
       expect(status).toBe(400);
       expect(body.error).toContain('required');
     });
 
     it('caps an over-long requested TTL', async () => {
-      await setup({ coles: login });
+      await setup({ 'example-login': login });
       const { status, body } = await postJSON(port, '/_vault/mint-tokens', {
-        secretName: 'coles',
+        secretName: 'example-login',
         sessionId: 'sess-1',
         expires_in: 99999,
       });
