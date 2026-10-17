@@ -37,13 +37,13 @@ npm workspaces (`packages/*`), TypeScript project references (`tsc -b`). Core ne
 | `ca.ts` | In-process ECDSA P-256 root CA + per-host leaf certs (`@peculiar/x509` on WebCrypto); leafs in an in-memory LRU; only the CA persists, and only when `COATCHECK_CA_DIR` is set |
 | `connect-target.ts` | Strict `CONNECT` target parser (RFC 1123 DNS name or IP literal, port 1–65535); invalid → 400 |
 | `token-store.ts` | In-memory tickets, TTL 900s default; `issue(name, value, {ttlSeconds, allowedHosts, sessionId})`; `replaceAll(input, {host, scheme})` denies the whole request if any ticket is bound elsewhere; `replaceAllForSession` (CDP; origin check is roadmap item 15) |
-| `vault-handler.ts` | `/_health`, `/_ca`, `/_vault*`, `/_secret/*`, `mint-tokens`, OAuth `refresh`; multi-field JSON secrets + `_cleartext`; `InvalidSecretNameError` from a provider → 400 |
+| `vault-handler.ts` | `/_health`, `/_ca`, `/_vault*`, `/_secret/*`, `mint-tokens` (live sid required via `VaultDeps.cdpSessionStore`, else 404), OAuth `refresh`; multi-field JSON secrets + `_cleartext`; `InvalidSecretNameError` from a provider → 400 |
 | `secret-provider.ts` | `SecretProvider` / `SecretStore` / `Secret` / `CreateProvider` interfaces, `withCache`, `InvalidSecretNameError`, secret-name validation (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, enforced in `vault-handler.ts` before any provider call) |
 | `memory-provider.ts` | In-memory provider for tests and embedding (not selectable via `COATCHECK_PROVIDER`) |
 | `json-response-rewriter.ts` | `createJsonResponseRewriter(transform)`: vendor-neutral HTTP/1.1 response framing (Content-Length, chunked → Content-Length) around a JSON transform |
 | `browser-adapters.ts` | `BrowserAdapter {name, hosts, rewriteJson(body, register)}`; Browserbase adapter: rewrites every `ws(s)://…browserbase.com` value (parsed hostname) + any `ws(s)` `connectUrl`, deletes `signingKey` and live-view URLs; `COATCHECK_BROWSER_ADAPTERS` built-ins |
 | `browserbase-rewrite.ts` | Retained `createConnectUrlRewriter` wrapper (key-based `connectUrl` rewrite) over `createJsonResponseRewriter` |
-| `cdp-session-store.ts` | sid → real CDP URL + adapter name (`register(url, adapterName)`), 10 min TTL |
+| `cdp-session-store.ts` | sid → real CDP URL + adapter name (`register(url, adapterName)`), 10 min TTL until connected; `markConnected` keeps it live until `revoke` (teardown); `has(sid)` |
 | `cdp/proxy.ts` | WS proxy on 8444, `MAX_CONCURRENT=1`, teardown revokes session tickets |
 | `cdp/substitution.ts` | Outbound swap in `Input.insertText`, `Runtime.evaluate`, `Runtime.callFunctionOn`; inbound echo-back redaction/drop |
 | `cdp/keystroke-detector.ts` | Fails closed on `page.type()` (keystroke-by-keystroke ticket entry) |

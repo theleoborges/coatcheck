@@ -55,6 +55,20 @@ export class CdpSessionStore {
     return entry.realConnectUrl;
   }
 
+  /** True while `sid` is live: registered and not expired, revoked, or (once connected) closed. */
+  has(sid: string): boolean {
+    return this.get(sid) !== null;
+  }
+
+  /**
+   * A client connected: the sid stays live until `revoke` (connection
+   * teardown) instead of expiring at its TTL, so a long session can still mint.
+   */
+  markConnected(sid: string): void {
+    const entry = this.sessions.get(sid);
+    if (entry) entry.expiresAt = Number.POSITIVE_INFINITY;
+  }
+
   /** The adapter that registered a live sid, or null if unknown/expired. */
   adapterName(sid: string): string | null {
     return this.get(sid) === null ? null : this.sessions.get(sid)!.adapterName;

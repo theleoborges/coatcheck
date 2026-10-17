@@ -63,6 +63,7 @@ export function startCdpProxy(opts: CdpProxyOptions): Promise<CdpProxyHandle> {
     }
 
     activeConnections++;
+    cdpSessionStore.markConnected(sid!);
     console.log(`[cdp] session sid=${sid} adapter=${cdpSessionStore.adapterName(sid) ?? 'unknown'} connected, dialling upstream`);
 
     const detector = new KeystrokeDetector();

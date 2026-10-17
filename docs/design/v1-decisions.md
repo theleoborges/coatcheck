@@ -475,6 +475,20 @@ export interface BrowserAdapter {
 - `CdpSessionStore.register(url, adapterName)` records the adapter name for
   logging.
 
+### `mint-tokens` session details (recorded while implementing roadmap item 14)
+
+- **A sid is live from `register` until its 10-minute TTL if no client
+  connects; once a client connects, it stays live until that connection
+  closes** (teardown revokes it). `mint-tokens` accepts only live sids.
+  Rationale: the TTL exists to bound unused rewrites; expiring a connected
+  session would make a login that starts more than 10 minutes into a session
+  fail with `404`, and a closed session must not take new tickets.
+- **The check runs before the provider is called**, right after body
+  validation, and answers `404 {"error":"Unknown or expired CDP session"}`
+  without echoing the sid. No ticket is issued.
+- `VaultDeps.cdpSessionStore` is required (only `has` is used), so a caller
+  can't forget it and silently skip the check.
+
 ### Adapter details (recorded while implementing roadmap item 13)
 
 - **Field names checked against the Browserbase API reference

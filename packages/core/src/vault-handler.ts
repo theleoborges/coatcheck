@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { TokenStore } from './token-store.js';
 import type { CertAuthority } from './ca.js';
+import type { CdpSessionStore } from './cdp-session-store.js';
 import { InvalidSecretNameError, isValidSecretName, type SecretProvider } from './secret-provider.js';
 import { policyHostsFor, type Policy } from './policy.js';
 import { matchesHost, type HostPattern } from './host-matcher.js';
@@ -16,6 +17,8 @@ export interface VaultDeps {
   policy: Policy;
   /** `COATCHECK_ALLOW_UNBOUND_SECRETS`: mint unbound tickets instead of refusing with 403. */
   allowUnboundSecrets?: boolean;
+  /** Live CDP sessions: `mint-tokens` refuses an unknown, expired or closed sid with 404. */
+  cdpSessionStore: Pick<CdpSessionStore, 'has'>;
 }
 
 /**
@@ -303,6 +306,14 @@ function handleMintTokens(
   if (!isValidSecretName(secretName)) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Invalid secret name' }));
+    return;
+  }
+  // Only sessions coatcheck created (via an adapter rewrite) and that are still
+  // live can take credentials; checked before the provider is consulted.
+  if (!deps.cdpSessionStore.has(sessionId)) {
+    console.warn(`[mint] secret=${secretName} rejected: unknown or expired CDP session`);
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unknown or expired CDP session' }));
     return;
   }
 

@@ -241,7 +241,13 @@ inspected.
 
 See `docs/design/cdp-injection.md` for gaps specific to the CDP path: no
 origin binding, `Runtime.evaluate` exfiltration, transform-blind redaction,
-uninspected binary frames, `mint-tokens` not validating `sessionId`.
+uninspected binary frames.
+
+Fixed by roadmap item 14: `mint-tokens` accepted any `sessionId`, so a caller
+could mint credential tickets for a session that didn't exist or had already
+closed. It now requires a live sid from `CdpSessionStore` and answers `404`
+otherwise, before reading the credential (`vault-handler.ts`; attack tests in
+`vault-handler.test.ts`).
 
 Fixed by roadmap item 13: with a valid browser-service API-key ticket, the
 agent could call Browserbase's `/v1/sessions/{id}/debug` and receive raw CDP

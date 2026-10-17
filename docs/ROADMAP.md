@@ -185,7 +185,7 @@ rejected, are in `docs/design/v1-decisions.md`.
       API.
     - Existing CDP tests keep passing.
 
-14. **Validate `mint-tokens` sessions.** Give `VaultDeps` the
+14. **[Done]** **Validate `mint-tokens` sessions.** Give `VaultDeps` the
     `CdpSessionStore`. An unknown or expired sid gets `404`.
 
 15. **CDP origin binding.**

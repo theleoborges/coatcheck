@@ -130,4 +130,20 @@ describe('CDP proxy', () => {
     expect(tokenStore.sessionValues(sid)).toHaveLength(0);
     expect(cdpSessionStore.get(sid)).toBeNull();
   });
+
+  it('keeps a connected sid live until the connection closes, then refuses it', async () => {
+    const sid = await setup();
+    expect(cdpSessionStore.has(sid)).toBe(true);
+    // Connected: no longer subject to the registration TTL.
+    const realNow = Date.now;
+    Date.now = () => realNow() + 3_600_000;
+    try {
+      expect(cdpSessionStore.has(sid)).toBe(true);
+    } finally {
+      Date.now = realNow;
+    }
+    client.close();
+    await new Promise(r => setTimeout(r, 50));
+    expect(cdpSessionStore.has(sid)).toBe(false);
+  });
 });

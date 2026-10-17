@@ -114,7 +114,11 @@ listed in `COATCHECK_PASSTHROUGH_HOSTS`, which disables the rewrite.
 
 Body: `{ "secretName": "<name>", "sessionId": "<sid>", "expires_in"?: <seconds> }`.
 
-`handleMintTokens` (`packages/core/src/vault-handler.ts:234-296`) reads the named secret,
+`handleMintTokens` (`packages/core/src/vault-handler.ts`) first checks that the
+sid is live in `CdpSessionStore` (registered by an adapter rewrite and not
+expired; once a client connects it stays live until that connection closes).
+An unknown, expired or closed sid gets `404 {"error":"Unknown or expired CDP
+session"}` before the provider is called. It then reads the named secret,
 requires it to be a JSON object with non-empty string `username` and
 `password` fields, and issues two tickets with
 `TokenStore.issueForSession(...)` (`packages/core/src/token-store.ts:81`). TTL defaults to
@@ -252,6 +256,7 @@ session remains the client's job.
 | `COATCHECK_CDP_ENABLED` unset | No CDP listener; `connectUrl` not rewritten; agent receives the real vendor URL (`packages/core/src/mitm.ts`, `packages/core/src/start.ts`). Credential injection unavailable. |
 | Token store empty at CONNECT time | Tunnel is passthrough; `connectUrl` not rewritten for that connection (`packages/core/src/mitm.ts`). |
 | sid unknown or expired (10 min) | WebSocket closed 1008. |
+| `mint-tokens` for an unknown, expired or closed sid | `404`, no ticket issued, provider not called. |
 | Second concurrent CDP connection | Closed 1013. |
 | Upstream does not open within 10 s | Torn down; session tickets revoked. |
 | >256 frames queued before upstream opens | CDP error to client, torn down. |
@@ -286,12 +291,6 @@ session remains the client's job.
   (`Page.captureScreenshot` returns base64 inside a text frame, which the
   literal-match redactor will not match) and any rendered password (for
   example after a "show password" toggle) reach the agent.
-- **`mint-tokens` does not validate `sessionId`.** `handleMintTokens` accepts
-  any string and does not check it against `CdpSessionStore`
-  (`packages/core/src/vault-handler.ts:240-247`; `VaultDeps` has no session store). Tickets
-  can be minted for a sid that does not exist yet or never will; they simply
-  never substitute until their TTL expires. It also means the caller, not
-  coatcheck, decides which session a credential binds to.
 - **Other routes to the same browser bypass the proxy.** Inbound redaction
   only covers traffic that flows through this listener. Since roadmap item 13
   the Browserbase adapter rewrites every Browserbase WebSocket URL in API

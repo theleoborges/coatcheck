@@ -60,6 +60,7 @@ export function createCoatcheck(deps: CoatcheckDeps): Coatcheck {
     missingSecretUrl: deps.missingSecretUrl,
     policy: deps.policy ?? EMPTY_POLICY,
     allowUnboundSecrets: deps.allowUnboundSecrets ?? false,
+    cdpSessionStore: deps.cdpSessionStore,
   };
 
   const auth = createApiAuth(deps.apiToken);
