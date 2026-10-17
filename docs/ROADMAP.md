@@ -94,7 +94,7 @@ rejected, are in `docs/design/v1-decisions.md`.
      - `AWS_ENDPOINT_URL` is left to the SDK.
    - Add `COATCHECK_TICKET_TTL_SECONDS`.
 
-8. **Policy file and host matcher.** `COATCHECK_POLICY_FILE` (JSON) maps secret
+8. **[Done]** **Policy file and host matcher.** `COATCHECK_POLICY_FILE` (JSON) maps secret
    names (trailing `*` allowed) to `allowed_hosts`. It also lists the shared
    secrets, replacing the hard-coded allowlist in `src/vault-handler.ts`.
 

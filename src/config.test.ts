@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { ConfigError, LEGACY_ENV_NAMES, loadConfig, type Env } from './config.js';
+import { EMPTY_POLICY } from './policy.js';
 
 const base: Env = { COATCHECK_PROVIDER: 'aws' };
 
@@ -25,6 +26,8 @@ describe('loadConfig', () => {
       ca: { dir: undefined, subject: 'CN=coatcheck CA, O=coatcheck' },
       missingSecretUrl: undefined,
       cdp: undefined,
+      policy: EMPTY_POLICY,
+      policyFile: undefined,
     });
   });
 
@@ -53,6 +56,8 @@ describe('loadConfig', () => {
       ca: { dir: '/var/lib/coatcheck/ca', subject: 'CN=Example CA' },
       missingSecretUrl: 'https://dashboard.example.com/secrets',
       cdp: { port: 9444, advertiseHost: 'coatcheck' },
+      policy: EMPTY_POLICY,
+      policyFile: undefined,
     });
   });
 
@@ -99,5 +104,29 @@ describe('loadConfig', () => {
 
   it('formats a readable error', () => {
     expect(() => loadConfig({ AGENT_LABEL: 'x' })).toThrow(/Invalid configuration:\n {2}- AGENT_LABEL was renamed to COATCHECK_AGENT_ID/);
+  });
+
+  it('loads the policy file through the injected reader', () => {
+    const files: Record<string, string> = {
+      '/etc/coatcheck/policy.json': JSON.stringify({
+        secrets: { 'github-token': { allowed_hosts: ['api.github.com'] } },
+        shared: { 'browserbase-api-key': { allowed_hosts: ['api.browserbase.com'] } },
+      }),
+    };
+    const config = loadConfig({ ...base, COATCHECK_POLICY_FILE: '/etc/coatcheck/policy.json' }, p => files[p]);
+    expect(config.policyFile).toBe('/etc/coatcheck/policy.json');
+    expect(config.policy.secrets).toHaveLength(1);
+    expect([...config.policy.shared.keys()]).toEqual(['browserbase-api-key']);
+  });
+
+  it('fails startup on an unreadable or invalid policy file', () => {
+    const missing = problems({ ...base, COATCHECK_POLICY_FILE: '/nope.json' });
+    expect(missing).toEqual([expect.stringContaining("cannot read '/nope.json'")]);
+    try {
+      loadConfig({ ...base, COATCHECK_POLICY_FILE: '/p.json' }, () => '{"secrets":{"a":{"allowed_hosts":["*"]}}}');
+      expect.unreachable();
+    } catch (err) {
+      expect((err as ConfigError).problems).toEqual([expect.stringContaining('secrets["a"].allowed_hosts[0]')]);
+    }
   });
 });

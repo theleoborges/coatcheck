@@ -119,7 +119,7 @@ ticket into a request to any destination.
 | Tickets expire | 900 s default (`src/token-store.ts:4`); session-bound tickets 600 s default, 1800 s max (`src/vault-handler.ts:222-223`) |
 | `curl -v` on the agent side shows only the ticket | Substitution happens after TLS termination, on coatcheck's upstream leg |
 | Session-bound (browser) tickets never resolve on HTTPS | `src/token-store.ts:133` |
-| Shared secrets are allowlisted | `/_secret/{name}` refuses names outside a hard-coded allowlist (`src/vault-handler.ts`) |
+| Shared secrets are allowlisted | `/_secret/{name}` refuses names not listed under `shared` in the operator's policy file; with no policy file, it refuses every name (`src/policy.ts`, `src/vault-handler.ts`) |
 | Secret names are validated before any provider call | `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (no `/`, no leading `.`), checked after URL-decoding on every route that takes a name; invalid names get `400` (`isValidSecretName`, `src/secret-provider.ts`; `src/vault-handler.ts`) |
 | Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`src/mitm.ts`) |
 | CONNECT targets cannot reach a shell or the filesystem | Targets are parsed strictly (RFC 1123 DNS name or IP literal, port 1–65535; otherwise `400`) (`src/connect-target.ts`). Certificates are generated in-process with WebCrypto; leaf keys stay in memory (LRU, 1000 entries) and only the CA is written to disk, when `COATCHECK_CA_DIR` is set (`src/ca.ts`). |
@@ -149,7 +149,9 @@ for. Until host binding lands, coatcheck keeps secrets out of the agent's
 context, logs, and disk, and stops passive leaks (an echoed env var, a pasted
 log), but does **not** stop an agent that is actively trying to exfiltrate.
 Fix: per-secret `allowed_hosts` checked against the CONNECT target (see
-`docs/ROADMAP.md`).
+`docs/ROADMAP.md`). The policy file and host matcher exist (`src/policy.ts`,
+`src/host-matcher.ts`), so allowed hosts can already be declared and are
+validated at startup, but nothing enforces them yet (roadmap item 9).
 
 ### MEDIUM: tickets are reusable until TTL
 

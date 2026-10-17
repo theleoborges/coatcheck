@@ -69,7 +69,7 @@ aws --endpoint-url http://localhost:4566 --region us-east-1 ssm put-parameter \
 |---|---|---|
 | Named secret | SSM SecureString at `{COATCHECK_AWS_SSM_PREFIX}{name}` (default `/coatcheck/secrets/{name}`) | `/_vault/{name}` |
 | Multi-value secret | Same location, with a JSON object as the value (`{"username":…,"password":…}`) | `/_vault/{name}?field=…` |
-| Shared key | Secrets Manager `{COATCHECK_AWS_SHARED_PREFIX}{name}` (default `coatcheck/{name}`), which must also be in a compiled-in allowlist | `/_secret/{name}` |
+| Shared key | Secrets Manager `{COATCHECK_AWS_SHARED_PREFIX}{name}` (default `coatcheck/{name}`), which must also be listed under `shared` in the [policy file](#policy-file) | `/_secret/{name}` |
 
 Both prefixes may contain `{agentId}`, replaced with `COATCHECK_AGENT_ID` (for example `/acme/agents/{agentId}/secrets/`); coatcheck refuses to start if a prefix uses `{agentId}` and it is unset. coatcheck caches backend reads in memory for `COATCHECK_SECRET_CACHE_TTL_SECONDS` (default 5 minutes), so a rotated secret can take that long to show up.
 
@@ -88,7 +88,7 @@ The API is served on the proxy port (default `127.0.0.1:3128`). **It has no auth
 | `GET /_vault/{name}` | `{"type":"multi","fields":[…]}` | For a multi-value (JSON) secret. Request a specific field with `?field=`. |
 | `GET /_vault/{name}?field={f}` | `{"token":"cct_…","expires_in":900}` | Ticket for one field. If the secret's `_cleartext` array lists the field, returns `{"value":"…","cleartext":true}` instead (for non-sensitive values such as URLs and account IDs). |
 | `GET /_vault/{name}?check=1` | `{"exists":true}` | Checks whether a secret exists without decrypting it. |
-| `GET /_secret/{name}` | `{"token":"cct_…","expires_in":900}` | Shared key from Secrets Manager. Returns 403 unless `{name}` is in the allowlist (currently `browserbase-api-key`). |
+| `GET /_secret/{name}` | `{"token":"cct_…","expires_in":900}` | Shared key from the backend's shared store. Returns 403 unless `{name}` is listed under `shared` in the policy file (with no policy file, every name gets 403). |
 | `POST /_vault/mint-tokens` | `{"username_token":"cct_…","password_token":"cct_…","expires_in":600}` | Body: `{"secretName":"example-login","sessionId":"<cdp sid>","expires_in"?:N}`. The secret must be a multi-value secret with `username` and `password`. Tickets are bound to one CDP session (see below). Default TTL is 600 s, capped at 1800 s. |
 | `POST /_vault/{name}/refresh` | `{"token":"cct_…","expires_in":900}` | Secret fields: `refresh_token`, `token_url`, `client_id`, `client_secret`. coatcheck posts a `refresh_token` grant, writes `access_token`, `expires_at`, and any rotated `refresh_token` back to the backend, and returns a ticket for the new access token. |
 
@@ -106,6 +106,7 @@ Errors are JSON `{"error":…}` with status 400, 403, 404, 500, 501, or 502.
 | `COATCHECK_BIND_HOST` | `127.0.0.1` | Bind address for the proxy and the CDP proxy. Use `0.0.0.0` only for local docker-compose. |
 | `COATCHECK_TICKET_TTL_SECONDS` | `900` | Lifetime of tickets from `/_vault` and `/_secret`. |
 | `COATCHECK_SECRET_CACHE_TTL_SECONDS` | `300` | How long backend reads are cached; `0` disables the cache. |
+| `COATCHECK_POLICY_FILE` | (unset) | JSON [policy file](#policy-file): allowed hosts per secret and the shared-secret allowlist. Read once at startup; an invalid file stops startup. |
 | `COATCHECK_MISSING_SECRET_URL` | (unset) | Returned as `vault_url` in 404s, e.g. a dashboard where users add secrets. Omitted when unset. |
 | `COATCHECK_CA_SUBJECT` | `CN=coatcheck CA, O=coatcheck` | Subject of a newly generated CA. |
 | `COATCHECK_CA_DIR` | (unset) | Where to persist the CA key and cert (`ca.key`, `ca.crt`). If unset, coatcheck generates an in-memory CA on every start. If an existing ECDSA P-256 CA is found there, coatcheck reuses it; any other key type (for example an RSA CA from an older version) fails startup until the files are deleted. Per-host certificates are never written to disk. |
@@ -120,6 +121,29 @@ Errors are JSON `{"error":…}` with status 400, 403, 404, 500, 501, or 502.
 Region, endpoint (`AWS_REGION`, `AWS_ENDPOINT_URL` for LocalStack) and credentials come from the standard AWS SDK chain; there is no built-in default region.
 
 Earlier variable names (`AGENT_LABEL`, `PROXY_PORT`, `PROXY_BIND_HOST`, `CA_DIR`, `PROXY_ROLE_ARN`, `CDP_PROXY_*`) are rejected at startup with a message naming the replacement. Certificates are generated in-process (ECDSA P-256); coatcheck needs no `openssl` binary.
+
+## Policy file
+
+`COATCHECK_POLICY_FILE` points at a JSON file owned by the operator (see `examples/policy.example.json`):
+
+```json
+{
+  "secrets": {
+    "github-token": { "allowed_hosts": ["api.github.com"] },
+    "google-*":     { "allowed_hosts": ["*.googleapis.com", "oauth2.googleapis.com"] }
+  },
+  "shared": {
+    "browserbase-api-key": { "allowed_hosts": ["api.browserbase.com"] }
+  }
+}
+```
+
+- `secrets` keys are exact secret names or a prefix ending in `*`. An exact name wins over a prefix, and a longer prefix wins over a shorter one.
+- `shared` keys are exact names. Listing a shared secret here is what allowlists it for `/_secret/{name}`.
+- `allowed_hosts` entries are exact hostnames, or `*.example.com`, which matches any subdomain but not `example.com` itself. Entries are case-insensitive and IDNs are converted to punycode. IP addresses match exactly. HTTPS is implied; write `http://host` to also allow plaintext HTTP. Ports and paths are not allowed. A bare `*` and wildcards over a single label (`*.com`) are rejected.
+- The schema is strict: unknown keys, empty `allowed_hosts` lists and invalid entries all stop startup.
+
+> **`allowed_hosts` is parsed and validated but not enforced yet.** Tickets are still swapped on requests to any host. Enforcement is roadmap item 9; until then, treat the file as the shared-secret allowlist plus a declaration of intent.
 
 ## Trusting the CA in the agent container
 

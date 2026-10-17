@@ -5,6 +5,7 @@ import type { SecretProvider } from './secret-provider.js';
 import type { CertAuthority } from './ca.js';
 import type { CdpSessionStore } from './cdp-session-store.js';
 import { handleVaultRequest } from './vault-handler.js';
+import { EMPTY_POLICY, type Policy } from './policy.js';
 import { handleForwardRequest } from './forward.js';
 import { createConnectHandler } from './mitm.js';
 
@@ -17,6 +18,8 @@ export interface CoatcheckDeps {
   cdpSessionStore: CdpSessionStore;
   /** Set when CDP injection is enabled: where rewritten connectUrls point. */
   cdp?: { port: number; advertiseHost: string };
+  /** Operator policy (`COATCHECK_POLICY_FILE`). Default: empty. */
+  policy?: Policy;
   /** `vault_url` hint in 404s (`COATCHECK_MISSING_SECRET_URL`). */
   missingSecretUrl?: string;
   /** Defaults to `api.browserbase.com`. */
@@ -41,6 +44,7 @@ export function createCoatcheck(deps: CoatcheckDeps): Coatcheck {
     provider: deps.provider,
     ca: deps.ca,
     missingSecretUrl: deps.missingSecretUrl,
+    policy: deps.policy ?? EMPTY_POLICY,
   };
 
   const server = http.createServer((req, res) => {

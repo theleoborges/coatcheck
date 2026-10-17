@@ -6,6 +6,7 @@
  */
 
 import { isValidSecretName } from './secret-provider.js';
+import { EMPTY_POLICY, parsePolicy, type Policy } from './policy.js';
 
 export type Env = Readonly<Record<string, string | undefined>>;
 
@@ -24,7 +25,13 @@ export interface Config {
   missingSecretUrl?: string;
   /** Set when CDP injection is enabled. */
   cdp?: { port: number; advertiseHost: string };
+  /** From `COATCHECK_POLICY_FILE`; empty (no shared secrets, nothing bound) when unset. */
+  policy: Policy;
+  policyFile?: string;
 }
+
+/** Reads the policy file. Injected so `loadConfig` stays pure. */
+export type ReadFile = (path: string) => string;
 
 /** Providers available in this build. More arrive with the workspace split (roadmap item 12). */
 export const KNOWN_PROVIDERS = ['aws'] as const;
@@ -94,7 +101,7 @@ export function interpolateAgentId(template: string, agentId: string | undefined
   return template.split('{agentId}').join(agentId);
 }
 
-export function loadConfig(env: Env): Config {
+export function loadConfig(env: Env, readFile?: ReadFile): Config {
   const r = new EnvReader(env);
 
   for (const [legacy, current] of Object.entries(LEGACY_ENV_NAMES)) {
@@ -118,6 +125,19 @@ export function loadConfig(env: Env): Config {
     r.problems.push('COATCHECK_MISSING_SECRET_URL must be an http(s) URL');
   }
 
+  const policyFile = r.string('COATCHECK_POLICY_FILE');
+  let policy = EMPTY_POLICY;
+  if (policyFile !== undefined) {
+    let text: string | undefined;
+    try {
+      if (!readFile) throw new Error('no file reader available');
+      text = readFile(policyFile);
+    } catch (err) {
+      r.problems.push(`COATCHECK_POLICY_FILE: cannot read '${policyFile}' (${(err as Error).message})`);
+    }
+    if (text !== undefined) policy = parsePolicy(text, r.problems, `COATCHECK_POLICY_FILE '${policyFile}'`);
+  }
+
   const cdpEnabled = r.bool('COATCHECK_CDP_ENABLED', false);
   const cdpPort = r.int('COATCHECK_CDP_PORT', 8444, 1, 65535);
   const config: Config = {
@@ -135,6 +155,8 @@ export function loadConfig(env: Env): Config {
     cdp: cdpEnabled
       ? { port: cdpPort, advertiseHost: r.string('COATCHECK_CDP_ADVERTISE_HOST') ?? '127.0.0.1' }
       : undefined,
+    policy,
+    policyFile,
   };
 
   if (r.problems.length > 0) throw new ConfigError(r.problems);

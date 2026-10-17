@@ -2,6 +2,7 @@ import http from 'node:http';
 import { TokenStore } from './token-store.js';
 import type { CertAuthority } from './ca.js';
 import { isValidSecretName, type SecretProvider } from './secret-provider.js';
+import type { Policy } from './policy.js';
 
 export interface VaultDeps {
   tokenStore: TokenStore;
@@ -9,17 +10,9 @@ export interface VaultDeps {
   ca: Pick<CertAuthority, 'caCertPem'>;
   /** Where users manage secrets; returned as `vault_url` in 404s when set. */
   missingSecretUrl?: string;
+  /** Operator policy; its `shared` section is the `/_secret/*` allowlist. */
+  policy: Policy;
 }
-
-/**
- * Shared secrets the agent is permitted to request via /_secret/{name}, read
- * from the provider's shared store. Adding a name here grants every agent the
- * ability to mint short-lived tokens for it — only add shared API keys consumed
- * by agent tooling.
- */
-const SHARED_SECRET_ALLOWLIST = new Set<string>([
-  'browserbase-api-key',
-]);
 
 /**
  * Handle vault API requests (/_health, /_ca, /_vault).
@@ -152,7 +145,9 @@ export function handleVaultRequest(
   if (sharedMatch && req.method === 'GET') {
     const secretName = decodeSecretName(sharedMatch[1], res);
     if (secretName === null) return true;
-    if (!SHARED_SECRET_ALLOWLIST.has(secretName)) {
+    // The policy file's `shared` section is the allowlist: listing a name there
+    // grants every agent the ability to mint short-lived tickets for it.
+    if (!deps.policy.shared.has(secretName)) {
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: `Secret '${secretName}' is not in the shared-secret allowlist` }));
       return true;

@@ -1,0 +1,10 @@
+{
+  "secrets": {
+    "example-api-key": { "allowed_hosts": ["httpbin.org"] },
+    "example-login": { "allowed_hosts": ["*.example.com"] },
+    "github-*": { "allowed_hosts": ["api.github.com", "github.com"] }
+  },
+  "shared": {
+    "browserbase-api-key": { "allowed_hosts": ["api.browserbase.com"] }
+  }
+}

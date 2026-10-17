@@ -21,6 +21,8 @@ Repo is **private** until we're ready to publish. Target license Apache-2.0.
 |---|---|
 | `src/index.ts` | Entrypoint: loads config + provider, builds deps, listens on 3128, starts the CDP proxy, SIGTERM |
 | `src/config.ts` | Pure `loadConfig(env)` → typed `Config`; every `COATCHECK_*` core setting; legacy names fail with "renamed to X"; `ConfigError` lists all problems |
+| `src/policy.ts` | `COATCHECK_POLICY_FILE` parser (strict schema): per-secret `allowed_hosts` rules (exact or `prefix*`, exact > longest prefix) and the `shared` allowlist for `/_secret/*`; `policyHostsFor` |
+| `src/host-matcher.ts` | Allowed-host patterns: exact, `*.suffix` (not apex, ≥2 labels), `http://` opt-in for plaintext, IP exact; normalised (lowercase, punycode); `matchesHost(patterns, {host, scheme})`. **Not enforced at swap time until roadmap item 9** |
 | `src/providers/index.ts` | `loadProvider(name, ctx)`: `COATCHECK_PROVIDER` → provider factory |
 | `src/server.ts` | `createCoatcheck(deps)`: side-effect-free factory for the proxy + vault API server (tests start it on port 0) |
 | `src/mitm.ts` | `CONNECT` → MITM (only when token store non-empty) or passthrough; header/URL token swap on keep-alive requests; `connectUrl` rewrite wiring |
@@ -41,7 +43,7 @@ Repo is **private** until we're ready to publish. Target license Apache-2.0.
 
 ## Known security gaps (fix before going public)
 
-1. **Tickets are not bound to destination hosts** — the MITM path (`src/mitm.ts`) knows the hostname but only logs it. A ticket sent to any host gets the real value. Fix: per-secret allowed hosts/pattern, enforced at swap time (HTTP and CDP).
+1. **Tickets are not bound to destination hosts** — the MITM path (`src/mitm.ts`) knows the hostname but only logs it. A ticket sent to any host gets the real value. The policy file and matcher exist (`src/policy.ts`, `src/host-matcher.ts`); enforcement at swap time (HTTP and CDP) is roadmap item 9.
 2. ~~**Shell injection / path traversal in `src/ca.ts`**~~ — fixed: strict `CONNECT` target validation (`src/connect-target.ts`) and in-process cert generation (`src/ca.ts`, no `openssl`).
 3. **Plain-HTTP forward path also swaps** — `curl -x proxy http://127.0.0.1:<agent-listener>/?k=cct_…` hands the agent the plaintext without leaving the box, so egress enforcement alone doesn't close gap 1. Host binding must cover the HTTP path too.
 4. **The AWS "sidecar assumes a separate role" pattern Liv used was bypassable** — both containers in an ECS task share one task role, and that role was allowed `sts:AssumeRole` on the proxy role, so the agent could assume it directly. `docs/THREAT_MODEL.md` documents correct patterns (separate task, ExternalId only injected into the sidecar, blocking 169.254.170.2). Any AWS deployment guide/provider must not repeat this.

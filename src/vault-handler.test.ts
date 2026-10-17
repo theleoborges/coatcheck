@@ -3,6 +3,12 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { oauthErrorCode, handleVaultRequest, VaultDeps } from './vault-handler.js';
 import { TokenStore } from './token-store.js';
 import { createMemoryProvider, type MemoryProviderInit } from './providers/memory.js';
+import { EMPTY_POLICY, parsePolicy, type Policy } from './policy.js';
+
+/** The policy these tests run under: one allowlisted shared secret. */
+const TEST_POLICY: Policy = parsePolicy(JSON.stringify({
+  shared: { 'browserbase-api-key': { allowed_hosts: ['api.browserbase.com'] } },
+}), []);
 
 // Save real fetch before any tests can mock it
 const realFetch = globalThis.fetch;
@@ -81,7 +87,7 @@ describe('Vault Handler', () => {
   async function setup(
     secrets: Record<string, string>,
     sharedSecrets: Record<string, string> = {},
-    opts: Pick<MemoryProviderInit, 'writable'> & { noShared?: boolean; missingSecretUrl?: string } = {},
+    opts: Pick<MemoryProviderInit, 'writable'> & { noShared?: boolean; missingSecretUrl?: string; policy?: Policy } = {},
   ) {
     tokenStore = new TokenStore();
     const provider = createMemoryProvider({
@@ -90,7 +96,13 @@ describe('Vault Handler', () => {
       writable: opts.writable,
     });
     if (provider.secrets.put) vi.spyOn(provider.secrets, 'put');
-    const deps: VaultDeps = { tokenStore, provider, ca: mockCa(), missingSecretUrl: opts.missingSecretUrl };
+    const deps: VaultDeps = {
+      tokenStore,
+      provider,
+      ca: mockCa(),
+      missingSecretUrl: opts.missingSecretUrl,
+      policy: opts.policy ?? TEST_POLICY,
+    };
     server = createTestServer(deps);
     port = await listen(server);
     return deps;
@@ -340,6 +352,21 @@ describe('Vault Handler', () => {
       expect(body.error).toContain('not in the shared-secret allowlist');
       // No token issued — even though the upstream secret exists, the proxy refuses to mint
       expect(tokenStore.size).toBe(0);
+    });
+
+    it('allowlists only the policy file\'s shared section (none without a policy)', async () => {
+      await setup({}, { 'browserbase-api-key': 'k' }, { policy: EMPTY_POLICY });
+      const { status, body } = await fetchJSON(port, '/_secret/browserbase-api-key');
+      expect(status).toBe(403);
+      expect(body.error).toContain('not in the shared-secret allowlist');
+      expect(tokenStore.size).toBe(0);
+    });
+
+    it('allowlists any shared secret the policy names', async () => {
+      const policy = parsePolicy(JSON.stringify({ shared: { 'search-api-key': { allowed_hosts: ['api.search.example'] } } }), []);
+      await setup({}, { 'search-api-key': 'sk-search', 'browserbase-api-key': 'k' }, { policy });
+      expect((await fetchJSON(port, '/_secret/search-api-key')).status).toBe(200);
+      expect((await fetchJSON(port, '/_secret/browserbase-api-key')).status).toBe(403);
     });
 
     it('rejects invalid shared-secret names with 400', async () => {

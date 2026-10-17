@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { TokenStore } from './token-store.js';
 import { CertAuthority } from './ca.js';
 import { CdpSessionStore } from './cdp-session-store.js';
@@ -22,7 +23,7 @@ function exitOnConfigError(err: unknown): never {
 let config: Config;
 let rawProvider: SecretProvider;
 try {
-  config = loadConfig(env);
+  config = loadConfig(env, path => fs.readFileSync(path, 'utf8'));
   rawProvider = await loadProvider(config.provider, { env, agentId: config.agentId });
 } catch (err) {
   exitOnConfigError(err);
@@ -41,11 +42,15 @@ const coatcheck = createCoatcheck({
   cdpSessionStore,
   cdp: config.cdp,
   missingSecretUrl: config.missingSecretUrl,
+  policy: config.policy,
 });
 
 const { port } = await coatcheck.listen(config.port, config.bindHost);
 console.log(`coatcheck listening on ${config.bindHost}:${port} (provider=${provider.name}${config.agentId ? ` agent=${config.agentId}` : ''})`);
 console.log(`Vault API: http://localhost:${port}/_vault`);
+console.log(config.policyFile
+  ? `Policy: ${config.policyFile} (${config.policy.secrets.length} secret rule(s), ${config.policy.shared.size} shared secret(s))`
+  : 'Policy: none (no shared secrets; set COATCHECK_POLICY_FILE)');
 
 let cdpProxyHandle: { close(): Promise<void> } | null = null;
 if (config.cdp) {

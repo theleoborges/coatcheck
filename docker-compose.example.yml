@@ -27,6 +27,9 @@ services:
       - COATCHECK_CDP_ADVERTISE_HOST=${COATCHECK_CDP_ADVERTISE_HOST:-127.0.0.1}
       # No COATCHECK_AWS_ROLE_ARN: STS AssumeRole is skipped, static creds are used.
       # Default prefixes: /coatcheck/secrets/ (SSM) and coatcheck/ (Secrets Manager).
+      - COATCHECK_POLICY_FILE=/etc/coatcheck/policy.json
+    volumes:
+      - ./examples/policy.example.json:/etc/coatcheck/policy.json:ro
     ports:
       - '3128:3128'
       - '8444:8444'
