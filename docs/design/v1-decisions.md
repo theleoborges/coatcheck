@@ -41,6 +41,45 @@ packages/provider-env/  @coatcheck/provider-env: `.` = env provider, `./file` = 
     and it still needs the dynamic path for third-party providers.
   - Separate repos: premature.
 
+### Packaging details (recorded while implementing roadmap item 12)
+
+- **Providers depend on core, never the reverse.** Provider packages import
+  `ConfigError`, `EnvReader`, `interpolateAgentId`, `isValidSecretName` and
+  the interface types from `@coatcheck/core`, declared as a
+  `peerDependency` so a deployment has exactly one copy of core. Core has no
+  dependency on any provider package: `aws`, `env` and `file` are mapped to
+  `@coatcheck/provider-aws`, `@coatcheck/provider-env` and
+  `@coatcheck/provider-env/file` and loaded with `import()`. If the package
+  isn't installed, startup fails with a `ConfigError` that names the package
+  to install. Rationale: a static dependency would make the AWS SDK part of
+  core's install again, which is what §1 rejects.
+- **A provider module's default export is its `CreateProvider`.** A module
+  without a function default export fails startup with a `ConfigError`.
+  `loadConfig` accepts any non-empty `COATCHECK_PROVIDER`; whether it resolves
+  is only known at `import()` time.
+- **`createMemoryProvider` stays in core** and is exported for tests and
+  embedding. It is not selectable through `COATCHECK_PROVIDER`.
+- **Workspace resolution without a build step.** Each package's `exports` has
+  a `@coatcheck/source` condition pointing at `src/*.ts` ahead of the
+  `types`/`default` entries that point at `dist`. vitest
+  (`resolve.conditions`) and `tsx` (`--conditions`) use it, so tests and
+  `npm run dev` run against source. Published tarballs ship `dist` only;
+  nobody else sets that condition. Rejected: vitest path aliases, which tsx
+  would not share.
+- **`type-check` is `tsc -b`.** Composite project references must emit
+  declarations for downstream packages, so type-check and build are the same
+  command; `build` is kept as a name for CI and the Dockerfiles.
+- **A provider rejects a name with `InvalidSecretNameError`** (exported by
+  core), thrown from `get`/`exists`/`put`; the vault API answers `400` with
+  its message. This is how the env provider refuses names outside
+  `[a-z0-9-]+` (§4) without adding a method to `SecretStore`. Any other
+  provider error stays a logged `500`.
+- **vitest uses inline `projects`**, one per package, from the root config.
+- **The demo files move to `examples/`.** `docker-compose.example.yml`
+  becomes `examples/docker-compose.localstack.yml`; both compose files build
+  from the repo root. The env quickstart uses `Dockerfile` (not
+  `Dockerfile.dev`) since it has nothing to iterate on.
+
 ## 2. SecretProvider interface and naming
 
 ```ts
@@ -435,6 +474,107 @@ export interface BrowserAdapter {
   the current API when implementing.
 - `CdpSessionStore.register(url, adapterName)` records the adapter name for
   logging.
+
+### CDP origin binding details (recorded while implementing roadmap item 15)
+
+- **Origin state is per flattened CDP `sessionId`** (the top-level
+  `sessionId` field of a frame; frames without one share a root entry). It
+  holds the main frame's id and committed URL from `Page.frameNavigated`
+  with no `parentId`, and is dropped on `Target.detachedFromTarget`.
+- **A navigation in progress makes the origin unknown.** Otherwise a fill
+  sent right after a navigation to another site is checked against the old
+  origin and can land on the new page (time of check vs. time of use). The
+  origin is unknown:
+  - from an outbound `Page.navigate`, `Page.reload` or
+    `Page.navigateToHistoryEntry` on that session until the next main-frame
+    `Page.frameNavigated`, a main-frame `Page.frameStoppedLoading`, or a
+    `Page.navigate` response with no `loaderId` (same-document) or an
+    `errorText`;
+  - from an inbound main-frame `Page.frameStartedLoading` until the next
+    main-frame `Page.frameNavigated` or `Page.frameStoppedLoading`.
+
+  A navigation started by page script, or by a click whose start event hasn't
+  reached coatcheck yet, can still race a fill; that is documented with the
+  script-on-allowed-origin risk.
+- **Only `http:` and `https:` origins can match.** `about:blank`, `data:`,
+  `chrome-error:` and the like are unknown origins. The page URL's scheme is
+  passed to `matchesHost`, so an `http://` page needs an `http://` entry, as
+  on the HTTP path.
+- **Unbound session tickets** (`COATCHECK_ALLOW_UNBOUND_SECRETS=1`) substitute
+  on any known origin, never on an unknown one.
+- **A denial drops the whole frame.** coatcheck answers with a CDP error
+  carrying the request's `id` and `sessionId` (so Playwright routes it to the
+  waiting call), code `-32000`, message `credential-origin violation: …`
+  naming the secret and the page host, never a value. The keystroke
+  detector's error gains the `sessionId` too. Playwright retries an action
+  on any CDP error that isn't a JavaScript or session-closed error, so a
+  refused `page.fill` is refused on every retry and surfaces as a
+  `TimeoutError` after the action timeout; the reason is in coatcheck's log
+  (`FAIL-CLOSED: origin binding refused …`). Accepted: no CDP error shape
+  makes Playwright stop retrying, and the refusal is what matters.
+- **No substitution in `Runtime.evaluate` or `Runtime.callFunctionOn`.**
+  Playwright's `fill` passes the value to its injected script through
+  `callFunctionOn.arguments`, but for text, email and password inputs the
+  script only selects the field and returns `needsinput`; the value itself
+  goes out as `Input.insertText`. So the injected script sees the ticket, and
+  no `callFunctionOn` substitution is needed. Tickets seen in `Runtime.*`
+  frames are logged (names only) and forwarded unchanged. The e2e test
+  proves this on text, email and password inputs.
+- **E2E test:** `playwright` (exact pin, core devDependency) launches local
+  Chromium with `--remote-debugging-port` and
+  `--host-resolver-rules` mapping two test hostnames to a local HTTP server;
+  the test registers the browser's CDP URL as a sid, connects through the CDP
+  proxy with `connectOverCDP`, and checks the submitted form. CI installs
+  Chromium with `npx playwright install --with-deps chromium`. The test runs
+  in the normal `npm test`.
+
+### `mint-tokens` session details (recorded while implementing roadmap item 14)
+
+- **A sid is live from `register` until its 10-minute TTL if no client
+  connects; once a client connects, it stays live until that connection
+  closes** (teardown revokes it). `mint-tokens` accepts only live sids.
+  Rationale: the TTL exists to bound unused rewrites; expiring a connected
+  session would make a login that starts more than 10 minutes into a session
+  fail with `404`, and a closed session must not take new tickets.
+- **The check runs before the provider is called**, right after body
+  validation, and answers `404 {"error":"Unknown or expired CDP session"}`
+  without echoing the sid. No ticket is issued.
+- `VaultDeps.cdpSessionStore` is required (only `has` is used), so a caller
+  can't forget it and silently skip the check.
+
+### Adapter details (recorded while implementing roadmap item 13)
+
+- **Field names checked against the Browserbase API reference
+  (2026-10).** Session create returns `connectUrl` (WebSocket),
+  `seleniumRemoteUrl` (HTTP) and `signingKey` ("used to authenticate HTTP
+  connections to the session"). `GET /v1/sessions/{id}/debug` returns
+  `debuggerUrl`, `debuggerFullscreenUrl`, `wsUrl` and `pages[]` with
+  `debuggerUrl` and `debuggerFullscreenUrl`. The reference gives types
+  (`uri`) but no example values, so the adapter can't assume the debugger
+  URLs are WebSocket URLs.
+- **Rewritten:** every string value that parses as a `ws:`/`wss:` URL whose
+  host is `browserbase.com` or a subdomain of it, whatever its key; plus the
+  value of any `connectUrl` key that is a `ws:`/`wss:` URL on any host. The
+  host check uses the parsed hostname, not a regex over the raw string, so
+  `evilbrowserbase.com` doesn't match. `connectUrl` stays key-based as well
+  because it is the CDP endpoint by definition; a vendor domain change must
+  not turn into a bypass.
+- **Removed:** `signingKey`, and any string value that can't be rewritten
+  but would hand the agent a direct route to the browser: an `http(s)` URL
+  whose query embeds a Browserbase WebSocket target (the hosted DevTools
+  viewer shape, `…inspector.html?wss=connect.browserbase.com/…`), and any
+  non-WebSocket `debuggerUrl` / `debuggerFullscreenUrl`. Rationale: a live
+  view in the agent's hands is raw CDP, which is the bypass this item closes.
+  Cost: Browserbase live view is unavailable through coatcheck while CDP is
+  enabled. `seleniumRemoteUrl` is left: without `signingKey` it can't
+  authenticate.
+- **Library adapters replace the env list.** `startCoatcheck({ adapters })`
+  uses exactly the adapters given; when omitted, `COATCHECK_BROWSER_ADAPTERS`
+  (comma-separated built-in names, default `browserbase`; unknown names fail
+  startup) picks built-ins. Rationale: one source of truth per process,
+  and a library user can include `browserbaseAdapter` explicitly.
+- Adapter `hosts` use the `allowed_hosts` syntax (exact or `*.suffix`) and
+  are parsed when the server is built, so a bad pattern fails startup.
 - Existing CDP tests keep passing. `cdp/proxy.test.ts` registers sids directly,
   and `browserbase-rewrite.test.ts` keeps working through a retained
   `createConnectUrlRewriter` wrapper. The tests that intentionally change

@@ -13,7 +13,7 @@ It works like a coat check. You hand over the coat and get a ticket. The ticket 
 ┌──────────────────────┐               ┌──────────────────────────┐
 │                      │ GET /_vault/  │ vault API                │  fetch by name
 │ get ticket ──────────┼──────────────>│  issue cct_… (15 min) ───┼──────────> secret backend
-│   <── cct_9f2c…      │               │                          │            (AWS SSM / SM)
+│   <── cct_9f2c…      │               │                          │            (env, file, AWS)
 │                      │               │                          │
 │ curl -H "Authorization: Bearer cct_9f2c…" https://api.github.com/…
 │   HTTPS_PROXY ───────┼── CONNECT ───>│ MITM TLS (own CA)        │
@@ -21,26 +21,26 @@ It works like a coat check. You hand over the coat and get a ticket. The ticket 
 │                      │               │ in headers / URL         │
 │                      │               │                          │
 │ playwright           │  ws://…/cdp/  │ CDP WebSocket proxy      │
-│   page.fill(cct_…) ──┼──────────────>│ swap in Input.insertText,├──────────> browser service
+│   page.fill(cct_…) ──┼──────────────>│ swap in Input.insertText ├──────────> browser service
 │                      │<──────────────┤ redact echoed secrets    │            (Browserbase)
 └──────────────────────┘               └──────────────────────────┘
 ```
 
 1. **Ticket issuance.** The agent calls `GET http://127.0.0.1:3128/_vault/{name}`. coatcheck fetches the secret from its backend and returns `cct_` plus 64 hex characters. Tickets live only in coatcheck's memory, with a 15-minute TTL. Each ticket is bound to the secret's allowed hosts (see [Policy file](#policy-file)); a secret with no allowed hosts gets no ticket.
 2. **HTTPS substitution.** The agent container sets `HTTPS_PROXY` to coatcheck and trusts coatcheck's CA. coatcheck intercepts `CONNECT` tunnels to hosts a ticket could be used on (hosts in the policy file, hosts of a live ticket, and the browser service's API host) with a per-host certificate it signs itself, negotiating HTTP/1.1. It replaces every active ticket it finds in the request line and headers, then re-encrypts to the real host, with normal certificate verification. A ticket is only replaced when the `CONNECT` target is one of its allowed hosts; otherwise the request is refused with `403` and never forwarded. This works with unmodified tools such as curl, git over HTTPS (with a bearer header), Python `requests`, and Node `fetch`, because they only need proxy support and a trusted CA. Plain-HTTP proxy requests get the same treatment. Every other `CONNECT` is a blind TCP tunnel (see `COATCHECK_MITM`). WebSocket upgrades work through an intercepted tunnel: after `101 Switching Protocols` it becomes a raw pipe.
-3. **Browser (CDP) injection.** With the CDP proxy enabled, coatcheck rewrites the `connectUrl` in the browser service's session-create response so it points at a local WebSocket proxy. The agent's Playwright client connects there. On the way out, coatcheck swaps session-scoped tickets inside `Input.insertText`, `Runtime.evaluate`, and `Runtime.callFunctionOn`. On the way back, it redacts any real value the page echoes. Keystroke-by-keystroke entry fails closed (details [below](#browser--cdp-credential-injection)).
+3. **Browser (CDP) injection.** With the CDP proxy enabled, coatcheck rewrites the browser service's CDP URLs (the session `connectUrl`, and the debug endpoint's URLs) so they point at a local WebSocket proxy. The agent's Playwright client connects there. On the way out, coatcheck swaps session-scoped tickets inside `Input.insertText` (what `page.fill()` sends), and only when the page's origin is one of the login secret's allowed hosts. On the way back, it redacts any real value the page echoes. Keystroke-by-keystroke entry fails closed (details [below](#browser--cdp-credential-injection)).
 4. **OAuth refresh.** `POST /_vault/{name}/refresh` runs the refresh-token exchange inside coatcheck. It writes the new tokens back to the backend and returns only a ticket for the new access token.
 
 ## Quickstart
 
-> The only secret backend right now is **AWS**: SSM Parameter Store for named secrets and Secrets Manager for shared keys. For local use, the example points coatcheck at [LocalStack](https://github.com/localstack/localstack). An env/file provider is planned so you can run without AWS.
+The quickstart needs only Docker: secrets come from environment variables (the `env` provider), so no cloud account is involved.
 
 ```bash
 export COATCHECK_API_TOKEN=$(openssl rand -hex 32)   # required: the demo listens on 0.0.0.0
-docker compose -f docker-compose.example.yml up --build
+docker compose -f examples/docker-compose.env.yml up --build
 ```
 
-This starts coatcheck on `localhost:3128` and LocalStack. It also seeds two demo secrets from `examples/localstack-init.sh`: `example-api-key` (single value) and `example-login` (a username/password pair).
+This starts coatcheck on `localhost:3128` with two demo secrets set in the compose file: `example-api-key` (single value, `COATCHECK_SECRET_EXAMPLE_API_KEY`) and `example-login` (a username/password pair, `COATCHECK_SECRET_EXAMPLE_LOGIN`).
 
 ```bash
 # 1. Get a ticket
@@ -64,7 +64,40 @@ curl -s --proxy http://coatcheck:$COATCHECK_API_TOKEN@localhost:3128 --cacert /t
 # {"error":"Secret 'example-api-key' is not allowed for host 'example.org'",…}
 ```
 
-To add your own secret to LocalStack:
+To add a secret, add `COATCHECK_SECRET_<NAME>` to the compose file's environment and restart (see [Secret providers](#secret-providers) for the name mapping).
+
+## Secret providers
+
+`COATCHECK_PROVIDER` picks the backend at startup. The Docker image ships all three built-ins.
+
+| Value | Package | Backend |
+|---|---|---|
+| `env` | `@coatcheck/provider-env` | Environment variables, read once at startup. Read-only. |
+| `file` | `@coatcheck/provider-env/file` | A JSON file, `{"secrets":{"name":"value",…},"shared":{…}}`, at `COATCHECK_SECRETS_FILE`. Re-read on every (uncached) lookup; OAuth refresh writes it atomically (temp file, then rename). |
+| `aws` | `@coatcheck/provider-aws` | SSM Parameter Store (named secrets) and Secrets Manager (shared keys), optionally through an assumed role. |
+| anything else | your module | A module specifier loaded with `import()`. Its default export is `createProvider(ctx): Promise<SecretProvider>` (types in `@coatcheck/core`). |
+
+Values are strings everywhere; a multi-value secret is a JSON-encoded object.
+
+### env provider names
+
+The `env` provider accepts only secret names made of **lowercase letters, digits and `-`** (`[a-z0-9-]+`), so that a name and its variable map both ways: uppercase the name and replace `-` with `_`.
+
+| Secret name | Variable |
+|---|---|
+| `github-token` (`/_vault/github-token`) | `COATCHECK_SECRET_GITHUB_TOKEN` (prefix: `COATCHECK_ENV_PREFIX`) |
+| `browserbase-api-key` (`/_secret/browserbase-api-key`) | `COATCHECK_SHARED_SECRET_BROWSERBASE_API_KEY` |
+
+Any other name (`GitHub`, `a_b`, `a.b`) gets `400`. `GET /_vault` lists only variables whose names map back. The `file` provider has no such restriction; it uses the core name rules below.
+
+### LocalStack demo (AWS provider)
+
+```bash
+export COATCHECK_API_TOKEN=$(openssl rand -hex 32)
+docker compose -f examples/docker-compose.localstack.yml up --build
+```
+
+This runs the same demo against [LocalStack](https://github.com/localstack/localstack), seeded by `examples/localstack-init.sh`. To add your own secret to LocalStack:
 
 ```bash
 aws --endpoint-url http://localhost:4566 --region us-east-1 ssm put-parameter \
@@ -97,7 +130,7 @@ The API is served on the proxy port (default `127.0.0.1:3128`). With `COATCHECK_
 | `GET /_vault/{name}?field={f}` | `{"token":"cct_…","expires_in":900,"allowed_hosts":[…]}` | Ticket for one field; every field shares the secret's allowed hosts. If the secret's `_cleartext` array lists the field, returns `{"value":"…","cleartext":true}` instead (for non-sensitive values such as URLs and account IDs). |
 | `GET /_vault/{name}?check=1` | `{"exists":true}` | Checks whether a secret exists without decrypting it. |
 | `GET /_secret/{name}` | `{"token":"cct_…","expires_in":900,"allowed_hosts":[…]}` | Shared key from the backend's shared store. Returns 403 unless `{name}` is listed under `shared` in the policy file (with no policy file, every name gets 403). The ticket is bound to the hosts listed there. |
-| `POST /_vault/mint-tokens` | `{"username_token":"cct_…","password_token":"cct_…","expires_in":600,"allowed_hosts":[…]}` | Body: `{"secretName":"example-login","sessionId":"<cdp sid>","expires_in"?:N}`. The secret must be a multi-value secret with `username` and `password`. Tickets are bound to one CDP session (see below). Default TTL is 600 s, capped at 1800 s. The login secret must have allowed hosts; they are recorded on the tickets, but the CDP path does not check them against the page yet (roadmap item 15). |
+| `POST /_vault/mint-tokens` | `{"username_token":"cct_…","password_token":"cct_…","expires_in":600,"allowed_hosts":[…]}` | Body: `{"secretName":"example-login","sessionId":"<cdp sid>","expires_in"?:N}`. The secret must be a multi-value secret with `username` and `password`. Tickets are bound to one CDP session (see below); `404` unless `sessionId` is a live sid from a rewritten URL (unknown, expired, or its connection has closed). Default TTL is 600 s, capped at 1800 s. The login secret must have allowed hosts; the tickets only fill pages on those hosts. |
 | `POST /_vault/{name}/refresh` | `{"token":"cct_…","expires_in":900,"allowed_hosts":[…]}` | Secret fields: `refresh_token`, `token_url`, `client_id`, `client_secret`. The `token_url` host must be one of the secret's allowed hosts (`403` otherwise), because `client_secret` is sent there. coatcheck posts a `refresh_token` grant, writes `access_token`, `expires_at`, and any rotated `refresh_token` back to the backend, and returns a ticket for the new access token, bound to the same hosts. |
 
 Secret names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` after URL-decoding; anything else (including `/` or a leading `.`) gets `400` before the backend is consulted. `refresh` returns `501` when the configured backend is read-only.
@@ -108,7 +141,7 @@ Errors are JSON `{"error":…}` with status 400, 401, 403, 404, 500, 501, or 502
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `COATCHECK_PROVIDER` | (required) | Secret backend. Currently `aws`. |
+| `COATCHECK_PROVIDER` | (required) | Secret backend: `env`, `file`, `aws`, or a module specifier (see [Secret providers](#secret-providers)). |
 | `COATCHECK_AGENT_ID` | (unset) | Optional agent identity: used in logs, in `{agentId}` templates, and in the default STS session name. Same character rules as secret names. |
 | `COATCHECK_PORT` | `3128` | Port for the proxy and the HTTP API. |
 | `COATCHECK_BIND_HOST` | `127.0.0.1` | Bind address for the proxy and the CDP proxy. Any non-loopback address (including `0.0.0.0`) requires `COATCHECK_API_TOKEN`. |
@@ -124,7 +157,10 @@ Errors are JSON `{"error":…}` with status 400, 401, 403, 404, 500, 501, or 502
 | `COATCHECK_CA_DIR` | (unset) | Where to persist the CA key and cert (`ca.key`, `ca.crt`). If unset, coatcheck generates an in-memory CA on every start. If an existing ECDSA P-256 CA is found there, coatcheck reuses it; any other key type (for example an RSA CA from an older version) fails startup until the files are deleted. Per-host certificates are never written to disk. |
 | `COATCHECK_CDP_ENABLED` | `0` | Set to `1` to run the CDP proxy and rewrite browser-service `connectUrl`s. |
 | `COATCHECK_CDP_PORT` | `8444` | CDP WebSocket proxy port. |
+| `COATCHECK_BROWSER_ADAPTERS` | `browserbase` | Comma-separated built-in browser adapters: which browser-service API responses get their CDP URLs rewritten. Custom adapters go through the library API (`startCoatcheck({ adapters })`). |
 | `COATCHECK_CDP_ADVERTISE_HOST` | `127.0.0.1` | Host written into the rewritten `connectUrl`. Override it when the Playwright client is in a different container. |
+| `COATCHECK_ENV_PREFIX` | `COATCHECK_SECRET_` | Variable prefix for named secrets (`env` provider). Shared secrets always use `COATCHECK_SHARED_SECRET_`. |
+| `COATCHECK_SECRETS_FILE` | (required for `file`) | Path of the JSON secrets file (`file` provider). |
 | `COATCHECK_AWS_SSM_PREFIX` | `/coatcheck/secrets/` | SSM path prefix for named secrets (`aws` provider). Must start and end with `/`; may contain `{agentId}`. |
 | `COATCHECK_AWS_SHARED_PREFIX` | `coatcheck/` | Secrets Manager name prefix for shared keys (`aws` provider); may contain `{agentId}`. |
 | `COATCHECK_AWS_ROLE_ARN` | (unset) | IAM role to assume before reading secrets. If unset, the default AWS credential chain is used. |
@@ -223,8 +259,8 @@ On the plain-HTTP path tickets are swapped only in the path, query and headers, 
 
 This lets an agent log into a website through a remote browser without the password entering its context. Set `COATCHECK_CDP_ENABLED=1`. Browserbase is the only supported browser service today.
 
-1. The agent creates a session with `POST https://api.browserbase.com/v1/sessions` **through `HTTPS_PROXY`**, authenticating with a `/_secret/browserbase-api-key` ticket. coatcheck rewrites the response's `connectUrl` from the real `wss://…` URL, which carries Browserbase's signing key, to `ws://{COATCHECK_CDP_ADVERTISE_HOST}:8444/cdp/{sid}`. The agent never sees the real URL. A `sid` is valid for 10 minutes until a client connects.
-2. The agent mints session-bound tickets with `POST /_vault/mint-tokens {"secretName":"example-login","sessionId":"{sid}"}`.
+1. The agent creates a session with `POST https://api.browserbase.com/v1/sessions` **through `HTTPS_PROXY`**, authenticating with a `/_secret/browserbase-api-key` ticket. coatcheck rewrites the response's `connectUrl` from the real `wss://…` URL, which carries Browserbase's signing key, to `ws://{COATCHECK_CDP_ADVERTISE_HOST}:8444/cdp/{sid}`. It also removes `signingKey`, and rewrites (or, for live-view pages, removes) the URLs returned by `GET /v1/sessions/{id}/debug`, so the agent never sees a real CDP URL. A `sid` is valid for 10 minutes until a client connects.
+2. The agent mints session-bound tickets with `POST /_vault/mint-tokens {"secretName":"example-login","sessionId":"{sid}"}`. The sid must be one coatcheck issued and still live: unconnected sids expire after 10 minutes, connected ones when their connection closes. Anything else gets `404`.
 3. The agent connects (`chromium.connectOverCDP(connectUrl)`) and fills the form:
 
    ```js
@@ -235,14 +271,16 @@ This lets an agent log into a website through a remote browser without the passw
 
 What the CDP proxy does:
 
-- **Outbound.** Swaps session-bound tickets in `Input.insertText.text` (what `page.fill()` sends), `Runtime.evaluate.expression`, and `Runtime.callFunctionOn` (`functionDeclaration` and every `arguments[].value`). Other methods are forwarded unchanged, and a ticket found in them is logged.
+- **Outbound, origin-bound.** Swaps session-bound tickets only in `Input.insertText.text` (what `page.fill()` sends), and only when the page's committed main-frame origin (tracked from `Page.frameNavigated`) is one of the login secret's allowed hosts. An `http://` page needs an `http://` entry. On another origin, before the first navigation, while a navigation is in progress, or on a non-http(s) page, the frame is dropped and the client gets a CDP error (`credential-origin violation: …`). Playwright retries a refused `fill` until its action timeout, so it surfaces as a `TimeoutError`; coatcheck logs `FAIL-CLOSED: origin binding refused …`.
+- **No script substitution.** `Runtime.evaluate` and `Runtime.callFunctionOn` are never substituted, so an expression can't be used to send the real value elsewhere. `page.fill()` still works on text, email and password inputs: Playwright passes the value to its injected script, which sees only the ticket, and types it with `Input.insertText`. Tickets in other methods are forwarded unchanged and logged.
 - **Session scoping.** Session-bound tickets substitute only on their own CDP session's frames, never on the HTTPS path. They are revoked when the WebSocket closes.
 - **Inbound.** Every real value from the session is replaced with `[REDACTED:{secret}:{field}]`. If a frame cannot be parsed, or still contains a real value after redaction, it is dropped.
 - **Keystroke fail-closed.** `page.type()` sends one `Input.dispatchKeyEvent` per character, so the ticket never appears whole in one frame and cannot be swapped. coatcheck tracks the typed characters. When they spell an active ticket, it drops the frame and returns a CDP error telling the client to use `page.fill()`. The preceding keystrokes have already been forwarded, so the field holds a partial ticket string, never the secret.
 
 Client rules:
 
-- Use `page.fill()`, never `page.type()`, for credential fields.
+- Use `page.fill()`, never `page.type()` or `page.evaluate()`, for credential fields.
+- Navigate to the login page (`page.goto`) and let it finish loading before filling.
 - Don't take screenshots during login, and don't toggle "show password". Pixels are not redacted, so a rendered secret ends up in the agent's context.
 - Don't read a password field's `.value` back. The frame is dropped, so the read fails.
 - Normal HTML login forms work. 2FA/OTP flows are not handled.
@@ -257,9 +295,10 @@ coatcheck is **pre-1.0**. The HTTP API, ticket format (`cct_…`), and configura
 - **`HTTPS_PROXY` is advisory.** A process that ignores it bypasses coatcheck, which means no substitution and also no protection. Pair coatcheck with egress enforcement (network policy, firewall, or security group) so the agent can reach the internet only through the proxy.
 - **Interception follows the bindings, not the request.** In the default `bound` mode, a keep-alive tunnel opened to a host before any ticket for it existed (a host bound only by a secret's `_allowed_hosts`) stays a raw tunnel, so a ticket later sent down it reaches the upstream unswapped. Clients that pin certificates fail on intercepted hosts unless listed in `COATCHECK_PASSTHROUGH_HOSTS`. Intercepted tunnels speak HTTP/1.1 only (ALPN), and WebSocket frames after an upgrade are not inspected.
 - **Without `COATCHECK_API_TOKEN`, any local process can mint tickets.** That is the intended sidecar setup (loopback, shared network namespace), and coatcheck refuses to start off loopback without a token. The token is one shared secret: there are no per-client identities or scopes.
-- **The secret backend is AWS-only**, with fixed path prefixes, pending a provider interface (env/file first, then others).
-- **Browserbase is the only browser adapter.** The `connectUrl` rewrite is tied to `api.browserbase.com`.
-- **CDP v1 limits:** one session at a time, no origin binding yet (login tickets record their allowed hosts, but a login ticket still fills any page in that session), no 2FA, no `page.type()` support, and no screenshot redaction.
+- **Three built-in secret backends** (environment variables, a JSON file, AWS). HashiCorp Vault and Vercel are planned; anything else needs a custom provider module.
+- **Browserbase is the only built-in browser adapter.** Other services need a custom adapter (`BrowserAdapter` in `@coatcheck/core`). With CDP enabled, Browserbase live-view URLs are removed from API responses, because a live view is a raw CDP connection.
+- **Origin binding keys on the main frame, and trusts the page once it matches.** Script the agent runs on an allowed origin (`page.evaluate`) can read the filled value and send it anywhere, in a transformed form the redactor doesn't catch. Logins inside cross-origin iframes aren't handled correctly: a login form in an iframe from another origin (an embedded auth widget) is refused unless the main frame's origin is allowed; on an allowed main frame, a fill whose focus is inside a cross-origin iframe (including one the agent injected) types the real value into that iframe. A navigation started by page script can race a fill.
+- **CDP v1 limits:** one session at a time, no 2FA, no `page.type()` support, and no screenshot redaction.
 
 ## How this differs from superfly/tokenizer
 
@@ -274,10 +313,18 @@ coatcheck makes different trade-offs:
 
 ## Development
 
+npm workspaces, one package per directory:
+
+| Package | Contents |
+|---|---|
+| `packages/core` (`@coatcheck/core`) | Proxy, MITM, CA, tickets, vault API, CDP proxy, config, provider interface; the `coatcheck` bin and `startCoatcheck({ config, provider })` for embedding |
+| `packages/provider-aws` (`@coatcheck/provider-aws`) | The `aws` provider; the only package that depends on the AWS SDK |
+| `packages/provider-env` (`@coatcheck/provider-env`) | The `env` provider and, at `@coatcheck/provider-env/file`, the `file` provider |
+
 ```bash
 npm install
-npm test          # vitest
-npm run build     # tsc -> dist/
+npm run lint && npm run type-check && npm test && npm run build   # tsc -b -> packages/*/dist
+COATCHECK_PROVIDER=env COATCHECK_SECRET_DEMO=x npm run dev        # runs the TypeScript source, no build
 COATCHECK_PROVIDER=aws AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:4566 npm run dev
 ```
 

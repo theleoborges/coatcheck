@@ -154,7 +154,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 ## Phase 4: packaging
 
-12. **npm workspaces.** Move code with `git mv` into three packages:
+12. **[Done]** **npm workspaces.** Move code with `git mv` into three packages:
     - `packages/core` (`@coatcheck/core`, with the `coatcheck` bin);
     - `packages/provider-aws`;
     - `packages/provider-env`.
@@ -173,7 +173,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 ## Phase 5: browser injection
 
-13. **Browser adapters.**
+13. **[Done]** **Browser adapters.**
     - Extract the HTTP framing from `src/browserbase-rewrite.ts` into a generic
       `createJsonResponseRewriter`.
     - Add the adapter interface `{ name, hosts, rewriteJson(body, register) }`
@@ -185,10 +185,10 @@ rejected, are in `docs/design/v1-decisions.md`.
       API.
     - Existing CDP tests keep passing.
 
-14. **Validate `mint-tokens` sessions.** Give `VaultDeps` the
+14. **[Done]** **Validate `mint-tokens` sessions.** Give `VaultDeps` the
     `CdpSessionStore`. An unknown or expired sid gets `404`.
 
-15. **CDP origin binding.**
+15. **[Done]** **CDP origin binding.**
     - Track each CDP session's committed main-frame URL from
       `Page.frameNavigated`.
     - `Input.insertText` substitutes a session-bound ticket only when that host

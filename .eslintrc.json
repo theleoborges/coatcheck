@@ -25,7 +25,7 @@
       {
         "object": "process",
         "property": "env",
-        "message": "Read configuration in src/config.ts (or the entrypoint) and pass it down."
+        "message": "Read configuration in packages/core/src/config.ts (or the bin, cli.ts) and pass it down; providers get env via ProviderContext."
       }
     ]
   },
@@ -37,8 +37,8 @@
   "overrides": [
     {
       "files": [
-        "src/index.ts",
-        "src/config.ts"
+        "packages/core/src/cli.ts",
+        "packages/core/src/config.ts"
       ],
       "rules": {
         "no-restricted-properties": "off"

