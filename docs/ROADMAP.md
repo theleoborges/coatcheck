@@ -42,7 +42,7 @@ rejected, are in `docs/design/v1-decisions.md`.
    passthrough vs MITM, `connectUrl` rewrite wiring, and the forward path.
    No behaviour change.
 
-4. **Ticket prefix `tok_` → `cct_`.** Export one `TICKET_PREFIX` /
+4. **[Done]** **Ticket prefix `tok_` → `cct_`.** Export one `TICKET_PREFIX` /
    `TICKET_PATTERN`, and use it in the token store, swap logging, and the CDP
    outbound pre-filter (which hard-codes `'tok_'` today). There is no
    dual-prefix window: tickets live only in memory and never survive a

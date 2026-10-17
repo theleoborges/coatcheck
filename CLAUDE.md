@@ -1,6 +1,6 @@
 # coatcheck
 
-Credential broker sidecar for AI agents. The agent never holds real secrets: it asks coatcheck for a secret by name and gets a short-lived ticket (`tok_…`). Real values are substituted on the wire — in HTTPS requests (MITM `CONNECT` proxy) and in browser automation (CDP WebSocket proxy). Like a coat check: hand over the coat, get a ticket, the ticket is worthless outside the cloakroom.
+Credential broker sidecar for AI agents. The agent never holds real secrets: it asks coatcheck for a secret by name and gets a short-lived ticket (`cct_…`). Real values are substituted on the wire — in HTTPS requests (MITM `CONNECT` proxy) and in browser automation (CDP WebSocket proxy). Like a coat check: hand over the coat, get a ticket, the ticket is worthless outside the cloakroom.
 
 ## Origin
 
@@ -39,7 +39,7 @@ Repo is **private** until we're ready to publish. Target license Apache-2.0.
 
 1. **Tickets are not bound to destination hosts** — the MITM path (`src/mitm.ts`) knows the hostname but only logs it. A ticket sent to any host gets the real value. Fix: per-secret allowed hosts/pattern, enforced at swap time (HTTP and CDP).
 2. ~~**Shell injection / path traversal in `src/ca.ts`**~~ — fixed: strict `CONNECT` target validation (`src/connect-target.ts`) and in-process cert generation (`src/ca.ts`, no `openssl`).
-3. **Plain-HTTP forward path also swaps** — `curl -x proxy http://127.0.0.1:<agent-listener>/?k=tok_…` hands the agent the plaintext without leaving the box, so egress enforcement alone doesn't close gap 1. Host binding must cover the HTTP path too.
+3. **Plain-HTTP forward path also swaps** — `curl -x proxy http://127.0.0.1:<agent-listener>/?k=cct_…` hands the agent the plaintext without leaving the box, so egress enforcement alone doesn't close gap 1. Host binding must cover the HTTP path too.
 4. **The AWS "sidecar assumes a separate role" pattern Liv used was bypassable** — both containers in an ECS task share one task role, and that role was allowed `sts:AssumeRole` on the proxy role, so the agent could assume it directly. `docs/THREAT_MODEL.md` documents correct patterns (separate task, ExternalId only injected into the sidecar, blocking 169.254.170.2). Any AWS deployment guide/provider must not repeat this.
 
 Full list with severities: `docs/THREAT_MODEL.md`. Proxy integration tests (MITM, passthrough, forward, `connectUrl` rewrite): `src/server.test.ts`.

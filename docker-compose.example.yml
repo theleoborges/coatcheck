@@ -1,10 +1,10 @@
 # Local demo: coatcheck backed by LocalStack (SSM + Secrets Manager).
 #
 #   docker compose -f docker-compose.example.yml up --build
-#   curl -s localhost:3128/_vault/example-api-key        # -> {"token":"tok_...", ...}
+#   curl -s localhost:3128/_vault/example-api-key        # -> {"token":"cct_...", ...}
 #   curl -s localhost:3128/_ca > /tmp/coatcheck-ca.crt
 #   curl -s --proxy http://localhost:3128 --cacert /tmp/coatcheck-ca.crt \
-#     -H "Authorization: Bearer tok_..." https://httpbin.org/headers
+#     -H "Authorization: Bearer cct_..." https://httpbin.org/headers
 #
 # httpbin echoes the real value back — exactly the exfiltration path that
 # host-bound tickets will close (see docs/THREAT_MODEL.md). Demo only.

@@ -12,21 +12,21 @@ It works like a coat check. You hand over the coat and get a ticket. The ticket 
  agent container                         coatcheck sidecar                       upstream
 ┌──────────────────────┐               ┌──────────────────────────┐
 │                      │ GET /_vault/  │ vault API                │  fetch by name
-│ get ticket ──────────┼──────────────>│  issue tok_… (15 min) ───┼──────────> secret backend
-│   <── tok_9f2c…      │               │                          │            (AWS SSM / SM)
+│ get ticket ──────────┼──────────────>│  issue cct_… (15 min) ───┼──────────> secret backend
+│   <── cct_9f2c…      │               │                          │            (AWS SSM / SM)
 │                      │               │                          │
-│ curl -H "Authorization: Bearer tok_9f2c…" https://api.github.com/…
+│ curl -H "Authorization: Bearer cct_9f2c…" https://api.github.com/…
 │   HTTPS_PROXY ───────┼── CONNECT ───>│ MITM TLS (own CA)        │
-│                      │               │ tok_9f2c… -> real value ─┼──────────> api.github.com
+│                      │               │ cct_9f2c… -> real value ─┼──────────> api.github.com
 │                      │               │ in headers / URL         │
 │                      │               │                          │
 │ playwright           │  ws://…/cdp/  │ CDP WebSocket proxy      │
-│   page.fill(tok_…) ──┼──────────────>│ swap in Input.insertText,├──────────> browser service
+│   page.fill(cct_…) ──┼──────────────>│ swap in Input.insertText,├──────────> browser service
 │                      │<──────────────┤ redact echoed secrets    │            (Browserbase)
 └──────────────────────┘               └──────────────────────────┘
 ```
 
-1. **Ticket issuance.** The agent calls `GET http://127.0.0.1:3128/_vault/{name}`. coatcheck fetches the secret from its backend and returns `tok_` plus 64 hex characters. Tickets live only in coatcheck's memory, with a 15-minute TTL.
+1. **Ticket issuance.** The agent calls `GET http://127.0.0.1:3128/_vault/{name}`. coatcheck fetches the secret from its backend and returns `cct_` plus 64 hex characters. Tickets live only in coatcheck's memory, with a 15-minute TTL.
 2. **HTTPS substitution.** The agent container sets `HTTPS_PROXY` to coatcheck and trusts coatcheck's CA. While at least one ticket is active, coatcheck intercepts `CONNECT` tunnels with a per-host certificate it signs itself. It replaces every active ticket it finds in the request line and headers, then re-encrypts to the real host, with normal certificate verification. This works with unmodified tools such as curl, git over HTTPS (with a bearer header), Python `requests`, and Node `fetch`, because they only need proxy support and a trusted CA. Plain-HTTP proxy requests get the same treatment. When no tickets are active, `CONNECT` is a blind TCP tunnel.
 3. **Browser (CDP) injection.** With the CDP proxy enabled, coatcheck rewrites the `connectUrl` in the browser service's session-create response so it points at a local WebSocket proxy. The agent's Playwright client connects there. On the way out, coatcheck swaps session-scoped tickets inside `Input.insertText`, `Runtime.evaluate`, and `Runtime.callFunctionOn`. On the way back, it redacts any real value the page echoes. Keystroke-by-keystroke entry fails closed (details [below](#browser--cdp-credential-injection)).
 4. **OAuth refresh.** `POST /_vault/{name}/refresh` runs the refresh-token exchange inside coatcheck. It writes the new tokens back to the backend and returns only a ticket for the new access token.
@@ -44,14 +44,14 @@ This starts coatcheck on `localhost:3128` and LocalStack. It also seeds two demo
 ```bash
 # 1. Get a ticket
 curl -s localhost:3128/_vault/example-api-key
-# {"token":"tok_3b1e…","expires_in":900}
+# {"token":"cct_3b1e…","expires_in":900}
 
 # 2. Fetch coatcheck's CA
 curl -s localhost:3128/_ca > /tmp/coatcheck-ca.crt
 
 # 3. Use the ticket as if it were the real key
 curl -s --proxy http://localhost:3128 --cacert /tmp/coatcheck-ca.crt \
-  -H "Authorization: Bearer tok_3b1e…" https://httpbin.org/headers
+  -H "Authorization: Bearer cct_3b1e…" https://httpbin.org/headers
 ```
 
 httpbin echoes the request headers, so step 3 shows the **real** value arriving upstream. That is the point of the demo, and also the main open gap: a ticket sent to any host gets swapped (see [limitations](#status--known-limitations)).
@@ -84,13 +84,13 @@ The API is served on the proxy port (default `127.0.0.1:3128`). **It has no auth
 | `GET /_health` | `{"status":"ok","tokens_active":N}` | Liveness check. |
 | `GET /_ca` | PEM | coatcheck's root CA certificate, for the agent to trust. |
 | `GET /_vault` | `{"secrets":["github-token",…]}` | Lists secret names. Values are not decrypted. |
-| `GET /_vault/{name}` | `{"token":"tok_…","expires_in":900}` | For a single-value secret. |
+| `GET /_vault/{name}` | `{"token":"cct_…","expires_in":900}` | For a single-value secret. |
 | `GET /_vault/{name}` | `{"type":"multi","fields":[…]}` | For a multi-value (JSON) secret. Request a specific field with `?field=`. |
-| `GET /_vault/{name}?field={f}` | `{"token":"tok_…","expires_in":900}` | Ticket for one field. If the secret's `_cleartext` array lists the field, returns `{"value":"…","cleartext":true}` instead (for non-sensitive values such as URLs and account IDs). |
+| `GET /_vault/{name}?field={f}` | `{"token":"cct_…","expires_in":900}` | Ticket for one field. If the secret's `_cleartext` array lists the field, returns `{"value":"…","cleartext":true}` instead (for non-sensitive values such as URLs and account IDs). |
 | `GET /_vault/{name}?check=1` | `{"exists":true}` | Checks whether a secret exists without decrypting it. |
-| `GET /_secret/{name}` | `{"token":"tok_…","expires_in":900}` | Shared key from Secrets Manager. Returns 403 unless `{name}` is in the allowlist (currently `browserbase-api-key`). |
-| `POST /_vault/mint-tokens` | `{"username_token":"tok_…","password_token":"tok_…","expires_in":600}` | Body: `{"secretName":"example-login","sessionId":"<cdp sid>","expires_in"?:N}`. The secret must be a multi-value secret with `username` and `password`. Tickets are bound to one CDP session (see below). Default TTL is 600 s, capped at 1800 s. |
-| `POST /_vault/{name}/refresh` | `{"token":"tok_…","expires_in":900}` | Secret fields: `refresh_token`, `token_url`, `client_id`, `client_secret`. coatcheck posts a `refresh_token` grant, writes `access_token`, `expires_at`, and any rotated `refresh_token` back to the backend, and returns a ticket for the new access token. |
+| `GET /_secret/{name}` | `{"token":"cct_…","expires_in":900}` | Shared key from Secrets Manager. Returns 403 unless `{name}` is in the allowlist (currently `browserbase-api-key`). |
+| `POST /_vault/mint-tokens` | `{"username_token":"cct_…","password_token":"cct_…","expires_in":600}` | Body: `{"secretName":"example-login","sessionId":"<cdp sid>","expires_in"?:N}`. The secret must be a multi-value secret with `username` and `password`. Tickets are bound to one CDP session (see below). Default TTL is 600 s, capped at 1800 s. |
+| `POST /_vault/{name}/refresh` | `{"token":"cct_…","expires_in":900}` | Secret fields: `refresh_token`, `token_url`, `client_id`, `client_secret`. coatcheck posts a `refresh_token` grant, writes `access_token`, `expires_at`, and any rotated `refresh_token` back to the backend, and returns a ticket for the new access token. |
 
 Errors are JSON `{"error":…}` with status 400, 403, 404, 500, or 502.
 
@@ -147,20 +147,20 @@ coatcheck does a **literal substring replace** of active ticket strings, so the 
 
 **Works.** The ticket appears as plaintext in the request line or a header:
 
-- `Authorization: Bearer tok_…`
-- `Authorization: token tok_…` (GitHub style)
-- `X-API-Key: tok_…`, or any custom header
-- `https://api.example.com/v1/x?api_key=tok_…` (query string)
+- `Authorization: Bearer cct_…`
+- `Authorization: token cct_…` (GitHub style)
+- `X-API-Key: cct_…`, or any custom header
+- `https://api.example.com/v1/x?api_key=cct_…` (query string)
 
 **Does not work.** The request still goes out, but with the ticket unchanged, and the upstream returns 401/403:
 
-- **HTTP Basic auth**, e.g. `curl -u user:tok_…`, `https://user:tok_…@host/` URLs, `.netrc`, and git credential helpers. Base64 encoding hides the ticket from the substring scan. For git, send an `Authorization` header instead (`git -c http.extraHeader="Authorization: Bearer tok_…"`).
+- **HTTP Basic auth**, e.g. `curl -u user:cct_…`, `https://user:cct_…@host/` URLs, `.netrc`, and git credential helpers. Base64 encoding hides the ticket from the substring scan. For git, send an `Authorization` header instead (`git -c http.extraHeader="Authorization: Bearer cct_…"`).
 - **Tickets in request bodies** (JSON, form-encoded, multipart). Bodies are forwarded untouched.
 - **Any client that ignores `HTTPS_PROXY`.** Node's built-in `https` module is the common case: it needs an explicit agent such as `https-proxy-agent`. curl, git, Python `requests`, and undici `fetch` honor the variable.
 - **Client-side signing**, such as AWS SigV4, HMAC request signatures, or JWT minting. The client computes a signature over the ticket, not the real secret.
 - **Expired tickets.** After 15 minutes the ticket is forwarded literally.
 
-If an upstream returns 401 while you are using a ticket, assume the swap did not happen before you assume the stored credential is wrong. coatcheck logs one line per request with no values: `[swap] … result=hit secrets=…` on success, or `result=miss unswapped_tok_literals=N` when a `tok_<64 hex>` string reaches the upstream intact.
+If an upstream returns 401 while you are using a ticket, assume the swap did not happen before you assume the stored credential is wrong. coatcheck logs one line per request with no values: `[swap] … result=hit secrets=…` on success, or `result=miss unswapped_ticket_literals=N` when a `cct_<64 hex>` string reaches the upstream intact.
 
 ## Browser / CDP credential injection
 
@@ -193,9 +193,9 @@ Client rules:
 
 ## Status & known limitations
 
-coatcheck is **pre-1.0**. The HTTP API, ticket format (`tok_…`, moving to `ck_…`), and configuration may change. Known gaps, roughly in priority order:
+coatcheck is **pre-1.0**. The HTTP API, ticket format (`cct_…`), and configuration may change. Known gaps, roughly in priority order:
 
-- **Tickets are not bound to destination hosts.** This is the top priority. Today any active ticket is swapped on a request to *any* host. A prompt-injected agent that sends `Authorization: Bearer tok_…` to an attacker's server delivers the real secret, as the httpbin quickstart shows. coatcheck currently protects against the agent *seeing* or *printing* secrets (logs, transcripts, model context), not against it *sending* them somewhere. Per-secret allowed hosts are planned.
+- **Tickets are not bound to destination hosts.** This is the top priority. Today any active ticket is swapped on a request to *any* host. A prompt-injected agent that sends `Authorization: Bearer cct_…` to an attacker's server delivers the real secret, as the httpbin quickstart shows. coatcheck currently protects against the agent *seeing* or *printing* secrets (logs, transcripts, model context), not against it *sending* them somewhere. Per-secret allowed hosts are planned.
 - **Request bodies are not substituted.** Only the request line (URL) and headers are. `Transfer-Encoding: chunked` request bodies on the MITM path are not parsed, which can misframe keep-alive connections.
 - **`HTTPS_PROXY` is advisory.** A process that ignores it bypasses coatcheck, which means no substitution and also no protection. Pair coatcheck with egress enforcement (network policy, firewall, or security group) so the agent can reach the internet only through the proxy.
 - **Interception is all-or-nothing while any ticket is live.** With at least one active ticket, *every* `CONNECT` is MITM'd, not just connections that carry tickets. Clients that pin certificates or don't trust the CA will fail during that window.

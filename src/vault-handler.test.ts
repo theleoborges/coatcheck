@@ -136,7 +136,7 @@ describe('Vault Handler', () => {
     await setup({ github: 'ghp_real_token_123' });
     const { status, body } = await fetchJSON(port, '/_vault/github');
     expect(status).toBe(200);
-    expect(body.token).toMatch(/^tok_/);
+    expect(body.token).toMatch(/^cct_/);
     expect(body.expires_in).toBe(900);
 
     // Token resolves to the real value
@@ -148,7 +148,7 @@ describe('Vault Handler', () => {
     await setup({ github: 'ghp_real_token_123' });
     const { status, body } = await fetchJSON(port, '/_vault/github?field=whatever');
     expect(status).toBe(200);
-    expect(body.token).toMatch(/^tok_/);
+    expect(body.token).toMatch(/^cct_/);
 
     const resolved = tokenStore.resolve(body.token as string);
     expect(resolved).toBe('ghp_real_token_123');
@@ -194,7 +194,7 @@ describe('Vault Handler', () => {
 
     const { status, body } = await fetchJSON(port, '/_vault/supabase?field=service-role-key');
     expect(status).toBe(200);
-    expect(body.token).toMatch(/^tok_/);
+    expect(body.token).toMatch(/^cct_/);
     expect(tokenStore.resolve(body.token as string)).toBe('sbp_secret');
     expect(body.value).toBeUndefined();
     expect(tokenStore.size).toBe(1);
@@ -205,12 +205,12 @@ describe('Vault Handler', () => {
 
     const { status: s1, body: b1 } = await fetchJSON(port, '/_vault/supabase?field=project-url');
     expect(s1).toBe(200);
-    expect(b1.token).toMatch(/^tok_/);
+    expect(b1.token).toMatch(/^cct_/);
     expect(tokenStore.resolve(b1.token as string)).toBe('https://proj.supabase.co');
 
     const { status: s2, body: b2 } = await fetchJSON(port, '/_vault/supabase?field=service-role-key');
     expect(s2).toBe(200);
-    expect(b2.token).toMatch(/^tok_/);
+    expect(b2.token).toMatch(/^cct_/);
     expect(tokenStore.resolve(b2.token as string)).toBe('sbp_secret');
 
     expect(tokenStore.size).toBe(2);
@@ -240,7 +240,7 @@ describe('Vault Handler', () => {
     await setup({ 'my-list': '["a","b","c"]' });
     const { status, body } = await fetchJSON(port, '/_vault/my-list');
     expect(status).toBe(200);
-    expect(body.token).toMatch(/^tok_/);
+    expect(body.token).toMatch(/^cct_/);
     expect(tokenStore.resolve(body.token as string)).toBe('["a","b","c"]');
   });
 
@@ -248,7 +248,7 @@ describe('Vault Handler', () => {
     await setup({ 'api-key': 'not-json-at-all' });
     const { status, body } = await fetchJSON(port, '/_vault/api-key');
     expect(status).toBe(200);
-    expect(body.token).toMatch(/^tok_/);
+    expect(body.token).toMatch(/^cct_/);
     expect(tokenStore.resolve(body.token as string)).toBe('not-json-at-all');
   });
 
@@ -256,7 +256,7 @@ describe('Vault Handler', () => {
     await setup({ 'my integration': 'secret-val' });
     const { status, body } = await fetchJSON(port, '/_vault/my%20integration');
     expect(status).toBe(200);
-    expect(body.token).toMatch(/^tok_/);
+    expect(body.token).toMatch(/^cct_/);
   });
 
   it('returns false for non-vault paths', async () => {
@@ -285,7 +285,7 @@ describe('Vault Handler', () => {
       await setup({}, { 'browserbase-api-key': 'bb_live_real_key_xyz' });
       const { status, body } = await fetchJSON(port, '/_secret/browserbase-api-key');
       expect(status).toBe(200);
-      expect(body.token).toMatch(/^tok_/);
+      expect(body.token).toMatch(/^cct_/);
       expect(body.expires_in).toBe(900);
       expect(tokenStore.resolve(body.token as string)).toBe('bb_live_real_key_xyz');
     });
@@ -327,8 +327,8 @@ describe('Vault Handler', () => {
         sessionId: 'sess-1',
       });
       expect(status).toBe(200);
-      expect(body.username_token).toMatch(/^tok_/);
-      expect(body.password_token).toMatch(/^tok_/);
+      expect(body.username_token).toMatch(/^cct_/);
+      expect(body.password_token).toMatch(/^cct_/);
       expect(body.expires_in).toBe(600);
 
       // Tokens resolve only within their session
@@ -431,7 +431,7 @@ describe('Vault Handler', () => {
       }
     });
 
-    it('refreshes token, updates vault, and returns tok_*', async () => {
+    it('refreshes token, updates vault, and returns cct_*', async () => {
       const originalFetch = globalThis.fetch;
       globalThis.fetch = vi.fn().mockResolvedValue({
         ok: true,
@@ -448,10 +448,10 @@ describe('Vault Handler', () => {
         const { status, body } = await fetchJSON(port, '/_vault/google/refresh', 'POST');
 
         expect(status).toBe(200);
-        expect(body.token).toMatch(/^tok_/);
+        expect(body.token).toMatch(/^cct_/);
         expect(body.expires_in).toBe(900);
 
-        // The tok_* should resolve to the new access token
+        // The cct_* should resolve to the new access token
         expect(tokenStore.resolve(body.token as string)).toBe('ya29.new-token');
 
         // Vault should have been updated

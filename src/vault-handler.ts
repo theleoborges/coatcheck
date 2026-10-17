@@ -298,7 +298,7 @@ function handleMintTokens(
 /**
  * Handle OAuth token refresh server-side.
  * Reads refresh_token + credentials from vault, exchanges with provider,
- * stores new tokens back in vault, returns a tok_* to the agent.
+ * stores new tokens back in vault, returns a cct_* to the agent.
  */
 async function handleOAuthRefresh(
   secretName: string,
@@ -374,7 +374,7 @@ async function handleOAuthRefresh(
 
   await secretFetcher.put(secretName, JSON.stringify(updated));
 
-  // Issue a tok_* for the new access token
+  // Issue a cct_* for the new access token
   const tok = tokenStore.issue(`${secretName}:access_token`, tokens.access_token);
   console.log(`[issue] secret=${secretName}:access_token ttl_s=${tok.ttlSeconds} via=oauth_refresh`);
   res.writeHead(200, { 'Content-Type': 'application/json' });

@@ -133,9 +133,9 @@ describe('coatcheck server: CONNECT', () => {
     const t = await startTls(socket, upstreamCa.caCertPem); // trusts only the upstream CA
     expect(issuerCn(t)).toContain('CN=upstream test CA');
 
-    t.write('GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer tok_literal\r\n\r\n');
+    t.write('GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer cct_literal\r\n\r\n');
     const [res] = await readResponses(t, 1);
-    expect((JSON.parse(res.body) as Echo).headers.authorization).toBe('Bearer tok_literal');
+    expect((JSON.parse(res.body) as Echo).headers.authorization).toBe('Bearer cct_literal');
   });
 
   it('MITMs when tickets are live and swaps tickets on every keep-alive request', async () => {

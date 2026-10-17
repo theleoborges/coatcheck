@@ -7,12 +7,12 @@
  * a single frame and would be typed literally into the site. We don't buffer-
  * and-replay (v1 scope); instead we detect the per-keystroke run that spells a
  * known session token and fail closed: the proxy drops the offending frame and
- * errors the agent, rather than leaking `tok_*` to the site as a password.
+ * errors the agent, rather than leaking `cct_*` to the site as a password.
  *
  * One detector per CDP session. The buffer never crosses sessions.
  */
 
-// Token ids are `tok_` + 64 hex = 68 chars. Keep a little margin.
+// Token ids are `cct_` + 64 hex = 68 chars. Keep a little margin.
 const WINDOW = 80;
 
 export class KeystrokeDetector {

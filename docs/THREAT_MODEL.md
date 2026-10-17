@@ -9,7 +9,7 @@ assumes this happens and aims to keep real credentials out of everything the
 agent can read: its process memory, environment, filesystem, logs, and model
 context.
 
-The agent receives a **ticket** (`tok_` + 64 hex chars) instead of a secret.
+The agent receives a **ticket** (`cct_` + 64 hex chars) instead of a secret.
 coatcheck swaps the ticket for the real value on the wire, after TLS
 termination, on traffic it intercepts.
 
@@ -161,7 +161,7 @@ single-use option.
 At CONNECT time, an empty store means a raw TCP tunnel (`mitm.ts`). A
 tunnel opened before the first ticket was issued stays passthrough for its
 whole life, so a client with a keep-alive connection pool can later send a
-ticket down an un-MITM'd tunnel. It fails closed (the upstream sees `tok_…`
+ticket down an un-MITM'd tunnel. It fails closed (the upstream sees `cct_…`
 and rejects it), but it is surprising, and it also means traffic inspection
 and any future allowlist would not apply to those tunnels.
 
