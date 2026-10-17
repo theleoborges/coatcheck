@@ -231,9 +231,13 @@ upstream as a confusing request.
 Only headers and URL are rewritten (`mitm.ts`, `forward.ts`). Body
 bytes pass through. This is a functional limitation (tickets in JSON or
 form bodies do not work) and narrows the substitution surface, which is
-mildly protective. Related: `Transfer-Encoding: chunked` request bodies are not
-parsed (`mitm.ts`), so a chunked body can misalign the request parser
-on a keep-alive tunnel. The MITM speaks HTTP/1.1 only and advertises
+mildly protective. The MITM parser frames `Transfer-Encoding: chunked` and
+`Content-Length` bodies per RFC 9112 (`http1-framing.ts`), so body bytes can't
+be parsed as a new request whose header tickets would be swapped. Ambiguous
+framing (both headers, codings other than `chunked`, repeated or malformed
+`Content-Length`, whitespace before a colon, obs-fold, malformed chunks) gets
+`400` and the tunnel is closed, which refuses request smuggling between
+coatcheck and the upstream. Request trailers pass through unswapped. The MITM speaks HTTP/1.1 only and advertises
 just `http/1.1` over ALPN. After a `101 Switching Protocols` response the
 tunnel becomes a raw pipe, so WebSocket frames are neither swapped nor
 inspected.

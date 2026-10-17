@@ -52,7 +52,7 @@ async function startHttpUpstream() {
   return { port: (server.address() as AddressInfo).port, received };
 }
 
-interface Echo { url: string; headers: http.IncomingHttpHeaders }
+interface Echo { url: string; headers: http.IncomingHttpHeaders; body?: string }
 
 let proxyCa: CertAuthority;
 let upstreamCa: CertAuthority;
@@ -89,9 +89,14 @@ async function startHttpsUpstream(body?: string) {
   const received: Echo[] = [];
   let tlsConnections = 0;
   const server = https.createServer({ key: leaf.key, cert: leaf.cert }, (req, res) => {
-    received.push({ url: req.url ?? '', headers: req.headers });
-    res.setHeader('content-type', 'application/json');
-    res.end(body ?? JSON.stringify({ url: req.url, headers: req.headers }));
+    const chunks: Buffer[] = [];
+    req.on('data', (d: Buffer) => chunks.push(d));
+    req.on('end', () => {
+      const reqBody = Buffer.concat(chunks).toString();
+      received.push({ url: req.url ?? '', headers: req.headers, body: reqBody });
+      res.setHeader('content-type', 'application/json');
+      res.end(body ?? JSON.stringify({ url: req.url, headers: req.headers, body: reqBody }));
+    });
   });
   server.on('secureConnection', () => { tlsConnections++; });
   await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
@@ -627,6 +632,74 @@ describe('coatcheck server: MITM policy', () => {
     t.write(`GET /next HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${tok}\r\n\r\n`);
     const [next] = await readResponses(t, 1);
     expect(next.body).toContain('X-Key: real-key');
+  });
+});
+
+describe('coatcheck server: request framing', () => {
+  async function tunnel() {
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy({ mitm: 'always' });
+    const tok = tokenStore.issue('k', 'real-key', { allowedHosts: hosts('127.0.0.1') }).id;
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    return { upstream, tok, t };
+  }
+
+  it('frames chunked bodies, so ticket-shaped chunk data is never parsed as a request (desync attack)', async () => {
+    captureLogs();
+    const { upstream, tok, t } = await tunnel();
+    // Chunk data holding a blank line and a header-looking ticket: the old
+    // parser read a chunked request as bodiless, parsed this data as a new
+    // "request", and swapped the ticket into what the upstream reads as the body.
+    const data = `x\r\n\r\nX-Smuggled: ${tok}\r\n\r\n`;
+    const chunk = `${Buffer.byteLength(data).toString(16)}\r\n${data}\r\n`;
+    const responses = readResponses(t, 2);
+    // Split mid-chunk to exercise the incomplete path.
+    t.write(`POST /up HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nX-Key: ${tok}\r\n\r\n${chunk.slice(0, 10)}`);
+    await new Promise(r => setTimeout(r, 20));
+    t.write(`${chunk.slice(10)}3;ext=1\r\nend\r\n0\r\n\r\n`);
+    t.write(`GET /next HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${tok}\r\n\r\n`);
+    const [r1, r2] = await responses;
+
+    const e1 = JSON.parse(r1.body) as Echo;
+    expect(e1.headers['x-key']).toBe('real-key');
+    expect(e1.body).toBe(`${data}end`);
+    expect(e1.body).not.toContain('real-key');
+    expect((JSON.parse(r2.body) as Echo).headers['x-key']).toBe('real-key');
+    expect(upstream.received.map(e => e.url)).toEqual(['/up', '/next']);
+  });
+
+  it.each([
+    ['Content-Length and Transfer-Encoding (CL.TE smuggling)', 'Content-Length: 4\r\nTransfer-Encoding: chunked\r\n', '0\r\n\r\n'],
+    ['a Transfer-Encoding other than chunked', 'Transfer-Encoding: gzip, chunked\r\n', '0\r\n\r\n'],
+    ['repeated Transfer-Encoding', 'Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n', '0\r\n\r\n'],
+    ['conflicting Content-Length', 'Content-Length: 1\r\nContent-Length: 4\r\n', 'abcd'],
+    ['a non-numeric Content-Length', 'Content-Length: +4\r\n', 'abcd'],
+    ['whitespace before the colon', 'Content-Length : 4\r\n', 'abcd'],
+    ['an obs-fold line', 'X-A: 1\r\n  folded\r\n', ''],
+    ['a malformed chunk size', 'Transfer-Encoding: chunked\r\n', 'zz\r\nabc\r\n0\r\n\r\n'],
+    ['chunk data longer than its size', 'Transfer-Encoding: chunked\r\n', '2\r\nabcd\r\n0\r\n\r\n'],
+  ])('refuses %s with 400 and closes the tunnel, forwarding nothing', async (_name, headers, body) => {
+    captureLogs();
+    const { upstream, tok, t } = await tunnel();
+    const closed = new Promise<void>(r => t.once('close', () => r()));
+    t.write(`POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${tok}\r\n${headers}\r\n${body}`);
+    t.write(`GET /smuggled HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${tok}\r\n\r\n`);
+    const [res] = await readResponses(t, 1);
+    expect(res.head).toMatch(/^HTTP\/1\.1 400 /);
+    expect(res.head).toMatch(/X-Coatcheck-Denied: bad-framing/i);
+    await closed;
+    expect(upstream.received).toEqual([]);
+  });
+
+  it('matches Content-Length only as a whole header name', async () => {
+    captureLogs();
+    const { upstream, t } = await tunnel();
+    const responses = readResponses(t, 2);
+    t.write('GET /a HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Content-Length: 50\r\n\r\n');
+    t.write('GET /b HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+    await responses;
+    expect(upstream.received.map(e => e.url)).toEqual(['/a', '/b']);
   });
 });
 

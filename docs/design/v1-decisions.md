@@ -448,6 +448,38 @@ Policy file:
 - After a `101 Switching Protocols` response, the connection switches to a raw
   pipe, so WebSockets work through the MITM.
 
+### Request framing details (recorded while implementing roadmap item 16)
+
+- **The MITM parser frames requests per RFC 9112 §6** (`http1-framing.ts`):
+  `Transfer-Encoding: chunked` is parsed chunk by chunk (size line, data,
+  last chunk, trailer section), otherwise `Content-Length`, otherwise no body.
+  The header section is swapped as before; the body, chunk framing included,
+  is forwarded byte for byte. Before this, a chunked request was read as
+  having no body, so chunk data containing a blank line was parsed as a new
+  "request" and tickets in it were swapped into what the upstream reads as
+  the body (body swapping is opt-in per secret, item 17).
+- **Ambiguous framing is refused, not normalised.** coatcheck can't know how
+  the upstream will read a request it doesn't understand, and the agent
+  controls both sides of a desync. Each of these gets `400`
+  (`X-Coatcheck-Denied: bad-framing`) and the tunnel is closed, without
+  forwarding anything from that request on:
+  - both `Transfer-Encoding` and `Content-Length`;
+  - a `Transfer-Encoding` other than exactly `chunked` (other codings, lists,
+    repeated headers);
+  - a `Content-Length` that isn't all digits, or repeated with any value;
+  - a header line that isn't `token ":"` (whitespace before the colon) or is
+    an obs-fold continuation line;
+  - a malformed chunk: a non-hex size, more than 16 hex digits, a size line
+    longer than 4 KiB, or data not followed by CRLF.
+  Header names are matched at the start of a line (the old unanchored regex
+  read `X-Content-Length` as `Content-Length`).
+- **Trailers are forwarded as received and never swapped.** Request trailers
+  are rare, and swapping them would need the header binding rules for a
+  second header section.
+- **Bodies are buffered whole**, as `Content-Length` bodies already were.
+  Rejected: streaming chunks through, because body swapping (item 17) needs
+  the whole body anyway and the agent can only exhaust its own sidecar.
+
 ## 6. Browser adapters
 
 ```ts

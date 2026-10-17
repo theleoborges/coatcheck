@@ -10,6 +10,7 @@ import { parseConnectTarget } from './connect-target.js';
 import { matchesHost, parseHostPattern, type HostPattern } from './host-matcher.js';
 import { allPolicyHosts, type Policy } from './policy.js';
 import type { MitmMode } from './config.js';
+import { requestFraming, scanChunked } from './http1-framing.js';
 import { DENIED_HEADER, hostMismatchBody, logSwapOutcome } from './swap-log.js';
 
 export interface MitmDeps {
@@ -147,18 +148,31 @@ export function createConnectHandler(deps: MitmDeps) {
         if (headerEnd === -1) return; // need more data
 
         const headerStr = requestData.subarray(0, headerEnd).toString();
+        const bodyStart = headerEnd + 4;
 
-        // Determine Content-Length to know how much body to consume.
-        // TODO: Transfer-Encoding: chunked is not handled — body length will be
-        // wrong for chunked requests, potentially misaligning the request parser
-        // (roadmap item 16).
-        const clMatch = headerStr.match(/content-length:\s*(\d+)/i);
-        const contentLength = clMatch ? parseInt(clMatch[1], 10) : 0;
-        const totalLength = headerEnd + 4 + contentLength;
+        // Find where this request ends (RFC 9112 §6); ambiguous framing is
+        // refused, since the upstream might read it differently (design §5).
+        const framing = requestFraming(headerStr);
+        let totalLength: number;
+        if (framing.kind === 'invalid') {
+          console.warn(`[connect] host=${hostname} rejected request: ${framing.reason}`);
+          denyAndClose(400, 'bad-framing', JSON.stringify({ error: `Bad request framing: ${framing.reason}`, reason: 'bad-framing' }));
+          return;
+        } else if (framing.kind === 'chunked') {
+          const scan = scanChunked(requestData, bodyStart);
+          if (scan.kind === 'incomplete') return; // need more data
+          if (scan.kind === 'invalid') {
+            console.warn(`[connect] host=${hostname} rejected request: ${scan.reason}`);
+            denyAndClose(400, 'bad-framing', JSON.stringify({ error: `Bad request framing: ${scan.reason}`, reason: 'bad-framing' }));
+            return;
+          }
+          totalLength = scan.end;
+        } else {
+          totalLength = bodyStart + (framing.kind === 'length' ? framing.length : 0);
+          if (requestData.length < totalLength) return; // need more data for body
+        }
 
-        if (requestData.length < totalLength) return; // need more data for body
-
-        const body = requestData.subarray(headerEnd + 4, totalLength);
+        const body = requestData.subarray(bodyStart, totalLength);
         requestData = requestData.subarray(totalLength); // remainder for next request
 
         // Swap tokens in headers. The binding key is the validated CONNECT
@@ -166,7 +180,7 @@ export function createConnectHandler(deps: MitmDeps) {
         const result = tokenStore.replaceAll(headerStr, { host: hostname, scheme: 'https' });
         logSwapOutcome('https', hostname, result, result.output);
         if (result.denied.length > 0) {
-          denyAndClose(hostMismatchBody(result.denied, hostname));
+          denyAndClose(403, 'host-mismatch', hostMismatchBody(result.denied, hostname));
           return;
         }
 
@@ -205,20 +219,20 @@ export function createConnectHandler(deps: MitmDeps) {
     }
 
     /**
-     * Answer 403 instead of forwarding, and close the tunnel: requests
-     * pipelined ahead of this one that the upstream hasn't answered are
-     * abandoned (design §3, "Host binding details").
+     * Answer 403 (host mismatch) or 400 (bad framing) instead of forwarding,
+     * and close the tunnel: requests pipelined ahead of this one that the
+     * upstream hasn't answered are abandoned (design §3, "Host binding details").
      */
-    function denyAndClose(body: string) {
+    function denyAndClose(status: 400 | 403, reason: string, body: string) {
       denied = true;
       pendingWrites = [];
       requestData = Buffer.alloc(0);
       realSocket.unpipe(tlsSocket);
       realSocket.destroy();
       tlsSocket.end(
-        'HTTP/1.1 403 Forbidden\r\n' +
+        `HTTP/1.1 ${status} ${status === 400 ? 'Bad Request' : 'Forbidden'}\r\n` +
         'Content-Type: application/json\r\n' +
-        `${DENIED_HEADER}: host-mismatch\r\n` +
+        `${DENIED_HEADER}: ${reason}\r\n` +
         `Content-Length: ${Buffer.byteLength(body)}\r\n` +
         'Connection: close\r\n\r\n' +
         body,

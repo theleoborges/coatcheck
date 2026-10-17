@@ -214,7 +214,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 ## Phase 6: swap coverage and deployment
 
-16. **Chunked request bodies.** Parse `Transfer-Encoding: chunked` in the MITM
+16. **[Done]** **Chunked request bodies.** Parse `Transfer-Encoding: chunked` in the MITM
     request parser so that keep-alive framing stays correct.
 
 17. **Request body substitution.** Opt in per secret, with `swap_body` in the
