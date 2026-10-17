@@ -7,16 +7,14 @@ COPY src/ ./src/
 RUN npm run build
 
 FROM node:22-slim
-# openssl is used to mint per-host leaf certificates (see src/ca.ts)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      openssl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# No system packages: certificates are generated in-process (src/ca.ts) and
+# Node verifies upstream TLS against its bundled root store.
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist/ ./dist/
 
-# 3128: HTTP(S) proxy + vault API. 8444: CDP WebSocket proxy (CDP_PROXY_ENABLED=1).
+# 3128: HTTP(S) proxy + vault API. 8444: CDP WebSocket proxy (COATCHECK_CDP_ENABLED=1).
 # Binds 127.0.0.1 by default — run as a sidecar sharing the agent's network namespace.
 EXPOSE 3128 8444
 

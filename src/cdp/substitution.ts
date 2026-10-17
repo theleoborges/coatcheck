@@ -1,12 +1,12 @@
-import type { TokenStore } from '../token-store.js';
+import { TICKET_PREFIX, type TokenStore } from '../token-store.js';
 
 /**
  * CDP frame substitution (design: docs/design/cdp-injection.md).
  *
- * Outbound (agent → Browserbase): replace session-scoped `tok_*` tokens with
+ * Outbound (agent → Browserbase): replace session-scoped `cct_*` tokens with
  *   their real values in the small set of CDP methods a login flow can reach.
  * Inbound (Browserbase → agent): defend echo-back. Redact any real value to a
- *   `[REDACTED:tok_*]` marker; if a frame still carries a real value after
+ *   `[REDACTED:<secretName>]` marker; if a frame still carries a real value after
  *   redaction (unparseable / binary-ish), drop it entirely (the byte-level floor).
  *
  * CDP is JSON-over-WebSocket. The pre-filter (`indexOf`) keeps the hot path
@@ -17,7 +17,7 @@ import type { TokenStore } from '../token-store.js';
 export interface OutboundResult {
   payload: string;
   substitutions: number;
-  /** A supported-but-unlisted method that still carried a `tok_*` literal. */
+  /** A supported-but-unlisted method that still carried a `cct_*` literal. */
   unsupportedTokenMethod?: string;
 }
 
@@ -28,14 +28,14 @@ export interface InboundResult {
   dropped: boolean;
 }
 
-/** Substitute outbound `tok_*` tokens for the given session. */
+/** Substitute outbound `cct_*` tokens for the given session. */
 export function substituteOutbound(
   raw: string,
   tokenStore: TokenStore,
   sessionId: string,
 ): OutboundResult {
   // Pre-filter: no token literal, nothing to do.
-  if (raw.indexOf('tok_') === -1) return { payload: raw, substitutions: 0 };
+  if (raw.indexOf(TICKET_PREFIX) === -1) return { payload: raw, substitutions: 0 };
 
   let parsed: { method?: string; params?: Record<string, unknown> };
   try {
@@ -81,7 +81,7 @@ export function substituteOutbound(
     }
   }
 
-  // A `tok_*` literal survived in a method we don't substitute. Don't leak it,
+  // A `cct_*` literal survived in a method we don't substitute. Don't leak it,
   // but surface it so production tells us about an uncovered code path.
   const unsupportedTokenMethod =
     !mutated && targets.length === 0 ? method : undefined;

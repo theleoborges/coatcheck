@@ -116,6 +116,32 @@ which spreads the existing object and copies only `access_token`,
 `refresh_token` and `expires_in` from the token endpoint. Mint-time narrowing
 by the agent is deferred, and if it is ever added it may only narrow.
 
+### Policy file details (recorded while implementing roadmap item 8)
+
+- **Schema is strict.** The top level allows only `secrets` and `shared`.
+  Each entry allows only `allowed_hosts`, which must be a non-empty array of
+  strings. Unknown keys and empty lists fail startup. Rationale: a typo such
+  as `allowed_host` would otherwise silently leave a secret unbound, and an
+  empty list is almost certainly a mistake.
+- **Shared names are exact.** A trailing `*` is allowed only under `secrets`.
+  The shared section is an allowlist that every agent can draw on, so each
+  entry should name one secret.
+- **Name precedence.** When several `secrets` patterns match a name, an exact
+  name wins. Among wildcards, the longest prefix wins. Rationale: the most
+  specific rule should apply, and the outcome must not depend on key order.
+- **`http://host` entries allow both schemes.** A bare entry allows HTTPS
+  only; `http://host` additionally allows plaintext to that host. Plaintext
+  is the riskier permission, so it implies the safer one.
+- **Entries carry no ports or paths.** `host:port`, `https://…`, paths,
+  ports, and bracketed IPv6 with a port are all rejected, because ports are
+  ignored when matching and a port in an entry would suggest otherwise. Bare
+  or bracketed IPv6 literals are accepted.
+- **No public-suffix list.** `*.co.uk` passes the "at least two labels after
+  `*.`" rule. Operators own the policy file; pulling in a PSL dependency
+  isn't worth it for v1.
+- **No policy file means no shared secrets.** `/_secret/*` returns `403` for
+  every name.
+
 ### Default: deny, at mint time
 
 - `/_vault/{name}` for an unbound secret returns `403` with an error naming the

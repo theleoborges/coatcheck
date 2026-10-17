@@ -1,23 +1,18 @@
 import http from 'node:http';
 import { TokenStore } from './token-store.js';
-import { SecretFetcher } from './secret-fetcher.js';
-import { CertAuthority } from './ca.js';
+import type { CertAuthority } from './ca.js';
+import { isValidSecretName, type SecretProvider } from './secret-provider.js';
+import type { Policy } from './policy.js';
 
 export interface VaultDeps {
   tokenStore: TokenStore;
-  secretFetcher: SecretFetcher;
-  ca: CertAuthority;
+  provider: SecretProvider;
+  ca: Pick<CertAuthority, 'caCertPem'>;
+  /** Where users manage secrets; returned as `vault_url` in 404s when set. */
+  missingSecretUrl?: string;
+  /** Operator policy; its `shared` section is the `/_secret/*` allowlist. */
+  policy: Policy;
 }
-
-/**
- * Fleet-wide secrets the agent is permitted to request via /_secret/{name}.
- * These live at `liv/{name}` in AWS Secrets Manager. Adding a name here grants
- * every agent the ability to mint short-lived tokens for it — only add secrets
- * that are fleet-shared API keys consumed by agent tooling.
- */
-const FLEET_SECRET_ALLOWLIST = new Set<string>([
-  'browserbase-api-key',
-]);
 
 /**
  * Handle vault API requests (/_health, /_ca, /_vault).
@@ -28,7 +23,7 @@ export function handleVaultRequest(
   res: http.ServerResponse,
   deps: VaultDeps,
 ): boolean {
-  const { tokenStore, secretFetcher, ca } = deps;
+  const { tokenStore, provider, ca } = deps;
   const url = req.url ?? '';
 
   // Health check
@@ -47,7 +42,7 @@ export function handleVaultRequest(
 
   // List integrations/secrets
   if (url === '/_vault' && req.method === 'GET') {
-    secretFetcher.listSecrets().then(names => {
+    provider.secrets.list().then(names => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ secrets: names }));
     }).catch(err => {
@@ -61,11 +56,12 @@ export function handleVaultRequest(
   // Get/check a secret
   const vaultMatch = url.match(/^\/_vault\/([^/?]+)(\?.*)?$/);
   if (vaultMatch && req.method === 'GET') {
-    const secretName = decodeURIComponent(vaultMatch[1]);
+    const secretName = decodeSecretName(vaultMatch[1], res);
+    if (secretName === null) return true;
     const params = new URLSearchParams(vaultMatch[2] ?? '');
 
     if (params.get('check') === '1') {
-      secretFetcher.exists(secretName).then(exists => {
+      provider.secrets.exists(secretName).then(exists => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ exists }));
       }).catch(err => {
@@ -79,12 +75,13 @@ export function handleVaultRequest(
     // Issue a proxy token
     const field = params.get('field');
 
-    secretFetcher.get(secretName).then(value => {
-      if (value === null) {
+    provider.secrets.get(secretName).then(secret => {
+      if (secret === null) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `Secret '${secretName}' not found`, vault_url: 'https://example.com/dashboard/integrations' }));
+        res.end(JSON.stringify({ error: `Secret '${secretName}' not found`, ...vaultUrlHint(deps) }));
         return;
       }
+      const value = secret.value;
 
       // Check if this is a multi-value (JSON) secret
       let parsed: Record<string, string> | null = null;
@@ -141,31 +138,40 @@ export function handleVaultRequest(
     return true;
   }
 
-  // Fleet-wide secret issuance (e.g. Browserbase API key).
-  // Per-user vault entries use /_vault/{name}; this is the parallel surface
-  // for shared API keys that live in AWS Secrets Manager.
-  const fleetMatch = url.match(/^\/_secret\/([^/?]+)$/);
-  if (fleetMatch && req.method === 'GET') {
-    const secretName = decodeURIComponent(fleetMatch[1]);
-    if (!FLEET_SECRET_ALLOWLIST.has(secretName)) {
+  // Shared secret issuance (e.g. a browser-service API key).
+  // Per-agent secrets use /_vault/{name}; this is the parallel surface for
+  // shared API keys in the provider's shared store.
+  const sharedMatch = url.match(/^\/_secret\/([^/?]+)$/);
+  if (sharedMatch && req.method === 'GET') {
+    const secretName = decodeSecretName(sharedMatch[1], res);
+    if (secretName === null) return true;
+    // The policy file's `shared` section is the allowlist: listing a name there
+    // grants every agent the ability to mint short-lived tickets for it.
+    if (!deps.policy.shared.has(secretName)) {
       res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: `Secret '${secretName}' is not in the fleet allowlist` }));
+      res.end(JSON.stringify({ error: `Secret '${secretName}' is not in the shared-secret allowlist` }));
       return true;
     }
-    secretFetcher.fetchFleetSecret(secretName).then(value => {
-      if (value === null) {
+    const shared = provider.shared;
+    if (!shared) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Provider '${provider.name}' has no shared secrets` }));
+      return true;
+    }
+    shared.get(secretName).then(secret => {
+      if (secret === null) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `Secret 'liv/${secretName}' not found in Secrets Manager` }));
+        res.end(JSON.stringify({ error: `Shared secret '${secretName}' not found` }));
         return;
       }
-      const token = tokenStore.issue(`fleet:${secretName}`, value);
-      console.log(`[issue] secret=fleet:${secretName} ttl_s=${token.ttlSeconds}`);
+      const token = tokenStore.issue(`shared:${secretName}`, secret.value);
+      console.log(`[issue] secret=shared:${secretName} ttl_s=${token.ttlSeconds}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds }));
     }).catch(err => {
-      console.error(`Error fetching fleet secret '${secretName}':`, err);
+      console.error(`Error fetching shared secret '${secretName}':`, err);
       res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Failed to fetch fleet secret' }));
+      res.end(JSON.stringify({ error: 'Failed to fetch shared secret' }));
     });
     return true;
   }
@@ -188,7 +194,8 @@ export function handleVaultRequest(
   // Refresh an OAuth token
   const refreshMatch = url.match(/^\/_vault\/([^/?]+)\/refresh$/);
   if (refreshMatch && req.method === 'POST') {
-    const secretName = decodeURIComponent(refreshMatch[1]);
+    const secretName = decodeSecretName(refreshMatch[1], res);
+    if (secretName === null) return true;
     handleOAuthRefresh(secretName, res, deps).catch(err => {
       console.error('Error refreshing token:', err);
       if (!res.writableEnded) {
@@ -200,6 +207,29 @@ export function handleVaultRequest(
   }
 
   return false;
+}
+
+function vaultUrlHint(deps: VaultDeps): { vault_url?: string } {
+  return deps.missingSecretUrl ? { vault_url: deps.missingSecretUrl } : {};
+}
+
+/**
+ * Decode a secret name from a URL path segment and validate it. On failure,
+ * answers 400 and returns null. Names never reach a provider unvalidated.
+ */
+function decodeSecretName(segment: string, res: http.ServerResponse): string | null {
+  let name: string;
+  try {
+    name = decodeURIComponent(segment);
+  } catch {
+    name = '';
+  }
+  if (!isValidSecretName(name)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid secret name: use letters, digits, ".", "_" and "-" (max 128, starting with a letter or digit)' }));
+    return null;
+  }
+  return name;
 }
 
 /** Collect and JSON-parse a request body (rejects on malformed JSON). */
@@ -236,7 +266,7 @@ function handleMintTokens(
   res: http.ServerResponse,
   deps: VaultDeps,
 ): void {
-  const { tokenStore, secretFetcher } = deps;
+  const { tokenStore, provider } = deps;
   const secretName = typeof body.secretName === 'string' ? body.secretName : '';
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
 
@@ -245,25 +275,30 @@ function handleMintTokens(
     res.end(JSON.stringify({ error: 'Both `secretName` and `sessionId` are required' }));
     return;
   }
+  if (!isValidSecretName(secretName)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid secret name' }));
+    return;
+  }
 
   let ttl = MINT_DEFAULT_TTL_SECONDS;
   if (typeof body.expires_in === 'number' && body.expires_in > 0) {
     ttl = Math.min(body.expires_in, MINT_MAX_TTL_SECONDS);
   }
 
-  secretFetcher.get(secretName).then(value => {
-    if (value === null) {
+  provider.secrets.get(secretName).then(secret => {
+    if (secret === null) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         error: `No credential stored under '${secretName}'`,
-        vault_url: 'https://example.com/dashboard/integrations',
+        ...vaultUrlHint(deps),
       }));
       return;
     }
 
     let parsed: Record<string, unknown> | null = null;
     try {
-      const obj = JSON.parse(value);
+      const obj = JSON.parse(secret.value);
       if (obj && typeof obj === 'object' && !Array.isArray(obj)) parsed = obj;
     } catch {
       // not JSON
@@ -298,21 +333,31 @@ function handleMintTokens(
 /**
  * Handle OAuth token refresh server-side.
  * Reads refresh_token + credentials from vault, exchanges with provider,
- * stores new tokens back in vault, returns a tok_* to the agent.
+ * stores new tokens back in vault, returns a cct_* to the agent.
  */
 async function handleOAuthRefresh(
   secretName: string,
   res: http.ServerResponse,
   deps: VaultDeps,
 ): Promise<void> {
-  const { tokenStore, secretFetcher } = deps;
+  const { tokenStore, provider } = deps;
+  const store = provider.secrets;
 
-  const raw = await secretFetcher.get(secretName);
-  if (raw === null) {
+  // Check before the token exchange: a rotated refresh token we cannot store
+  // would be lost.
+  if (!store.put) {
+    res.writeHead(501, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `Provider '${provider.name}' is read-only; OAuth refresh needs a writable store` }));
+    return;
+  }
+
+  const secret = await store.get(secretName);
+  if (secret === null) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: `Secret '${secretName}' not found` }));
     return;
   }
+  const raw = secret.value;
 
   let parsed: Record<string, unknown>;
   try {
@@ -351,8 +396,9 @@ async function handleOAuthRefresh(
   });
 
   if (!tokenRes.ok) {
-    const errorText = await tokenRes.text();
-    console.error(`OAuth refresh failed for ${secretName}:`, tokenRes.status, errorText);
+    // Never log the body: providers can echo client ids or fragments of the grant.
+    const errorCode = oauthErrorCode(await tokenRes.text().catch(() => ''));
+    console.error(`OAuth refresh failed for ${secretName}: status=${tokenRes.status} error=${errorCode}`);
     res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Token refresh failed', status: tokenRes.status }));
     return;
@@ -372,11 +418,29 @@ async function handleOAuthRefresh(
     updated.refresh_token = tokens.refresh_token;
   }
 
-  await secretFetcher.put(secretName, JSON.stringify(updated));
+  await store.put(secretName, JSON.stringify(updated));
 
-  // Issue a tok_* for the new access token
+  // Issue a cct_* for the new access token
   const tok = tokenStore.issue(`${secretName}:access_token`, tokens.access_token);
   console.log(`[issue] secret=${secretName}:access_token ttl_s=${tok.ttlSeconds} via=oauth_refresh`);
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ token: tok.id, expires_in: tok.ttlSeconds }));
+}
+
+const OAUTH_ERROR_CODE_MAX = 64;
+
+/**
+ * Extract the RFC 6749 `error` code from a token-endpoint error body, safe to
+ * log: only `[A-Za-z0-9_.-]`, at most 64 chars. Anything else becomes `unknown`.
+ */
+export function oauthErrorCode(body: string): string {
+  let code: unknown;
+  try {
+    code = (JSON.parse(body) as { error?: unknown })?.error;
+  } catch {
+    return 'unparseable';
+  }
+  if (typeof code !== 'string' || code.length === 0) return 'unknown';
+  const safe = code.slice(0, OAUTH_ERROR_CODE_MAX);
+  return /^[A-Za-z0-9_.-]+$/.test(safe) ? safe : 'unknown';
 }

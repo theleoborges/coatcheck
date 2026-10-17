@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { TokenStore } from './token-store.js';
+import { TokenStore, TICKET_PREFIX, TICKET_PATTERN } from './token-store.js';
 
 describe('TokenStore', () => {
   let store: TokenStore;
@@ -8,11 +8,38 @@ describe('TokenStore', () => {
     store?.destroy();
   });
 
-  it('issues tokens with tok_ prefix', () => {
+  it('issues tokens with cct_ prefix', () => {
     store = new TokenStore();
     const token = store.issue('my-secret', 'real-value-123');
-    expect(token.id).toMatch(/^tok_[a-f0-9]{64}$/);
+    expect(token.id).toMatch(/^cct_[a-f0-9]{64}$/);
     expect(token.ttlSeconds).toBe(900);
+  });
+
+  it('exports one prefix and pattern that match issued tickets', () => {
+    store = new TokenStore();
+    const { id } = store.issue('my-secret', 'v');
+    const sessionId = store.issueForSession('login:password', 'p', 'sid1').id;
+    expect(TICKET_PREFIX).toBe('cct_');
+    for (const t of [id, sessionId]) {
+      TICKET_PATTERN.lastIndex = 0;
+      expect(t.startsWith(TICKET_PREFIX)).toBe(true);
+      expect(`x ${t} y`.match(TICKET_PATTERN)).toEqual([t]);
+    }
+  });
+
+  it('does not treat the old tok_ prefix as a ticket', () => {
+    store = new TokenStore();
+    const { id } = store.issue('my-secret', 'real-value');
+    const legacy = 'tok_' + id.slice(TICKET_PREFIX.length);
+    expect(store.replaceAll(`Bearer ${legacy}`).swaps).toEqual([]);
+    TICKET_PATTERN.lastIndex = 0;
+    expect(legacy.match(TICKET_PATTERN)).toBeNull();
+  });
+
+  it('uses the configured default TTL', () => {
+    store = new TokenStore({ defaultTtlSeconds: 60 });
+    expect(store.issue('k', 'v').ttlSeconds).toBe(60);
+    expect(store.issue('k', 'v', 5).ttlSeconds).toBe(5);
   });
 
   it('resolves a valid token to its real value', () => {
@@ -23,7 +50,7 @@ describe('TokenStore', () => {
 
   it('returns null for unknown tokens', () => {
     store = new TokenStore();
-    expect(store.resolve('tok_unknown')).toBeNull();
+    expect(store.resolve('cct_unknown')).toBeNull();
   });
 
   it('replaces tokens in strings', () => {
@@ -59,7 +86,7 @@ describe('TokenStore', () => {
 
   it('returns input unchanged when store is empty', () => {
     store = new TokenStore();
-    const input = 'Authorization: Bearer tok_fake';
+    const input = 'Authorization: Bearer cct_fake';
     const result = store.replaceAll(input);
     expect(result.output).toBe(input);
     expect(result.swaps).toEqual([]);

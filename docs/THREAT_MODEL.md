@@ -9,7 +9,7 @@ assumes this happens and aims to keep real credentials out of everything the
 agent can read: its process memory, environment, filesystem, logs, and model
 context.
 
-The agent receives a **ticket** (`tok_` + 64 hex chars) instead of a secret.
+The agent receives a **ticket** (`cct_` + 64 hex chars) instead of a secret.
 coatcheck swaps the ticket for the real value on the wire, after TLS
 termination, on traffic it intercepts.
 
@@ -43,10 +43,10 @@ go around it to the secret store. Three properties are required.
 
 ### Worked example: AWS (ECS/Fargate)
 
-As shipped, `src/secret-fetcher.ts` reads per-agent secrets from SSM Parameter
+As shipped, the AWS provider (`src/providers/aws.ts`) reads per-agent secrets from SSM Parameter
 Store under a per-agent prefix and shared secrets from Secrets Manager, and
-optionally assumes a role named by `PROXY_ROLE_ARN` via STS before doing so
-(`src/secret-fetcher.ts:58-94`).
+optionally assumes a role named by `COATCHECK_AWS_ROLE_ARN` via STS before doing so
+(`src/providers/aws.ts`).
 
 - Agent task role: explicit `Deny` on `ssm:GetParameter*` for
   `…/user-secrets/*` and no `secretsmanager:GetSecretValue` on shared secrets.
@@ -119,9 +119,12 @@ ticket into a request to any destination.
 | Tickets expire | 900 s default (`src/token-store.ts:4`); session-bound tickets 600 s default, 1800 s max (`src/vault-handler.ts:222-223`) |
 | `curl -v` on the agent side shows only the ticket | Substitution happens after TLS termination, on coatcheck's upstream leg |
 | Session-bound (browser) tickets never resolve on HTTPS | `src/token-store.ts:133` |
-| Shared secrets are allowlisted | `/_secret/{name}` refuses names outside a hard-coded allowlist (`src/vault-handler.ts:18-20`, `:150-154`) |
-| Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`src/index.ts:173`) |
-| Logs carry no values | Swap logs record secret names, host, and ticket age only (`src/index.ts:269-290`) |
+| Shared secrets are allowlisted | `/_secret/{name}` refuses names not listed under `shared` in the operator's policy file; with no policy file, it refuses every name (`src/policy.ts`, `src/vault-handler.ts`) |
+| Secret names are validated before any provider call | `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (no `/`, no leading `.`), checked after URL-decoding on every route that takes a name; invalid names get `400` (`isValidSecretName`, `src/secret-provider.ts`; `src/vault-handler.ts`) |
+| Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`src/mitm.ts`) |
+| CONNECT targets cannot reach a shell or the filesystem | Targets are parsed strictly (RFC 1123 DNS name or IP literal, port 1–65535; otherwise `400`) (`src/connect-target.ts`). Certificates are generated in-process with WebCrypto; leaf keys stay in memory (LRU, 1000 entries) and only the CA is written to disk, when `COATCHECK_CA_DIR` is set (`src/ca.ts`). |
+| Logs carry no values | Swap logs record secret names, host, and ticket age only (`src/swap-log.ts`) |
+| OAuth refresh failures don't log provider bodies | Only the HTTP status and the RFC 6749 `error` code (sanitised to `[A-Za-z0-9_.-]`, at most 64 chars) are logged (`oauthErrorCode`, `src/vault-handler.ts`) |
 
 ## Known gaps
 
@@ -131,8 +134,8 @@ Severity reflects the attacker above. File references are to `src/`.
 
 `TokenStore.replaceAll` substitutes every active unscoped ticket into any
 request, whatever the destination (`token-store.ts:119-141`), on both the
-plain-HTTP forward path (`index.ts:41-77`, `:228-255`) and the HTTPS MITM path
-(`index.ts:152`, `:257-261`). So:
+plain-HTTP forward path (`forward.ts`) and the HTTPS MITM path
+(`mitm.ts`). So:
 
 ```bash
 TOK=$(curl -s http://127.0.0.1:3128/_vault/some-api-key | jq -r .token)
@@ -146,22 +149,9 @@ for. Until host binding lands, coatcheck keeps secrets out of the agent's
 context, logs, and disk, and stops passive leaks (an echoed env var, a pasted
 log), but does **not** stop an agent that is actively trying to exfiltrate.
 Fix: per-secret `allowed_hosts` checked against the CONNECT target (see
-`docs/ROADMAP.md`).
-
-### HIGH: CONNECT hostname reaches a shell unvalidated
-
-The CONNECT target is split on `:` and used as-is (`index.ts:81`), then
-interpolated into `execSync` command strings and file paths in
-`CertAuthority.getCertForHost` (`ca.ts:61-88`): `-subj "/CN=${hostname}"`
-inside double quotes (`ca.ts:72`) and unquoted `-out ${hostKeyPath}`
-(`ca.ts:67`). Any hostname character the HTTP parser lets through that the
-shell treats specially (`$(…)`, backticks, `;`, `&`, `|`) is a command
-injection candidate. `/` and `..` let a CONNECT target write key/cert files
-outside `CA_DIR`. The only precondition is a non-empty token store
-(`index.ts:95`), which the agent controls by minting a ticket. Command
-execution in coatcheck exposes the broker's identity and therefore every
-secret. Fix: validate hostnames (strict DNS label / IP literal) at
-`index.ts:81` and generate certificates in-process (no shell).
+`docs/ROADMAP.md`). The policy file and host matcher exist (`src/policy.ts`,
+`src/host-matcher.ts`), so allowed hosts can already be declared and are
+validated at startup, but nothing enforces them yet (roadmap item 9).
 
 ### MEDIUM: tickets are reusable until TTL
 
@@ -172,10 +162,10 @@ single-use option.
 
 ### MEDIUM: MITM engages only when the token store is non-empty
 
-At CONNECT time, an empty store means a raw TCP tunnel (`index.ts:94-99`). A
+At CONNECT time, an empty store means a raw TCP tunnel (`mitm.ts`). A
 tunnel opened before the first ticket was issued stays passthrough for its
 whole life, so a client with a keep-alive connection pool can later send a
-ticket down an un-MITM'd tunnel. It fails closed (the upstream sees `tok_…`
+ticket down an un-MITM'd tunnel. It fails closed (the upstream sees `cct_…`
 and rejects it), but it is surprising, and it also means traffic inspection
 and any future allowlist would not apply to those tunnels.
 
@@ -183,8 +173,8 @@ and any future allowlist would not apply to those tunnels.
 
 `/_vault`, `/_vault/{name}`, `/_vault/mint-tokens`, `/_vault/{name}/refresh`,
 and `/_secret/{name}` accept any caller (`vault-handler.ts:26-203`). Isolation
-rests entirely on the listener binding to `127.0.0.1` (`index.ts:295`). Setting
-`PROXY_BIND_HOST=0.0.0.0` (intended for local dev) lets anything that can
+rests entirely on the listener binding to `127.0.0.1` (`index.ts`). Setting
+`COATCHECK_BIND_HOST=0.0.0.0` (intended for local dev) lets anything that can
 reach the port mint tickets and, combined with the host-binding gap, read every
 secret. The CDP listener uses the same bind host and authenticates only by
 sid.
@@ -192,35 +182,20 @@ sid.
 ### LOW: Host header not checked against the CONNECT target
 
 Inside a MITM'd tunnel the request's `Host` header is forwarded untouched
-while the upstream socket goes to the CONNECT hostname (`index.ts:173`). TLS
+while the upstream socket goes to the CONNECT hostname (`mitm.ts`). TLS
 SNI from the client is not compared either. Harmless today, but any future
 host-bound policy must key on the CONNECT target (the actual upstream), never
 on `Host`.
 
 ### LOW: request bodies are not swapped
 
-Only headers and URL are rewritten (`index.ts:148-157`, `:228-255`). Body
+Only headers and URL are rewritten (`mitm.ts`, `forward.ts`). Body
 bytes pass through. This is a functional limitation (tickets in JSON or
 form bodies do not work) and narrows the substitution surface, which is
 mildly protective. Related: `Transfer-Encoding: chunked` request bodies are not
-parsed (`index.ts:137-143`), so a chunked body can misalign the request parser
+parsed (`mitm.ts`), so a chunked body can misalign the request parser
 on a keep-alive tunnel. The MITM also assumes HTTP/1.1 request/response:
 WebSocket upgrades or other protocols tunneled through a MITM'd CONNECT stall.
-
-### LOW: OAuth refresh failure logs the provider's response body
-
-`handleOAuthRefresh` logs `errorText` verbatim when the token endpoint returns
-non-2xx (`vault-handler.ts:353-355`). Providers usually return a short error
-JSON, but anything a provider echoes (client id, a fragment of the grant)
-lands in coatcheck's logs. Log status and a truncated, parsed `error` field
-instead.
-
-### LOW: secret names are passed through to the store unvalidated
-
-`/_vault/{name}` decodes the path segment and appends it to the store prefix
-(`vault-handler.ts:62-64`, `secret-fetcher.ts:127-139`). With SSM the name is
-literal and IAM bounds it, so `..` has no effect. A filesystem- or
-path-based provider would need to reject `/` and `..`.
 
 ### Browser injection
 

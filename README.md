@@ -12,21 +12,21 @@ It works like a coat check. You hand over the coat and get a ticket. The ticket 
  agent container                         coatcheck sidecar                       upstream
 ┌──────────────────────┐               ┌──────────────────────────┐
 │                      │ GET /_vault/  │ vault API                │  fetch by name
-│ get ticket ──────────┼──────────────>│  issue tok_… (15 min) ───┼──────────> secret backend
-│   <── tok_9f2c…      │               │                          │            (AWS SSM / SM)
+│ get ticket ──────────┼──────────────>│  issue cct_… (15 min) ───┼──────────> secret backend
+│   <── cct_9f2c…      │               │                          │            (AWS SSM / SM)
 │                      │               │                          │
-│ curl -H "Authorization: Bearer tok_9f2c…" https://api.github.com/…
+│ curl -H "Authorization: Bearer cct_9f2c…" https://api.github.com/…
 │   HTTPS_PROXY ───────┼── CONNECT ───>│ MITM TLS (own CA)        │
-│                      │               │ tok_9f2c… -> real value ─┼──────────> api.github.com
+│                      │               │ cct_9f2c… -> real value ─┼──────────> api.github.com
 │                      │               │ in headers / URL         │
 │                      │               │                          │
 │ playwright           │  ws://…/cdp/  │ CDP WebSocket proxy      │
-│   page.fill(tok_…) ──┼──────────────>│ swap in Input.insertText,├──────────> browser service
+│   page.fill(cct_…) ──┼──────────────>│ swap in Input.insertText,├──────────> browser service
 │                      │<──────────────┤ redact echoed secrets    │            (Browserbase)
 └──────────────────────┘               └──────────────────────────┘
 ```
 
-1. **Ticket issuance.** The agent calls `GET http://127.0.0.1:3128/_vault/{name}`. coatcheck fetches the secret from its backend and returns `tok_` plus 64 hex characters. Tickets live only in coatcheck's memory, with a 15-minute TTL.
+1. **Ticket issuance.** The agent calls `GET http://127.0.0.1:3128/_vault/{name}`. coatcheck fetches the secret from its backend and returns `cct_` plus 64 hex characters. Tickets live only in coatcheck's memory, with a 15-minute TTL.
 2. **HTTPS substitution.** The agent container sets `HTTPS_PROXY` to coatcheck and trusts coatcheck's CA. While at least one ticket is active, coatcheck intercepts `CONNECT` tunnels with a per-host certificate it signs itself. It replaces every active ticket it finds in the request line and headers, then re-encrypts to the real host, with normal certificate verification. This works with unmodified tools such as curl, git over HTTPS (with a bearer header), Python `requests`, and Node `fetch`, because they only need proxy support and a trusted CA. Plain-HTTP proxy requests get the same treatment. When no tickets are active, `CONNECT` is a blind TCP tunnel.
 3. **Browser (CDP) injection.** With the CDP proxy enabled, coatcheck rewrites the `connectUrl` in the browser service's session-create response so it points at a local WebSocket proxy. The agent's Playwright client connects there. On the way out, coatcheck swaps session-scoped tickets inside `Input.insertText`, `Runtime.evaluate`, and `Runtime.callFunctionOn`. On the way back, it redacts any real value the page echoes. Keystroke-by-keystroke entry fails closed (details [below](#browser--cdp-credential-injection)).
 4. **OAuth refresh.** `POST /_vault/{name}/refresh` runs the refresh-token exchange inside coatcheck. It writes the new tokens back to the backend and returns only a ticket for the new access token.
@@ -44,14 +44,14 @@ This starts coatcheck on `localhost:3128` and LocalStack. It also seeds two demo
 ```bash
 # 1. Get a ticket
 curl -s localhost:3128/_vault/example-api-key
-# {"token":"tok_3b1e…","expires_in":900}
+# {"token":"cct_3b1e…","expires_in":900}
 
 # 2. Fetch coatcheck's CA
 curl -s localhost:3128/_ca > /tmp/coatcheck-ca.crt
 
 # 3. Use the ticket as if it were the real key
 curl -s --proxy http://localhost:3128 --cacert /tmp/coatcheck-ca.crt \
-  -H "Authorization: Bearer tok_3b1e…" https://httpbin.org/headers
+  -H "Authorization: Bearer cct_3b1e…" https://httpbin.org/headers
 ```
 
 httpbin echoes the request headers, so step 3 shows the **real** value arriving upstream. That is the point of the demo, and also the main open gap: a ticket sent to any host gets swapped (see [limitations](#status--known-limitations)).
@@ -60,20 +60,20 @@ To add your own secret to LocalStack:
 
 ```bash
 aws --endpoint-url http://localhost:4566 --region us-east-1 ssm put-parameter \
-  --type SecureString --name /liv/agents/demo/user-secrets/github-token --value 'ghp_…'
+  --type SecureString --name /coatcheck/secrets/github-token --value 'ghp_…'
 ```
 
 ### Secret backend layout (AWS)
 
 | Kind | Where coatcheck reads it | Served by |
 |---|---|---|
-| Named secret | SSM SecureString at `/liv/agents/{AGENT_LABEL}/user-secrets/{name}` | `/_vault/{name}` |
+| Named secret | SSM SecureString at `{COATCHECK_AWS_SSM_PREFIX}{name}` (default `/coatcheck/secrets/{name}`) | `/_vault/{name}` |
 | Multi-value secret | Same location, with a JSON object as the value (`{"username":…,"password":…}`) | `/_vault/{name}?field=…` |
-| Shared key | Secrets Manager `liv/{name}`, which must also be in a compiled-in allowlist | `/_secret/{name}` |
+| Shared key | Secrets Manager `{COATCHECK_AWS_SHARED_PREFIX}{name}` (default `coatcheck/{name}`), which must also be listed under `shared` in the [policy file](#policy-file) | `/_secret/{name}` |
 
-The path prefix is hardcoded for now. It becomes configurable when the provider interface lands. coatcheck caches backend reads in memory for 5 minutes, so a rotated secret can take that long to show up.
+Both prefixes may contain `{agentId}`, replaced with `COATCHECK_AGENT_ID` (for example `/acme/agents/{agentId}/secrets/`); coatcheck refuses to start if a prefix uses `{agentId}` and it is unset. coatcheck caches backend reads in memory for `COATCHECK_SECRET_CACHE_TTL_SECONDS` (default 5 minutes), so a rotated secret can take that long to show up.
 
-If `PROXY_ROLE_ARN` is set, coatcheck assumes that role through STS (1-hour sessions, renewed every 45 minutes) before reading secrets. The intended deployment gives backend read access to that role only, and gives the agent's own identity none.
+If `COATCHECK_AWS_ROLE_ARN` is set, coatcheck assumes that role through STS (1-hour sessions, renewed every 45 minutes) before reading secrets. The intended deployment gives backend read access to that role only, and gives the agent's own identity none.
 
 ## HTTP API
 
@@ -84,32 +84,66 @@ The API is served on the proxy port (default `127.0.0.1:3128`). **It has no auth
 | `GET /_health` | `{"status":"ok","tokens_active":N}` | Liveness check. |
 | `GET /_ca` | PEM | coatcheck's root CA certificate, for the agent to trust. |
 | `GET /_vault` | `{"secrets":["github-token",…]}` | Lists secret names. Values are not decrypted. |
-| `GET /_vault/{name}` | `{"token":"tok_…","expires_in":900}` | For a single-value secret. |
+| `GET /_vault/{name}` | `{"token":"cct_…","expires_in":900}` | For a single-value secret. |
 | `GET /_vault/{name}` | `{"type":"multi","fields":[…]}` | For a multi-value (JSON) secret. Request a specific field with `?field=`. |
-| `GET /_vault/{name}?field={f}` | `{"token":"tok_…","expires_in":900}` | Ticket for one field. If the secret's `_cleartext` array lists the field, returns `{"value":"…","cleartext":true}` instead (for non-sensitive values such as URLs and account IDs). |
+| `GET /_vault/{name}?field={f}` | `{"token":"cct_…","expires_in":900}` | Ticket for one field. If the secret's `_cleartext` array lists the field, returns `{"value":"…","cleartext":true}` instead (for non-sensitive values such as URLs and account IDs). |
 | `GET /_vault/{name}?check=1` | `{"exists":true}` | Checks whether a secret exists without decrypting it. |
-| `GET /_secret/{name}` | `{"token":"tok_…","expires_in":900}` | Shared key from Secrets Manager. Returns 403 unless `{name}` is in the allowlist (currently `browserbase-api-key`). |
-| `POST /_vault/mint-tokens` | `{"username_token":"tok_…","password_token":"tok_…","expires_in":600}` | Body: `{"secretName":"example-login","sessionId":"<cdp sid>","expires_in"?:N}`. The secret must be a multi-value secret with `username` and `password`. Tickets are bound to one CDP session (see below). Default TTL is 600 s, capped at 1800 s. |
-| `POST /_vault/{name}/refresh` | `{"token":"tok_…","expires_in":900}` | Secret fields: `refresh_token`, `token_url`, `client_id`, `client_secret`. coatcheck posts a `refresh_token` grant, writes `access_token`, `expires_at`, and any rotated `refresh_token` back to the backend, and returns a ticket for the new access token. |
+| `GET /_secret/{name}` | `{"token":"cct_…","expires_in":900}` | Shared key from the backend's shared store. Returns 403 unless `{name}` is listed under `shared` in the policy file (with no policy file, every name gets 403). |
+| `POST /_vault/mint-tokens` | `{"username_token":"cct_…","password_token":"cct_…","expires_in":600}` | Body: `{"secretName":"example-login","sessionId":"<cdp sid>","expires_in"?:N}`. The secret must be a multi-value secret with `username` and `password`. Tickets are bound to one CDP session (see below). Default TTL is 600 s, capped at 1800 s. |
+| `POST /_vault/{name}/refresh` | `{"token":"cct_…","expires_in":900}` | Secret fields: `refresh_token`, `token_url`, `client_id`, `client_secret`. coatcheck posts a `refresh_token` grant, writes `access_token`, `expires_at`, and any rotated `refresh_token` back to the backend, and returns a ticket for the new access token. |
 
-Errors are JSON `{"error":…}` with status 400, 403, 404, 500, or 502.
+Secret names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` after URL-decoding; anything else (including `/` or a leading `.`) gets `400` before the backend is consulted. `refresh` returns `501` when the configured backend is read-only.
+
+Errors are JSON `{"error":…}` with status 400, 403, 404, 500, 501, or 502.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AGENT_LABEL` | (required) | Identifies the agent. Scopes the SSM path. coatcheck exits if it is unset. |
-| `PROXY_PORT` | `3128` | Port for the proxy and the HTTP API. |
-| `PROXY_BIND_HOST` | `127.0.0.1` | Bind address for the proxy and the CDP proxy. Use `0.0.0.0` only for local docker-compose. |
-| `CA_DIR` | `/tmp/proxy-ca` | CA key, CA cert, and generated host certs. If an existing `ca.key`/`ca.crt` is found there, coatcheck reuses it. Otherwise it generates a new CA on every start. |
-| `CDP_PROXY_ENABLED` | off | Set to `1` to run the CDP proxy and rewrite browser-service `connectUrl`s. |
-| `CDP_PROXY_PORT` | `8444` | CDP WebSocket proxy port. |
-| `CDP_PROXY_ADVERTISE_HOST` | `127.0.0.1` | Host written into the rewritten `connectUrl`. Override it when the Playwright client is in a different container. |
-| `AWS_REGION` | `ap-southeast-2` | Region for SSM, Secrets Manager, and STS. |
-| `AWS_ENDPOINT_URL` | (unset) | Endpoint override for SSM and Secrets Manager, e.g. LocalStack. |
-| `PROXY_ROLE_ARN` | (unset) | IAM role to assume before reading secrets. If unset, the default AWS credential chain is used. |
+| `COATCHECK_PROVIDER` | (required) | Secret backend. Currently `aws`. |
+| `COATCHECK_AGENT_ID` | (unset) | Optional agent identity: used in logs, in `{agentId}` templates, and in the default STS session name. Same character rules as secret names. |
+| `COATCHECK_PORT` | `3128` | Port for the proxy and the HTTP API. |
+| `COATCHECK_BIND_HOST` | `127.0.0.1` | Bind address for the proxy and the CDP proxy. Use `0.0.0.0` only for local docker-compose. |
+| `COATCHECK_TICKET_TTL_SECONDS` | `900` | Lifetime of tickets from `/_vault` and `/_secret`. |
+| `COATCHECK_SECRET_CACHE_TTL_SECONDS` | `300` | How long backend reads are cached; `0` disables the cache. |
+| `COATCHECK_POLICY_FILE` | (unset) | JSON [policy file](#policy-file): allowed hosts per secret and the shared-secret allowlist. Read once at startup; an invalid file stops startup. |
+| `COATCHECK_MISSING_SECRET_URL` | (unset) | Returned as `vault_url` in 404s, e.g. a dashboard where users add secrets. Omitted when unset. |
+| `COATCHECK_CA_SUBJECT` | `CN=coatcheck CA, O=coatcheck` | Subject of a newly generated CA. |
+| `COATCHECK_CA_DIR` | (unset) | Where to persist the CA key and cert (`ca.key`, `ca.crt`). If unset, coatcheck generates an in-memory CA on every start. If an existing ECDSA P-256 CA is found there, coatcheck reuses it; any other key type (for example an RSA CA from an older version) fails startup until the files are deleted. Per-host certificates are never written to disk. |
+| `COATCHECK_CDP_ENABLED` | `0` | Set to `1` to run the CDP proxy and rewrite browser-service `connectUrl`s. |
+| `COATCHECK_CDP_PORT` | `8444` | CDP WebSocket proxy port. |
+| `COATCHECK_CDP_ADVERTISE_HOST` | `127.0.0.1` | Host written into the rewritten `connectUrl`. Override it when the Playwright client is in a different container. |
+| `COATCHECK_AWS_SSM_PREFIX` | `/coatcheck/secrets/` | SSM path prefix for named secrets (`aws` provider). Must start and end with `/`; may contain `{agentId}`. |
+| `COATCHECK_AWS_SHARED_PREFIX` | `coatcheck/` | Secrets Manager name prefix for shared keys (`aws` provider); may contain `{agentId}`. |
+| `COATCHECK_AWS_ROLE_ARN` | (unset) | IAM role to assume before reading secrets. If unset, the default AWS credential chain is used. |
+| `COATCHECK_AWS_ROLE_SESSION_NAME` | `coatcheck-{agentId}`, or `coatcheck` | STS session name when assuming the role. |
 
-Standard AWS SDK credential variables apply. The runtime image needs `openssl` on `PATH`, because coatcheck shells out to it for CA and per-host certificate generation.
+Region, endpoint (`AWS_REGION`, `AWS_ENDPOINT_URL` for LocalStack) and credentials come from the standard AWS SDK chain; there is no built-in default region.
+
+Earlier variable names (`AGENT_LABEL`, `PROXY_PORT`, `PROXY_BIND_HOST`, `CA_DIR`, `PROXY_ROLE_ARN`, `CDP_PROXY_*`) are rejected at startup with a message naming the replacement. Certificates are generated in-process (ECDSA P-256); coatcheck needs no `openssl` binary.
+
+## Policy file
+
+`COATCHECK_POLICY_FILE` points at a JSON file owned by the operator (see `examples/policy.example.json`):
+
+```json
+{
+  "secrets": {
+    "github-token": { "allowed_hosts": ["api.github.com"] },
+    "google-*":     { "allowed_hosts": ["*.googleapis.com", "oauth2.googleapis.com"] }
+  },
+  "shared": {
+    "browserbase-api-key": { "allowed_hosts": ["api.browserbase.com"] }
+  }
+}
+```
+
+- `secrets` keys are exact secret names or a prefix ending in `*`. An exact name wins over a prefix, and a longer prefix wins over a shorter one.
+- `shared` keys are exact names. Listing a shared secret here is what allowlists it for `/_secret/{name}`.
+- `allowed_hosts` entries are exact hostnames, or `*.example.com`, which matches any subdomain but not `example.com` itself. Entries are case-insensitive and IDNs are converted to punycode. IP addresses match exactly. HTTPS is implied; write `http://host` to also allow plaintext HTTP. Ports and paths are not allowed. A bare `*` and wildcards over a single label (`*.com`) are rejected.
+- The schema is strict: unknown keys, empty `allowed_hosts` lists and invalid entries all stop startup.
+
+> **`allowed_hosts` is parsed and validated but not enforced yet.** Tickets are still swapped on requests to any host. Enforcement is roadmap item 9; until then, treat the file as the shared-secret allowlist plus a declaration of intent.
 
 ## Trusting the CA in the agent container
 
@@ -139,7 +173,7 @@ export HTTP_PROXY=http://127.0.0.1:3128
 export NO_PROXY=localhost,127.0.0.1,169.254.169.254,169.254.170.2   # plus internal services
 ```
 
-If `CA_DIR` is not on persistent storage, each coatcheck restart generates a new CA, and the agent has to fetch `/_ca` again.
+Unless `COATCHECK_CA_DIR` is set and on persistent storage, each coatcheck restart generates a new CA, and the agent has to fetch `/_ca` again.
 
 ## Using tickets
 
@@ -147,26 +181,26 @@ coatcheck does a **literal substring replace** of active ticket strings, so the 
 
 **Works.** The ticket appears as plaintext in the request line or a header:
 
-- `Authorization: Bearer tok_…`
-- `Authorization: token tok_…` (GitHub style)
-- `X-API-Key: tok_…`, or any custom header
-- `https://api.example.com/v1/x?api_key=tok_…` (query string)
+- `Authorization: Bearer cct_…`
+- `Authorization: token cct_…` (GitHub style)
+- `X-API-Key: cct_…`, or any custom header
+- `https://api.example.com/v1/x?api_key=cct_…` (query string)
 
 **Does not work.** The request still goes out, but with the ticket unchanged, and the upstream returns 401/403:
 
-- **HTTP Basic auth**, e.g. `curl -u user:tok_…`, `https://user:tok_…@host/` URLs, `.netrc`, and git credential helpers. Base64 encoding hides the ticket from the substring scan. For git, send an `Authorization` header instead (`git -c http.extraHeader="Authorization: Bearer tok_…"`).
+- **HTTP Basic auth**, e.g. `curl -u user:cct_…`, `https://user:cct_…@host/` URLs, `.netrc`, and git credential helpers. Base64 encoding hides the ticket from the substring scan. For git, send an `Authorization` header instead (`git -c http.extraHeader="Authorization: Bearer cct_…"`).
 - **Tickets in request bodies** (JSON, form-encoded, multipart). Bodies are forwarded untouched.
 - **Any client that ignores `HTTPS_PROXY`.** Node's built-in `https` module is the common case: it needs an explicit agent such as `https-proxy-agent`. curl, git, Python `requests`, and undici `fetch` honor the variable.
 - **Client-side signing**, such as AWS SigV4, HMAC request signatures, or JWT minting. The client computes a signature over the ticket, not the real secret.
 - **Expired tickets.** After 15 minutes the ticket is forwarded literally.
 
-If an upstream returns 401 while you are using a ticket, assume the swap did not happen before you assume the stored credential is wrong. coatcheck logs one line per request with no values: `[swap] … result=hit secrets=…` on success, or `result=miss unswapped_tok_literals=N` when a `tok_<64 hex>` string reaches the upstream intact.
+If an upstream returns 401 while you are using a ticket, assume the swap did not happen before you assume the stored credential is wrong. coatcheck logs one line per request with no values: `[swap] … result=hit secrets=…` on success, or `result=miss unswapped_ticket_literals=N` when a `cct_<64 hex>` string reaches the upstream intact.
 
 ## Browser / CDP credential injection
 
-This lets an agent log into a website through a remote browser without the password entering its context. Set `CDP_PROXY_ENABLED=1`. Browserbase is the only supported browser service today.
+This lets an agent log into a website through a remote browser without the password entering its context. Set `COATCHECK_CDP_ENABLED=1`. Browserbase is the only supported browser service today.
 
-1. The agent creates a session with `POST https://api.browserbase.com/v1/sessions` **through `HTTPS_PROXY`**, authenticating with a `/_secret/browserbase-api-key` ticket. coatcheck rewrites the response's `connectUrl` from the real `wss://…` URL, which carries Browserbase's signing key, to `ws://{CDP_PROXY_ADVERTISE_HOST}:8444/cdp/{sid}`. The agent never sees the real URL. A `sid` is valid for 10 minutes until a client connects.
+1. The agent creates a session with `POST https://api.browserbase.com/v1/sessions` **through `HTTPS_PROXY`**, authenticating with a `/_secret/browserbase-api-key` ticket. coatcheck rewrites the response's `connectUrl` from the real `wss://…` URL, which carries Browserbase's signing key, to `ws://{COATCHECK_CDP_ADVERTISE_HOST}:8444/cdp/{sid}`. The agent never sees the real URL. A `sid` is valid for 10 minutes until a client connects.
 2. The agent mints session-bound tickets with `POST /_vault/mint-tokens {"secretName":"example-login","sessionId":"{sid}"}`.
 3. The agent connects (`chromium.connectOverCDP(connectUrl)`) and fills the form:
 
@@ -193,9 +227,9 @@ Client rules:
 
 ## Status & known limitations
 
-coatcheck is **pre-1.0**. The HTTP API, ticket format (`tok_…`, moving to `ck_…`), and configuration may change. Known gaps, roughly in priority order:
+coatcheck is **pre-1.0**. The HTTP API, ticket format (`cct_…`), and configuration may change. Known gaps, roughly in priority order:
 
-- **Tickets are not bound to destination hosts.** This is the top priority. Today any active ticket is swapped on a request to *any* host. A prompt-injected agent that sends `Authorization: Bearer tok_…` to an attacker's server delivers the real secret, as the httpbin quickstart shows. coatcheck currently protects against the agent *seeing* or *printing* secrets (logs, transcripts, model context), not against it *sending* them somewhere. Per-secret allowed hosts are planned.
+- **Tickets are not bound to destination hosts.** This is the top priority. Today any active ticket is swapped on a request to *any* host. A prompt-injected agent that sends `Authorization: Bearer cct_…` to an attacker's server delivers the real secret, as the httpbin quickstart shows. coatcheck currently protects against the agent *seeing* or *printing* secrets (logs, transcripts, model context), not against it *sending* them somewhere. Per-secret allowed hosts are planned.
 - **Request bodies are not substituted.** Only the request line (URL) and headers are. `Transfer-Encoding: chunked` request bodies on the MITM path are not parsed, which can misframe keep-alive connections.
 - **`HTTPS_PROXY` is advisory.** A process that ignores it bypasses coatcheck, which means no substitution and also no protection. Pair coatcheck with egress enforcement (network policy, firewall, or security group) so the agent can reach the internet only through the proxy.
 - **Interception is all-or-nothing while any ticket is live.** With at least one active ticket, *every* `CONNECT` is MITM'd, not just connections that carry tickets. Clients that pin certificates or don't trust the CA will fail during that window.
@@ -221,7 +255,7 @@ coatcheck makes different trade-offs:
 npm install
 npm test          # vitest
 npm run build     # tsc -> dist/
-AGENT_LABEL=demo AWS_ENDPOINT_URL=http://localhost:4566 npm run dev
+COATCHECK_PROVIDER=aws AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:4566 npm run dev
 ```
 
 ## Docs

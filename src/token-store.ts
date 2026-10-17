@@ -1,11 +1,21 @@
 import { randomBytes } from 'node:crypto';
 
-const TOKEN_PREFIX = 'tok_';
+/**
+ * Prefix of every ticket id ("coatcheck ticket"). Distinctive so tickets are
+ * easy to grep for and to register with secret scanners. Single source of truth:
+ * the swap logger and the CDP pre-filter use it too.
+ */
+export const TICKET_PREFIX = 'cct_';
 const DEFAULT_TTL_SECONDS = 900; // 15 minutes — covers conversational latency between get-secret.sh and outbound call
+
+export interface TokenStoreOptions {
+  /** TTL for tickets issued without an explicit one (`COATCHECK_TICKET_TTL_SECONDS`). */
+  defaultTtlSeconds?: number;
+}
 const CLEANUP_INTERVAL_MS = 30_000; // 30 seconds
 
-/** Matches any issued token ID (32-byte hex). Used to spot un-swapped literals in outbound traffic. */
-export const TOKEN_LITERAL_PATTERN = /tok_[a-f0-9]{64}/g;
+/** Matches any issued ticket id (prefix + 32-byte hex). Used to spot un-swapped literals in outbound traffic. */
+export const TICKET_PATTERN = new RegExp(`${TICKET_PREFIX}[a-f0-9]{64}`, 'g');
 
 interface TokenEntry {
   id: string;
@@ -50,15 +60,18 @@ export class TokenStore {
   private tokens = new Map<string, TokenEntry>();
   private cleanupTimer: NodeJS.Timeout;
 
-  constructor() {
+  private readonly defaultTtlSeconds: number;
+
+  constructor(opts: TokenStoreOptions = {}) {
+    this.defaultTtlSeconds = opts.defaultTtlSeconds ?? DEFAULT_TTL_SECONDS;
     // Periodically clean up expired tokens
     this.cleanupTimer = setInterval(() => this.evictExpired(), CLEANUP_INTERVAL_MS);
     this.cleanupTimer.unref();
   }
 
   /** Issue a new proxy token for a secret */
-  issue(secretName: string, realValue: string, ttlSeconds = DEFAULT_TTL_SECONDS): IssuedToken {
-    const id = TOKEN_PREFIX + randomBytes(32).toString('hex');
+  issue(secretName: string, realValue: string, ttlSeconds = this.defaultTtlSeconds): IssuedToken {
+    const id = TICKET_PREFIX + randomBytes(32).toString('hex');
     const now = Date.now();
 
     this.tokens.set(id, {
@@ -82,9 +95,9 @@ export class TokenStore {
     secretName: string,
     realValue: string,
     sessionId: string,
-    ttlSeconds = DEFAULT_TTL_SECONDS,
+    ttlSeconds = this.defaultTtlSeconds,
   ): IssuedToken {
-    const id = TOKEN_PREFIX + randomBytes(32).toString('hex');
+    const id = TICKET_PREFIX + randomBytes(32).toString('hex');
     const now = Date.now();
 
     this.tokens.set(id, {

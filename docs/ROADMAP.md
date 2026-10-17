@@ -13,7 +13,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 ## Phase 1: shell injection (HIGH)
 
-1. **Validate CONNECT targets.** Parse `host:port` strictly:
+1. **[Done]** **Validate CONNECT targets.** Parse `host:port` strictly:
    - the host must be a DNS name (RFC 1123 labels, at most 253 chars) or an
      IP literal (`net.isIP`, with IPv6 in brackets);
    - the port must be 1–65535.
@@ -21,7 +21,7 @@ rejected, are in `docs/design/v1-decisions.md`.
    Anything else gets `400`. Tests cover `$(…)`, backticks, `;`, `|`, `/`,
    `..`, and empty or over-long labels.
 
-2. **In-process certificate generation.** Replace the `openssl` shell-outs in
+2. **[Done]** **In-process certificate generation.** Replace the `openssl` shell-outs in
    `src/ca.ts` with `@peculiar/x509` on Node WebCrypto, ECDSA P-256.
    - Leaf certs stay in memory (LRU, cap 1000), and IP targets get an IP SAN.
    - Only the CA key and cert are ever written to disk, and only when a CA
@@ -36,24 +36,24 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 ## Phase 2: foundations
 
-3. **Make the proxy testable.** Split `src/index.ts` into a side-effect-free
+3. **[Done]** **Make the proxy testable.** Split `src/index.ts` into a side-effect-free
    `createCoatcheck(deps)` factory and modules for the MITM handler, the
    plain-HTTP forwarder, and swap logging. Add tests for keep-alive,
    passthrough vs MITM, `connectUrl` rewrite wiring, and the forward path.
    No behaviour change.
 
-4. **Ticket prefix `tok_` → `cct_`.** Export one `TICKET_PREFIX` /
+4. **[Done]** **Ticket prefix `tok_` → `cct_`.** Export one `TICKET_PREFIX` /
    `TICKET_PATTERN`, and use it in the token store, swap logging, and the CDP
    outbound pre-filter (which hard-codes `'tok_'` today). There is no
    dual-prefix window: tickets live only in memory and never survive a
    restart. (`ck_` was rejected because it collides with WooCommerce consumer
    keys.)
 
-5. **Stop logging OAuth error bodies.** On a non-2xx refresh,
+5. **[Done]** **Stop logging OAuth error bodies.** On a non-2xx refresh,
    `handleOAuthRefresh` logs the status and a parsed, truncated `error` code,
    and nothing else.
 
-6. **`SecretProvider` interface (in-tree).** Introduce:
+6. **[Done]** **`SecretProvider` interface (in-tree).** Introduce:
 
    ```ts
    interface Secret { value: string; allowedHosts?: string[] }
@@ -80,7 +80,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 
    No other behaviour change.
 
-7. **Configuration.** Add a pure `loadConfig(env)`. It is the only reader of
+7. **[Done]** **Configuration.** Add a pure `loadConfig(env)`. It is the only reader of
    `process.env`, which an eslint rule enforces.
    - All settings move to the `COATCHECK_*` names in
      `docs/design/v1-decisions.md`. A legacy name fails startup with
@@ -94,7 +94,7 @@ rejected, are in `docs/design/v1-decisions.md`.
      - `AWS_ENDPOINT_URL` is left to the SDK.
    - Add `COATCHECK_TICKET_TTL_SECONDS`.
 
-8. **Policy file and host matcher.** `COATCHECK_POLICY_FILE` (JSON) maps secret
+8. **[Done]** **Policy file and host matcher.** `COATCHECK_POLICY_FILE` (JSON) maps secret
    names (trailing `*` allowed) to `allowed_hosts`. It also lists the shared
    secrets, replacing the hard-coded allowlist in `src/vault-handler.ts`.
 

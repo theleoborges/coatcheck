@@ -36,8 +36,8 @@ export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ```
 
-The CA is generated on first start and reused if `CA_DIR` persists across
-restarts. If it is regenerated, clients must re-fetch it.
+The CA is generated in memory on every start unless `COATCHECK_CA_DIR` is set and
+persists across restarts. If it is regenerated, clients must re-fetch it.
 
 ## 2. Get a ticket
 
@@ -45,7 +45,7 @@ restarts. If it is regenerated, clients must re-fetch it.
 |---|---|
 | `GET /_vault` | `{"secrets": ["name", …]}` (names only) |
 | `GET /_vault/{name}?check=1` | `{"exists": true\|false}` |
-| `GET /_vault/{name}` | simple secret: `{"token": "tok_…", "expires_in": 900}`; JSON secret: `{"type": "multi", "fields": [...]}` |
+| `GET /_vault/{name}` | simple secret: `{"token": "cct_…", "expires_in": 900}`; JSON secret: `{"type": "multi", "fields": [...]}` |
 | `GET /_vault/{name}?field=f` | `{"token": …}`, or `{"value": …, "cleartext": true}` if `f` is listed in the secret's `_cleartext` |
 | `GET /_secret/{name}` | ticket for an allowlisted shared secret |
 | `POST /_vault/{name}/refresh` | refreshes an OAuth secret server-side, returns a ticket for the new `access_token` |
@@ -61,7 +61,7 @@ TOK=$(curl -sf http://127.0.0.1:3128/_vault/example-api-key | jq -er .token)
 Talk to these endpoints directly (`http://127.0.0.1:3128/_vault/…`), not as a
 proxied request.
 
-A ticket is a placeholder. Seeing `tok_…` where you expected a secret is
+A ticket is a placeholder. Seeing `cct_…` where you expected a secret is
 correct. Tickets expire after 15 minutes by default; re-fetch for longer
 workflows rather than caching.
 
@@ -79,10 +79,10 @@ curl -H "X-API-Key: $TOK"            https://api.example.com/v1/items
 curl "https://api.example.com/v1/items?api_key=$TOK"
 ```
 
-Fails silently (the upstream receives `tok_…` and returns 401/403):
+Fails silently (the upstream receives `cct_…` and returns 401/403):
 
 - **HTTP Basic auth.** `curl -u user:$TOK`, `https://user:$TOK@host/`,
-  `.netrc`, credential helpers. The client base64-encodes `user:tok_…` into
+  `.netrc`, credential helpers. The client base64-encodes `user:cct_…` into
   `Authorization: Basic …`, which hides the literal.
 - **Ticket in the request body** (JSON, form-encoded, multipart). Bodies are
   forwarded unchanged.
@@ -93,7 +93,7 @@ Fails silently (the upstream receives `tok_…` and returns 401/403):
 
 A 401/403 when using a ticket almost always means the swap did not happen.
 Debug the call path; the stored secret is usually fine. coatcheck logs
-`[swap] … result=miss unswapped_tok_literals=N` when a `tok_` literal reaches
+`[swap] … result=miss unswapped_ticket_literals=N` when a `cct_` literal reaches
 an upstream unswapped.
 
 Also avoid `Transfer-Encoding: chunked` request bodies (send a
@@ -153,7 +153,7 @@ Fetch the ticket first, or open a fresh connection after fetching it.
 
 ## 6. Browser logins (CDP injection)
 
-Requires `CDP_PROXY_ENABLED=1` on coatcheck. The credential is a JSON secret
+Requires `COATCHECK_CDP_ENABLED=1` on coatcheck. The credential is a JSON secret
 with `username` and `password` fields, addressed by its secret name.
 
 1. Create the remote-browser session **through the proxy**, with the vendor
@@ -177,7 +177,7 @@ with `username` and `password` fields, addressed by its secret name.
    curl -s -X POST http://127.0.0.1:3128/_vault/mint-tokens \
      -H 'Content-Type: application/json' \
      -d "$(jq -n --arg n example-login --arg s "$SID" '{secretName:$n, sessionId:$s}')"
-   # {"username_token":"tok_…","password_token":"tok_…","expires_in":600}
+   # {"username_token":"cct_…","password_token":"cct_…","expires_in":600}
    ```
 
    Optional `expires_in` (seconds, capped at 1800). These tickets work only
