@@ -191,6 +191,55 @@ which the v1 adapter leaves in place.
   `/login`; `attack.md` and `attack-transform.md` re-run against the new build
   must report no password material.
 
+## Implementation decisions
+
+Choices the design above leaves open, settled before implementing.
+
+1. **Vault → connection wiring.** `POST /_vault/{name}/login` is served by the
+   vault server; the state lives in the CDP connection. The proxy attaches a
+   per-connection controller to its sid in `CdpSessionStore`
+   (`attach(sid, controller)`, cleared at teardown) and the vault handler looks
+   it up. "Connected" in the status table means a controller is attached; a
+   registered-but-unconnected or unknown sid answers `404`. This keeps
+   `vault-handler.ts` free of WebSocket code and the store the single owner of
+   sid lifetime.
+2. **Empty new-document scripts are kept.** Playwright registers
+   `Page.addScriptToEvaluateOnNewDocument {source: "", worldName}` on every page
+   to create its utility world. It runs no code, and removing it breaks
+   Playwright on the reloaded document. Only scripts whose `source` is
+   non-empty after trimming are removed. Removed scripts are not restored
+   after the window (re-adding would give them new identifiers the agent
+   doesn't know); the agent re-adds init scripts or bindings it still needs.
+3. **Id range.** coatcheck's ids start at 2³⁰ and increment. An agent frame
+   whose `id` is ≥ 2³⁰ is refused with a CDP error and never forwarded, so a
+   collision can't route a browser response to the wrong side.
+4. **Agent queue cap.** Frames queued during the window are capped at 4096. On
+   overflow the connection is torn down (fail closed; the login answers `502`)
+   rather than dropping frames, which would desynchronise Playwright.
+5. **Page targets.** Only flattened sessions from `Target.attachedToTarget` with
+   `targetInfo.type === "page"` are candidates. With no candidate the answer is
+   `409 page-ambiguous`.
+6. **Reload wait.** After `Page.reload`, wait for a main-frame
+   `Page.frameNavigated` and then `Page.loadEventFired` on that session. Both
+   count against `timeoutMs`. If the reload doesn't finish, nothing was filled,
+   and the answer is `409 no-success`.
+7. **Clear on success too.** After the success condition holds, any filled field
+   still attached to the document is emptied before the queue is released. For
+   a full-page login the nodes are gone and this does nothing. It covers SPAs
+   that keep the form mounted after logging in.
+8. **Driver errors.** If one of coatcheck's own commands fails for a reason not
+   in the table (for example, `DOM.focus` on an element that can't take focus),
+   the filled fields are emptied and the answer is
+   `502 {"status":"driver-error","cleared":true}`. The CDP error text isn't
+   echoed back, and no value is ever echoed.
+9. **Values for inbound redaction.** At the start of the window the login's
+   field values (non-`_cleartext`) are registered in `TokenStore` under the sid
+   (`registerSessionValues`). They are not tickets and never substitute
+   anywhere. `revokeSession` drops them at teardown.
+10. **Logging.** The window logs `[cdp] sid=… login secret=… window open` and
+    `[cdp] sid=… login secret=… window closed outcome=… ms=… queued=…`: names,
+    outcome, counts and duration only.
+
 ## Later: network mode
 
 The strongest design routes the **browser's** egress through coatcheck too
