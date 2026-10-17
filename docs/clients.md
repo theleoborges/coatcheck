@@ -65,7 +65,7 @@ persists across restarts. If it is regenerated, clients must re-fetch it.
 | `GET /_vault/{name}?field=f` | `{"token": …}`, or `{"value": …, "cleartext": true}` if `f` is listed in the secret's `_cleartext` |
 | `GET /_secret/{name}` | ticket for an allowlisted shared secret |
 | `POST /_vault/{name}/refresh` | refreshes an OAuth secret server-side, returns a ticket for the new `access_token` |
-| `POST /_vault/mint-tokens` | session-bound login tickets for browser injection (section 6) |
+| `POST /_vault/{name}/login` | broker-performed browser login (section 6) |
 
 Ticket responses also carry `allowed_hosts`: the only hosts the ticket will be
 swapped for. Sending it anywhere else gets `403` with
@@ -192,54 +192,51 @@ with `username` and `password` fields, addressed by its secret name.
    Use the vendor session id for vendor REST calls; use `sid` (from the
    rewritten URL) for coatcheck.
 
-2. Mint session-bound tickets:
-
-   ```bash
-   curl -s -X POST http://127.0.0.1:3128/_vault/mint-tokens \
-     -H 'Content-Type: application/json' \
-     -d "$(jq -n --arg n example-login --arg s "$SID" '{secretName:$n, sessionId:$s}')"
-   # {"username_token":"cct_…","password_token":"cct_…","expires_in":600}
-   ```
-
-   Optional `expires_in` (seconds, capped at 1800). These tickets work only
-   inside that CDP session and are revoked when its WebSocket closes. They do
-   not work on the HTTPS path.
-
-3. Connect to the rewritten URL and fill with **`page.fill()`**:
+2. Connect to the rewritten URL, navigate to the login page, and ask coatcheck
+   to log in. coatcheck fills and submits the form itself over the CDP
+   connection; the agent never holds a credential ticket:
 
    ```js
    const browser = await chromium.connectOverCDP(session.connectUrl); // the ws://127.0.0.1 URL
    const page = browser.contexts()[0]?.pages()[0] ?? await browser.newPage();
    await page.goto('https://site.example/login');
-   await page.fill('input[name=email]', usernameToken);
-   await page.fill('input[name=password]', passwordToken);
-   await page.click('button[type=submit]');
+
+   const res = await postViaProxy(`${COATCHECK_URL}/_vault/example-login/login`, {}, {
+     sessionId: sid,
+     fields: { username: 'input[name=email]', password: 'input[name=password]' },
+     submit: 'button[type=submit]',
+     until: 'navigation',
+   });
+   // res.status === 'ok' → logged in; carry on with the page.
    ```
+
+   `fields` maps each field of the login secret to a CSS selector resolved in
+   the main document. `submit` is a selector to click or `{"press":"Enter"}`.
+   `until` is `"navigation"` (default), `{"selector":"…"}` or `{"urlPrefix":"…"}`
+   — the last two cover SPA logins. `timeoutMs` defaults to 15 000 (max 60 000).
 
 Rules:
 
-- **`page.fill()`, never `page.type()`** for ticket values. `fill()` sends one
-  `Input.insertText` frame that coatcheck substitutes. `type()` sends one key
-  event per character; coatcheck cannot substitute that and fails the final
-  keystroke with a CDP error ("credential-flow violation").
-  `page.evaluate` is never substituted: the page script sees the ticket.
-- **Fill only after the login page has loaded**, on a host the login secret
-  allows. coatcheck checks the page's committed main-frame origin; a fill on
-  any other origin, or during a navigation, is refused. Playwright retries the
-  refused fill until its timeout, so it shows up as a `TimeoutError`; the
-  coatcheck log says why.
+- **Navigate to the login page and let it load before calling `/login`.** The
+  page's committed main-frame origin must be one of the login secret's allowed
+  hosts, or the login is refused with `403`. coatcheck reloads the page to a
+  fresh document before filling, so remove nothing you need afterwards.
+- **Don't enable request interception on the login page** (`page.route(...)`,
+  `Fetch.enable`): coatcheck refuses the login with `409 interception-active`
+  rather than silently disabling your interception. Turn it off, log in, turn
+  it back on.
+- **Outside the login call there are no credential tickets in the browser**, so
+  `page.type()`, `page.evaluate()` and screenshots are all fine. On a timeout
+  coatcheck empties the fields it filled before returning (`409`, `cleared`).
 - **Never connect to the vendor's raw `connectUrl`** or any debug/live-view
-  URL; substitution and redaction only apply on coatcheck's listener.
-- **Do not screenshot during login, do not toggle "show password", and do not
-  read a credential field's `.value` back.** Inbound frames containing the
-  real value are redacted to `[REDACTED:<name>]` or dropped (a dropped
-  response makes the awaiting call hang until timeout).
+  URL; the login driver and inbound redaction only apply on coatcheck's listener.
 - **One CDP connection at a time.** A second concurrent connection is refused
   (close code 1013).
 - A sid is single-use: after the WebSocket closes, create a new session.
 - Close the browser and release the vendor session when done; coatcheck does
   not release it.
-- Sites that require 2FA/OTP at login are not supported.
+- Logins inside a cross-origin iframe are refused (navigate to the identity
+  provider's own page first). Sites that require 2FA/OTP are not supported.
 
 ## 7. git over HTTPS
 

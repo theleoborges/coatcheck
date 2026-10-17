@@ -259,7 +259,7 @@ Done: the unused `http-proxy` dependency was removed during extraction.
 
 ## Phase 7: browser login, second design
 
-20. **Broker-performed login** (`docs/design/cdp-broker-login.md`). A red-team
+20. **[Done]** **Broker-performed login** (`docs/design/cdp-broker-login.md`). A red-team
     run against the v1 CDP path (`examples/agents/browser-login/attack-transform.md`)
     read a filled password back through the agent's own page script in
     transformed form, which the literal redactor can't catch. coatcheck now

