@@ -79,9 +79,11 @@ describe('loadConfig', () => {
     expect(loadConfig({ ...base, COATCHECK_PORT: '', COATCHECK_AGENT_ID: '' }).port).toBe(3128);
   });
 
-  it('requires a known provider', () => {
+  it('requires a provider; any value is a built-in name or a module specifier (resolved by loadProvider)', () => {
     expect(problems({})).toEqual([expect.stringContaining('COATCHECK_PROVIDER is required')]);
-    expect(problems({ COATCHECK_PROVIDER: 'vault' })).toEqual([expect.stringContaining("'vault' is not available")]);
+    for (const p of ['aws', 'env', 'file', '@acme/coatcheck-provider-vault', './my-provider.js']) {
+      expect(loadConfig({ COATCHECK_PROVIDER: p }).provider).toBe(p);
+    }
   });
 
   it('fails on every legacy name with a pointer to the new one', () => {

@@ -1,7 +1,7 @@
 # Local demo: coatcheck backed by LocalStack (SSM + Secrets Manager).
 #
 #   export COATCHECK_API_TOKEN=$(openssl rand -hex 32)
-#   docker compose -f docker-compose.example.yml up --build
+#   docker compose -f examples/docker-compose.localstack.yml up --build
 #   curl -s -H "Authorization: Bearer $COATCHECK_API_TOKEN" \
 #     localhost:3128/_vault/example-api-key              # -> {"token":"cct_...", ...}
 #   curl -s localhost:3128/_ca > /tmp/coatcheck-ca.crt
@@ -14,7 +14,7 @@
 services:
   coatcheck:
     build:
-      context: .
+      context: ..
       dockerfile: Dockerfile.dev
     environment:
       - COATCHECK_PROVIDER=aws
@@ -35,7 +35,7 @@ services:
       # Default prefixes: /coatcheck/secrets/ (SSM) and coatcheck/ (Secrets Manager).
       - COATCHECK_POLICY_FILE=/etc/coatcheck/policy.json
     volumes:
-      - ./examples/policy.example.json:/etc/coatcheck/policy.json:ro
+      - ./policy.example.json:/etc/coatcheck/policy.json:ro
     ports:
       - '3128:3128'
       - '8444:8444'
@@ -48,7 +48,7 @@ services:
     environment:
       - SERVICES=ssm,secretsmanager,sts
     volumes:
-      - ./examples/localstack-init.sh:/etc/localstack/init/ready.d/seed.sh:ro
+      - ./localstack-init.sh:/etc/localstack/init/ready.d/seed.sh:ro
     healthcheck:
       test: ['CMD', 'curl', '-sf', 'http://localhost:4566/_localstack/health']
       interval: 5s

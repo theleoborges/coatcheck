@@ -13,7 +13,7 @@ It works like a coat check. You hand over the coat and get a ticket. The ticket 
 ┌──────────────────────┐               ┌──────────────────────────┐
 │                      │ GET /_vault/  │ vault API                │  fetch by name
 │ get ticket ──────────┼──────────────>│  issue cct_… (15 min) ───┼──────────> secret backend
-│   <── cct_9f2c…      │               │                          │            (AWS SSM / SM)
+│   <── cct_9f2c…      │               │                          │            (env, file, AWS)
 │                      │               │                          │
 │ curl -H "Authorization: Bearer cct_9f2c…" https://api.github.com/…
 │   HTTPS_PROXY ───────┼── CONNECT ───>│ MITM TLS (own CA)        │
@@ -33,14 +33,14 @@ It works like a coat check. You hand over the coat and get a ticket. The ticket 
 
 ## Quickstart
 
-> The only secret backend right now is **AWS**: SSM Parameter Store for named secrets and Secrets Manager for shared keys. For local use, the example points coatcheck at [LocalStack](https://github.com/localstack/localstack). An env/file provider is planned so you can run without AWS.
+The quickstart needs only Docker: secrets come from environment variables (the `env` provider), so no cloud account is involved.
 
 ```bash
 export COATCHECK_API_TOKEN=$(openssl rand -hex 32)   # required: the demo listens on 0.0.0.0
-docker compose -f docker-compose.example.yml up --build
+docker compose -f examples/docker-compose.env.yml up --build
 ```
 
-This starts coatcheck on `localhost:3128` and LocalStack. It also seeds two demo secrets from `examples/localstack-init.sh`: `example-api-key` (single value) and `example-login` (a username/password pair).
+This starts coatcheck on `localhost:3128` with two demo secrets set in the compose file: `example-api-key` (single value, `COATCHECK_SECRET_EXAMPLE_API_KEY`) and `example-login` (a username/password pair, `COATCHECK_SECRET_EXAMPLE_LOGIN`).
 
 ```bash
 # 1. Get a ticket
@@ -64,7 +64,40 @@ curl -s --proxy http://coatcheck:$COATCHECK_API_TOKEN@localhost:3128 --cacert /t
 # {"error":"Secret 'example-api-key' is not allowed for host 'example.org'",…}
 ```
 
-To add your own secret to LocalStack:
+To add a secret, add `COATCHECK_SECRET_<NAME>` to the compose file's environment and restart (see [Secret providers](#secret-providers) for the name mapping).
+
+## Secret providers
+
+`COATCHECK_PROVIDER` picks the backend at startup. The Docker image ships all three built-ins.
+
+| Value | Package | Backend |
+|---|---|---|
+| `env` | `@coatcheck/provider-env` | Environment variables, read once at startup. Read-only. |
+| `file` | `@coatcheck/provider-env/file` | A JSON file, `{"secrets":{"name":"value",…},"shared":{…}}`, at `COATCHECK_SECRETS_FILE`. Re-read on every (uncached) lookup; OAuth refresh writes it atomically (temp file, then rename). |
+| `aws` | `@coatcheck/provider-aws` | SSM Parameter Store (named secrets) and Secrets Manager (shared keys), optionally through an assumed role. |
+| anything else | your module | A module specifier loaded with `import()`. Its default export is `createProvider(ctx): Promise<SecretProvider>` (types in `@coatcheck/core`). |
+
+Values are strings everywhere; a multi-value secret is a JSON-encoded object.
+
+### env provider names
+
+The `env` provider accepts only secret names made of **lowercase letters, digits and `-`** (`[a-z0-9-]+`), so that a name and its variable map both ways: uppercase the name and replace `-` with `_`.
+
+| Secret name | Variable |
+|---|---|
+| `github-token` (`/_vault/github-token`) | `COATCHECK_SECRET_GITHUB_TOKEN` (prefix: `COATCHECK_ENV_PREFIX`) |
+| `browserbase-api-key` (`/_secret/browserbase-api-key`) | `COATCHECK_SHARED_SECRET_BROWSERBASE_API_KEY` |
+
+Any other name (`GitHub`, `a_b`, `a.b`) gets `400`. `GET /_vault` lists only variables whose names map back. The `file` provider has no such restriction; it uses the core name rules below.
+
+### LocalStack demo (AWS provider)
+
+```bash
+export COATCHECK_API_TOKEN=$(openssl rand -hex 32)
+docker compose -f examples/docker-compose.localstack.yml up --build
+```
+
+This runs the same demo against [LocalStack](https://github.com/localstack/localstack), seeded by `examples/localstack-init.sh`. To add your own secret to LocalStack:
 
 ```bash
 aws --endpoint-url http://localhost:4566 --region us-east-1 ssm put-parameter \
@@ -108,7 +141,7 @@ Errors are JSON `{"error":…}` with status 400, 401, 403, 404, 500, 501, or 502
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `COATCHECK_PROVIDER` | (required) | Secret backend. Currently `aws`. |
+| `COATCHECK_PROVIDER` | (required) | Secret backend: `env`, `file`, `aws`, or a module specifier (see [Secret providers](#secret-providers)). |
 | `COATCHECK_AGENT_ID` | (unset) | Optional agent identity: used in logs, in `{agentId}` templates, and in the default STS session name. Same character rules as secret names. |
 | `COATCHECK_PORT` | `3128` | Port for the proxy and the HTTP API. |
 | `COATCHECK_BIND_HOST` | `127.0.0.1` | Bind address for the proxy and the CDP proxy. Any non-loopback address (including `0.0.0.0`) requires `COATCHECK_API_TOKEN`. |
@@ -125,6 +158,8 @@ Errors are JSON `{"error":…}` with status 400, 401, 403, 404, 500, 501, or 502
 | `COATCHECK_CDP_ENABLED` | `0` | Set to `1` to run the CDP proxy and rewrite browser-service `connectUrl`s. |
 | `COATCHECK_CDP_PORT` | `8444` | CDP WebSocket proxy port. |
 | `COATCHECK_CDP_ADVERTISE_HOST` | `127.0.0.1` | Host written into the rewritten `connectUrl`. Override it when the Playwright client is in a different container. |
+| `COATCHECK_ENV_PREFIX` | `COATCHECK_SECRET_` | Variable prefix for named secrets (`env` provider). Shared secrets always use `COATCHECK_SHARED_SECRET_`. |
+| `COATCHECK_SECRETS_FILE` | (required for `file`) | Path of the JSON secrets file (`file` provider). |
 | `COATCHECK_AWS_SSM_PREFIX` | `/coatcheck/secrets/` | SSM path prefix for named secrets (`aws` provider). Must start and end with `/`; may contain `{agentId}`. |
 | `COATCHECK_AWS_SHARED_PREFIX` | `coatcheck/` | Secrets Manager name prefix for shared keys (`aws` provider); may contain `{agentId}`. |
 | `COATCHECK_AWS_ROLE_ARN` | (unset) | IAM role to assume before reading secrets. If unset, the default AWS credential chain is used. |
@@ -257,7 +292,7 @@ coatcheck is **pre-1.0**. The HTTP API, ticket format (`cct_…`), and configura
 - **`HTTPS_PROXY` is advisory.** A process that ignores it bypasses coatcheck, which means no substitution and also no protection. Pair coatcheck with egress enforcement (network policy, firewall, or security group) so the agent can reach the internet only through the proxy.
 - **Interception follows the bindings, not the request.** In the default `bound` mode, a keep-alive tunnel opened to a host before any ticket for it existed (a host bound only by a secret's `_allowed_hosts`) stays a raw tunnel, so a ticket later sent down it reaches the upstream unswapped. Clients that pin certificates fail on intercepted hosts unless listed in `COATCHECK_PASSTHROUGH_HOSTS`. Intercepted tunnels speak HTTP/1.1 only (ALPN), and WebSocket frames after an upgrade are not inspected.
 - **Without `COATCHECK_API_TOKEN`, any local process can mint tickets.** That is the intended sidecar setup (loopback, shared network namespace), and coatcheck refuses to start off loopback without a token. The token is one shared secret: there are no per-client identities or scopes.
-- **The secret backend is AWS-only**, with fixed path prefixes, pending a provider interface (env/file first, then others).
+- **Three built-in secret backends** (environment variables, a JSON file, AWS). HashiCorp Vault and Vercel are planned; anything else needs a custom provider module.
 - **Browserbase is the only browser adapter.** The `connectUrl` rewrite is tied to `api.browserbase.com`.
 - **CDP v1 limits:** one session at a time, no origin binding yet (login tickets record their allowed hosts, but a login ticket still fills any page in that session), no 2FA, no `page.type()` support, and no screenshot redaction.
 
@@ -274,10 +309,18 @@ coatcheck makes different trade-offs:
 
 ## Development
 
+npm workspaces, one package per directory:
+
+| Package | Contents |
+|---|---|
+| `packages/core` (`@coatcheck/core`) | Proxy, MITM, CA, tickets, vault API, CDP proxy, config, provider interface; the `coatcheck` bin and `startCoatcheck({ config, provider })` for embedding |
+| `packages/provider-aws` (`@coatcheck/provider-aws`) | The `aws` provider; the only package that depends on the AWS SDK |
+| `packages/provider-env` (`@coatcheck/provider-env`) | The `env` provider and, at `@coatcheck/provider-env/file`, the `file` provider |
+
 ```bash
 npm install
-npm test          # vitest
-npm run build     # tsc -> dist/
+npm run lint && npm run type-check && npm test && npm run build   # tsc -b -> packages/*/dist
+COATCHECK_PROVIDER=env COATCHECK_SECRET_DEMO=x npm run dev        # runs the TypeScript source, no build
 COATCHECK_PROVIDER=aws AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:4566 npm run dev
 ```
 

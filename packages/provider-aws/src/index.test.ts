@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { awsErrorCode, loadAwsConfig } from './aws.js';
-import { ConfigError } from '../config.js';
+import { awsErrorCode, loadAwsConfig } from './index.js';
+import { ConfigError } from '@coatcheck/core';
 
 describe('awsErrorCode', () => {
   it('reads the code from err.name', () => {

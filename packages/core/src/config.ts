@@ -55,8 +55,8 @@ export function isLoopbackHost(host: string): boolean {
 /** Reads the policy file. Injected so `loadConfig` stays pure. */
 export type ReadFile = (path: string) => string;
 
-/** Providers available in this build. More arrive with the workspace split (roadmap item 12). */
-export const KNOWN_PROVIDERS = ['aws'] as const;
+/** Built-in provider names; any other value is a module specifier (see load-provider.ts). */
+export const KNOWN_PROVIDERS = ['aws', 'env', 'file'] as const;
 
 /** Pre-1.0 names that now fail startup with a pointer to the new one. */
 export const LEGACY_ENV_NAMES: Readonly<Record<string, string>> = {
@@ -132,9 +132,7 @@ export function loadConfig(env: Env, readFile?: ReadFile): Config {
 
   const provider = r.string('COATCHECK_PROVIDER');
   if (provider === undefined) {
-    r.problems.push(`COATCHECK_PROVIDER is required (one of: ${KNOWN_PROVIDERS.join(', ')})`);
-  } else if (!(KNOWN_PROVIDERS as readonly string[]).includes(provider)) {
-    r.problems.push(`COATCHECK_PROVIDER '${provider}' is not available (one of: ${KNOWN_PROVIDERS.join(', ')})`);
+    r.problems.push(`COATCHECK_PROVIDER is required (${KNOWN_PROVIDERS.join(', ')}, or a module specifier)`);
   }
 
   const agentId = r.string('COATCHECK_AGENT_ID');

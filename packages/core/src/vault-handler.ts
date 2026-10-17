@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { TokenStore } from './token-store.js';
 import type { CertAuthority } from './ca.js';
-import { isValidSecretName, type SecretProvider } from './secret-provider.js';
+import { InvalidSecretNameError, isValidSecretName, type SecretProvider } from './secret-provider.js';
 import { policyHostsFor, type Policy } from './policy.js';
 import { matchesHost, type HostPattern } from './host-matcher.js';
 import { allowedHostsJson, parseSecretValue, resolveBinding, userFields, type Binding, type InBandHosts } from './secret-binding.js';
@@ -50,9 +50,7 @@ export function handleVaultRequest(
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ secrets: names }));
     }).catch(err => {
-      console.error('Error listing secrets:', err);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Failed to list secrets' }));
+      sendProviderError(res, err, 'Error listing secrets:', 'Failed to list secrets');
     });
     return true;
   }
@@ -69,9 +67,7 @@ export function handleVaultRequest(
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ exists }));
       }).catch(err => {
-        console.error('Error checking secret:', err);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Failed to check secret' }));
+        sendProviderError(res, err, 'Error checking secret:', 'Failed to check secret');
       });
       return true;
     }
@@ -123,9 +119,7 @@ export function handleVaultRequest(
         issueTicket(res, deps, secretName, parsed.value, binding.allowedHosts);
       }
     }).catch(err => {
-      console.error('Error fetching secret:', err);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Failed to fetch secret' }));
+      sendProviderError(res, err, 'Error fetching secret:', 'Failed to fetch secret');
     });
     return true;
   }
@@ -162,9 +156,7 @@ export function handleVaultRequest(
       if (!sendBindingError(res, binding)) return;
       issueTicket(res, deps, `shared:${secretName}`, parsed.kind === 'simple' ? parsed.value : secret.value, binding.allowedHosts);
     }).catch(err => {
-      console.error(`Error fetching shared secret '${secretName}':`, err);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Failed to fetch shared secret' }));
+      sendProviderError(res, err, `Error fetching shared secret '${secretName}':`, 'Failed to fetch shared secret');
     });
     return true;
   }
@@ -190,11 +182,8 @@ export function handleVaultRequest(
     const secretName = decodeSecretName(refreshMatch[1], res);
     if (secretName === null) return true;
     handleOAuthRefresh(secretName, res, deps).catch(err => {
-      console.error('Error refreshing token:', err);
-      if (!res.writableEnded) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Failed to refresh token' }));
-      }
+      if (!res.writableEnded) sendProviderError(res, err, 'Error refreshing token:', 'Failed to refresh token');
+      else console.error('Error refreshing token:', err);
     });
     return true;
   }
@@ -232,6 +221,21 @@ function sendBindingError(res: http.ServerResponse, binding: Binding): binding i
 
 function vaultUrlHint(deps: VaultDeps): { vault_url?: string } {
   return deps.missingSecretUrl ? { vault_url: deps.missingSecretUrl } : {};
+}
+
+/**
+ * Answer a failed provider call: 400 for a name the provider can't map, else
+ * log and 500. Never echoes provider error details to the client.
+ */
+function sendProviderError(res: http.ServerResponse, err: unknown, logMessage: string, publicMessage: string): void {
+  if (err instanceof InvalidSecretNameError) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: err.message }));
+    return;
+  }
+  console.error(logMessage, err);
+  res.writeHead(500, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: publicMessage }));
 }
 
 /**
@@ -344,9 +348,7 @@ function handleMintTokens(
       allowed_hosts: allowedHostsJson(binding.allowedHosts),
     }));
   }).catch(err => {
-    console.error(`Error minting tokens for '${secretName}':`, err);
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Failed to mint tokens' }));
+    sendProviderError(res, err, `Error minting tokens for '${secretName}':`, 'Failed to mint tokens');
   });
 }
 

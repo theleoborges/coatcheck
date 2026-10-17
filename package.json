@@ -1,32 +1,24 @@
 {
-  "name": "@coatcheck/core",
-  "version": "0.1.0",
-  "description": "Credential broker for AI agents: agents hold short-lived tickets, real secrets are swapped in on the wire (HTTPS + browser/CDP).",
-  "license": "Apache-2.0",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/theleoborges/coatcheck.git"
-  },
+  "name": "coatcheck-monorepo",
+  "version": "0.0.0",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "engines": {
     "node": ">=20"
   },
+  "workspaces": [
+    "packages/core",
+    "packages/provider-aws",
+    "packages/provider-env"
+  ],
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
-    "lint": "eslint src/",
-    "type-check": "tsc --noEmit",
-    "test": "vitest run"
-  },
-  "dependencies": {
-    "@aws-sdk/client-secrets-manager": "^3.600.0",
-    "@aws-sdk/client-ssm": "^3.600.0",
-    "@aws-sdk/client-sts": "^3.600.0",
-    "@peculiar/x509": "2.1.0",
-    "reflect-metadata": "0.2.2",
-    "ws": "^8.18.0"
+    "build": "tsc -b",
+    "dev": "tsx --conditions=@coatcheck/source packages/core/src/cli.ts",
+    "lint": "eslint packages/*/src",
+    "type-check": "tsc -b",
+    "test": "vitest run",
+    "clean": "tsc -b --clean"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

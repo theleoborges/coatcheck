@@ -9,8 +9,8 @@ import {
   SecretsManagerClient,
   GetSecretValueCommand,
 } from '@aws-sdk/client-secrets-manager';
-import type { ProviderContext, Secret, SecretProvider, SecretStore } from '../secret-provider.js';
-import { ConfigError, EnvReader, interpolateAgentId } from '../config.js';
+import type { CreateProvider, ProviderContext, Secret, SecretProvider, SecretStore } from '@coatcheck/core';
+import { ConfigError, EnvReader, interpolateAgentId } from '@coatcheck/core';
 
 const DEFAULT_SSM_PREFIX = '/coatcheck/secrets/';
 const DEFAULT_SHARED_PREFIX = 'coatcheck/';
@@ -242,3 +242,7 @@ export function createAwsProvider(config: AwsProviderConfig): SecretProvider {
     shared: { get: name => backend.getShared(name) },
   };
 }
+
+/** `COATCHECK_PROVIDER=aws`: core loads this module and calls its default export. */
+const createProvider: CreateProvider = async ctx => createAwsProvider(loadAwsConfig(ctx));
+export default createProvider;

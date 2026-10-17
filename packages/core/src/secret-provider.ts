@@ -40,6 +40,17 @@ export function isValidSecretName(name: string): boolean {
   return SECRET_NAME_PATTERN.test(name);
 }
 
+/**
+ * Thrown by a provider for a name core accepts but the provider can't map
+ * (e.g. the env provider only takes `[a-z0-9-]+`). The vault API answers 400.
+ */
+export class InvalidSecretNameError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidSecretNameError';
+  }
+}
+
 type Readable = Pick<SecretStore, 'get'> & Partial<SecretStore>;
 
 /**

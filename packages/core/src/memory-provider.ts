@@ -1,4 +1,4 @@
-import type { Secret, SecretProvider, SecretStore } from '../secret-provider.js';
+import type { Secret, SecretProvider, SecretStore } from './secret-provider.js';
 
 export interface MemoryProviderInit {
   secrets?: Record<string, string>;

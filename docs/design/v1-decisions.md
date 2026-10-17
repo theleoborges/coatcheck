@@ -69,6 +69,11 @@ packages/provider-env/  @coatcheck/provider-env: `.` = env provider, `./file` = 
 - **`type-check` is `tsc -b`.** Composite project references must emit
   declarations for downstream packages, so type-check and build are the same
   command; `build` is kept as a name for CI and the Dockerfiles.
+- **A provider rejects a name with `InvalidSecretNameError`** (exported by
+  core), thrown from `get`/`exists`/`put`; the vault API answers `400` with
+  its message. This is how the env provider refuses names outside
+  `[a-z0-9-]+` (§4) without adding a method to `SecretStore`. Any other
+  provider error stays a logged `500`.
 - **vitest uses inline `projects`**, one per package, from the root config.
 - **The demo files move to `examples/`.** `docker-compose.example.yml`
   becomes `examples/docker-compose.localstack.yml`; both compose files build

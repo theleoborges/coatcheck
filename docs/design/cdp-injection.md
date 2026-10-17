@@ -1,9 +1,9 @@
 # Browser credential injection via CDP substitution
 
 Status: **implemented (v1)**, behind `COATCHECK_CDP_ENABLED=1`.
-Code: `src/cdp/proxy.ts`, `src/cdp/substitution.ts`, `src/cdp/keystroke-detector.ts`,
-`src/cdp-session-store.ts`, `src/browserbase-rewrite.ts`, wiring in `src/mitm.ts` and `src/index.ts`,
-mint endpoint in `src/vault-handler.ts`.
+Code: `packages/core/src/cdp/proxy.ts`, `packages/core/src/cdp/substitution.ts`, `packages/core/src/cdp/keystroke-detector.ts`,
+`packages/core/src/cdp-session-store.ts`, `packages/core/src/browserbase-rewrite.ts`, wiring in `packages/core/src/mitm.ts` and `packages/core/src/start.ts`,
+mint endpoint in `packages/core/src/vault-handler.ts`.
 
 ## Problem
 
@@ -61,8 +61,8 @@ agent ── ws://127.0.0.1:8444/cdp/{sid} ──▶ coatcheck :8444 (CDP proxy)
 Both listeners run in one process and share the `TokenStore`. The CDP
 listener binds to the same host as the HTTP listener (`COATCHECK_BIND_HOST`,
 default `127.0.0.1`), port `COATCHECK_CDP_PORT` (default 8444)
-(`src/index.ts`). If the CDP listener fails to bind,
-the process exits (`src/index.ts`), so a deployment that gates the agent
+(`packages/core/src/start.ts`). If the CDP listener fails to bind,
+`startCoatcheck` rejects and the `coatcheck` bin exits (`packages/core/src/start.ts`, `cli.ts`), so a deployment that gates the agent
 on broker health also gates it on the CDP listener.
 
 ### Step 1: connectUrl rewrite
@@ -73,7 +73,7 @@ agent received that URL it could connect directly and bypass substitution.
 
 When the CDP proxy is enabled and the CONNECT target is the vendor API host,
 coatcheck replaces the plain response pipe with a streaming rewriter
-(`src/mitm.ts`). `createConnectUrlRewriter` (`src/browserbase-rewrite.ts`)
+(`packages/core/src/mitm.ts`). `createConnectUrlRewriter` (`packages/core/src/browserbase-rewrite.ts`)
 is a small HTTP/1.1 response parser:
 
 - Frames each response by `Content-Length`, or decodes `Transfer-Encoding:
@@ -85,31 +85,31 @@ is a small HTTP/1.1 response parser:
   (`:80-86`).
 
 The replacement is produced by `CdpSessionStore.register(realConnectUrl)`
-(`src/cdp-session-store.ts:32`), which stores the real URL under a random
+(`packages/core/src/cdp-session-store.ts:32`), which stores the real URL under a random
 24-hex-char `sid` (12 random bytes) with a 10-minute TTL, and returns
 `ws://{COATCHECK_CDP_ADVERTISE_HOST}:{COATCHECK_CDP_PORT}/cdp/{sid}`. The signing key
 in the real URL never reaches the agent.
 
 The rewrite only happens on a MITM'd connection. With CDP enabled, the
 browser service's API host is always intercepted in the default
-`COATCHECK_MITM=bound` mode, as an adapter host (`src/mitm.ts`); unless it is
+`COATCHECK_MITM=bound` mode, as an adapter host (`packages/core/src/mitm.ts`); unless it is
 listed in `COATCHECK_PASSTHROUGH_HOSTS`, which disables the rewrite.
 
 ### Step 2: session-bound tickets (`POST /_vault/mint-tokens`)
 
 Body: `{ "secretName": "<name>", "sessionId": "<sid>", "expires_in"?: <seconds> }`.
 
-`handleMintTokens` (`src/vault-handler.ts:234-296`) reads the named secret,
+`handleMintTokens` (`packages/core/src/vault-handler.ts:234-296`) reads the named secret,
 requires it to be a JSON object with non-empty string `username` and
 `password` fields, and issues two tickets with
-`TokenStore.issueForSession(...)` (`src/token-store.ts:81`). TTL defaults to
-600 s and is capped at 1800 s (`src/vault-handler.ts:222-223`, `:249-252`).
+`TokenStore.issueForSession(...)` (`packages/core/src/token-store.ts:81`). TTL defaults to
+600 s and is capped at 1800 s (`packages/core/src/vault-handler.ts:222-223`, `:249-252`).
 Response: `{ "username_token", "password_token", "expires_in" }`.
 
 Session-bound tickets differ from ordinary tickets in two ways:
 
 - `replaceAll` (the HTTP/HTTPS path) skips any entry with a `sessionId`
-  (`src/token-store.ts:133`). A session-bound ticket never substitutes on the
+  (`packages/core/src/token-store.ts:133`). A session-bound ticket never substitutes on the
   HTTPS path.
 - `replaceAllForSession(input, sid)` (`:148`) substitutes only tickets bound to
   that sid. Ordinary (unscoped) tickets do not substitute inside CDP frames.
@@ -119,7 +119,7 @@ between a credential and the site it belongs to (see Known gaps).
 
 ### Step 3: CDP proxy connection
 
-`startCdpProxy` (`src/cdp/proxy.ts:37`) accepts `ws://…/cdp/{sid}`:
+`startCdpProxy` (`packages/core/src/cdp/proxy.ts:37`) accepts `ws://…/cdp/{sid}`:
 
 1. Parse the sid from the path (`/^\/cdp\/([a-f0-9]+)\/?$/`, `:201-204`) and
    resolve it in `CdpSessionStore`. Unknown or expired sid: close 1008
@@ -139,7 +139,7 @@ response, and the listener binds to loopback by default.
 
 ### Outbound substitution (agent → browser)
 
-`substituteOutbound` (`src/cdp/substitution.ts:33-95`):
+`substituteOutbound` (`packages/core/src/cdp/substitution.ts:33-95`):
 
 - Pre-filter: if the raw frame contains no `cct_` substring, forward it
   untouched without parsing (`:39`). Most CDP traffic skips JSON parsing.
@@ -157,20 +157,20 @@ the whole array (`:62-69`).
 
 - A frame of any other method that contains `cct_` is forwarded unmodified and
   logged as "token observed in unsupported method" (`:87-88`,
-  `src/cdp/proxy.ts:123-127`). Deliberately not substituted in v1:
+  `packages/core/src/cdp/proxy.ts:123-127`). Deliberately not substituted in v1:
   `Network.setExtraHTTPHeaders`, `Page.addScriptToEvaluateOnNewDocument`,
   `Fetch.continueRequest`.
-- Binary frames are forwarded without inspection (`src/cdp/proxy.ts:96-99`).
+- Binary frames are forwarded without inspection (`packages/core/src/cdp/proxy.ts:96-99`).
 
 ### Inbound redaction (browser → agent)
 
 If a page (or the agent) reads back a field's value, for example
 `Runtime.evaluate("document.querySelector('#pw').value")`, the real password
 would arrive in the response frame. `substituteInbound`
-(`src/cdp/substitution.ts:98-137`) defends this:
+(`packages/core/src/cdp/substitution.ts:98-137`) defends this:
 
 1. Collect the session's active real values (`TokenStore.sessionValues`,
-   `src/token-store.ts:174`). None: forward as-is.
+   `packages/core/src/token-store.ts:174`). None: forward as-is.
 2. Byte-level floor: if no value occurs as a substring of the raw frame,
    forward as-is (`:106-114`).
 3. Otherwise parse. Unparseable: **drop the frame** (`:117-123`).
@@ -182,7 +182,7 @@ would arrive in the response frame. `substituteInbound`
 
 A dropped frame is never forwarded, so the Playwright call that was waiting
 for it hangs or times out rather than returning the secret
-(`src/cdp/proxy.ts:168-171`). Binary inbound frames are forwarded without
+(`packages/core/src/cdp/proxy.ts:168-171`). Binary inbound frames are forwarded without
 inspection (`:163-166`).
 
 The redaction marker carries the secret name, not the ticket id, and is not
@@ -196,13 +196,13 @@ outbound substitutor handles. `page.type()` sends one `Input.dispatchKeyEvent`
 per character, so the ticket never appears whole in a single frame and cannot
 be substituted without stateful buffering and replay, which v1 does not do.
 
-Instead, `KeystrokeDetector` (`src/cdp/keystroke-detector.ts`) keeps an 80-char
+Instead, `KeystrokeDetector` (`packages/core/src/cdp/keystroke-detector.ts`) keeps an 80-char
 sliding window of `params.text` from `Input.dispatchKeyEvent` frames, one
 detector per connection. When the window ends with an active session-bound
 ticket id (`TokenStore.sessionTokenIds`), the proxy drops that frame and
 replies to the agent's request id with a CDP error:
 `{"error":{"code":-32000,"message":"credential-flow violation: page.type() detected on a vault token; use page.fill() instead"}}`
-(`src/cdp/proxy.ts:102-120`, `:227-233`). The session stays up.
+(`packages/core/src/cdp/proxy.ts:102-120`, `:227-233`). The session stays up.
 
 What this guarantees: the real password is never sent (it was never going to
 be, since keystrokes are not substituted) and the automation fails loudly
@@ -212,17 +212,17 @@ the last keystroke matches. A ticket is useless outside its own CDP session,
 so this leaks no secret, but the page has seen most of a ticket string.
 
 `Input.dispatchKeyEvent` frames are never run through `substituteOutbound`
-(`src/cdp/proxy.ts:118`).
+(`packages/core/src/cdp/proxy.ts:118`).
 
 ### Teardown and revocation
 
-`teardown()` (`src/cdp/proxy.ts:82-92`) runs once on client close, client
+`teardown()` (`packages/core/src/cdp/proxy.ts:82-92`) runs once on client close, client
 error, upstream close, upstream error, upstream connect timeout, or pending
 buffer overflow. It:
 
 - decrements the concurrency counter,
 - revokes every ticket bound to the sid (`TokenStore.revokeSession`,
-  `src/token-store.ts:204`),
+  `packages/core/src/token-store.ts:204`),
 - revokes the sid in `CdpSessionStore`, so a sid is single-use: reconnecting
   to the same `connectUrl` after close fails with 1008,
 - closes both sockets.
@@ -234,8 +234,8 @@ session remains the client's job.
 
 | Condition | Behaviour |
 |---|---|
-| `COATCHECK_CDP_ENABLED` unset | No CDP listener; `connectUrl` not rewritten; agent receives the real vendor URL (`src/mitm.ts`, `src/index.ts`). Credential injection unavailable. |
-| Token store empty at CONNECT time | Tunnel is passthrough; `connectUrl` not rewritten for that connection (`src/mitm.ts`). |
+| `COATCHECK_CDP_ENABLED` unset | No CDP listener; `connectUrl` not rewritten; agent receives the real vendor URL (`packages/core/src/mitm.ts`, `packages/core/src/start.ts`). Credential injection unavailable. |
+| Token store empty at CONNECT time | Tunnel is passthrough; `connectUrl` not rewritten for that connection (`packages/core/src/mitm.ts`). |
 | sid unknown or expired (10 min) | WebSocket closed 1008. |
 | Second concurrent CDP connection | Closed 1013. |
 | Upstream does not open within 10 s | Torn down; session tickets revoked. |
@@ -273,7 +273,7 @@ session remains the client's job.
   example after a "show password" toggle) reach the agent.
 - **`mint-tokens` does not validate `sessionId`.** `handleMintTokens` accepts
   any string and does not check it against `CdpSessionStore`
-  (`src/vault-handler.ts:240-247`; `VaultDeps` has no session store). Tickets
+  (`packages/core/src/vault-handler.ts:240-247`; `VaultDeps` has no session store). Tickets
   can be minted for a sid that does not exist yet or never will; they simply
   never substitute until their TTL expires. It also means the caller, not
   coatcheck, decides which session a credential binds to.
@@ -291,9 +291,9 @@ session remains the client's job.
 The vendor-specific pieces are small:
 
 - the REST host whose responses are rewritten (`BROWSERBASE_API_HOST`,
-  `src/server.ts`), and
+  `packages/core/src/server.ts`), and
 - the response rewriter that finds and replaces the CDP URL
-  (`src/browserbase-rewrite.ts`, keyed on the JSON field `connectUrl`).
+  (`packages/core/src/browserbase-rewrite.ts`, keyed on the JSON field `connectUrl`).
 
 Browserbase is the first such **browser adapter**. Everything else (the CDP
 proxy, substitution, redaction, keystroke detection, session store) is

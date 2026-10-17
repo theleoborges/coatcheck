@@ -154,7 +154,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 ## Phase 4: packaging
 
-12. **npm workspaces.** Move code with `git mv` into three packages:
+12. **[Done]** **npm workspaces.** Move code with `git mv` into three packages:
     - `packages/core` (`@coatcheck/core`, with the `coatcheck` bin);
     - `packages/provider-aws`;
     - `packages/provider-env`.

@@ -2,7 +2,7 @@ import http from 'node:http';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { oauthErrorCode, handleVaultRequest, VaultDeps } from './vault-handler.js';
 import { TokenStore } from './token-store.js';
-import { createMemoryProvider, type MemoryProviderInit } from './providers/memory.js';
+import { createMemoryProvider, type MemoryProviderInit } from './memory-provider.js';
 import { EMPTY_POLICY, parsePolicy, type Policy } from './policy.js';
 
 /** The policy these tests run under: the per-agent secrets they use are bound, plus one allowlisted shared secret. */

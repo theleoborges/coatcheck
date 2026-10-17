@@ -12,7 +12,7 @@ import { TokenStore } from './token-store.js';
 import { CertAuthority } from './ca.js';
 import { CdpSessionStore } from './cdp-session-store.js';
 import { createCoatcheck, type Coatcheck, type CoatcheckDeps } from './server.js';
-import { createMemoryProvider } from './providers/memory.js';
+import { createMemoryProvider } from './memory-provider.js';
 import { parsePolicy } from './policy.js';
 import { parseHostPattern, type HostPattern } from './host-matcher.js';
 

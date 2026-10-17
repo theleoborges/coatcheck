@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { isValidSecretName, withCache, type SecretStore } from './secret-provider.js';
-import { createMemoryProvider } from './providers/memory.js';
+import { createMemoryProvider } from './memory-provider.js';
 
 describe('isValidSecretName', () => {
   it('accepts letters, digits, dot, underscore and dash', () => {
