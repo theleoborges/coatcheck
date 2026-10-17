@@ -104,7 +104,7 @@ export function startCdpProxy(opts: CdpProxyOptions): Promise<CdpProxyHandle> {
       const raw = data.toString();
 
       // Keystroke fail-closed: detect page.type() runs that spell a session token.
-      if (raw.indexOf('Input.dispatchKeyEvent') !== -1) {
+      if (raw.indexOf('Input.dispatchKeyEvent') !== -1 || raw.indexOf('\\') !== -1) {
         const text = extractKeyEventText(raw);
         if (text !== null) {
           const matched = detector.inspect(text, tokenStore.sessionTokenIds(sid!));
@@ -119,12 +119,14 @@ export function startCdpProxy(opts: CdpProxyOptions): Promise<CdpProxyHandle> {
             );
             return; // drop the frame — never forward the literal token upstream
           }
+          forwardUpstream(data, false);
+          return;
         }
-        forwardUpstream(data, false);
-        return;
       }
 
-      if (raw.indexOf('"Page.navigate') !== -1 || raw.indexOf('"Page.reload"') !== -1) {
+      // A backslash may be a JSON escape hiding a method name from the
+      // substring checks, so such frames are parsed too.
+      if (raw.indexOf('"Page.navigate') !== -1 || raw.indexOf('"Page.reload"') !== -1 || raw.indexOf('\\') !== -1) {
         const parsed = parseJson(raw);
         if (parsed) origins.onOutbound(parsed);
       }
@@ -213,6 +215,10 @@ export function startCdpProxy(opts: CdpProxyOptions): Promise<CdpProxyHandle> {
         close: () =>
           new Promise<void>((res) => {
             wss.close(() => res());
+            // ws ≥ 8 leaves open connections alone, so close() would wait on
+            // them forever; terminating fires each connection's teardown,
+            // which revokes its session tickets.
+            for (const client of wss.clients) client.terminate();
           }),
       });
     });

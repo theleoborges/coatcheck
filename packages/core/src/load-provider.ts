@@ -29,8 +29,11 @@ export async function loadProvider(
     mod = await importModule(specifier);
   } catch (err) {
     const code = (err as { code?: unknown } | null)?.code;
-    if (code === 'ERR_MODULE_NOT_FOUND' || code === 'MODULE_NOT_FOUND') {
-      const pkg = BUILTIN_PROVIDERS[name]?.split('/').slice(0, 2).join('/');
+    const pkg = BUILTIN_PROVIDERS[name]?.split('/').slice(0, 2).join('/');
+    // For a built-in, only the package itself being absent means "install it";
+    // a missing dependency of an installed package surfaces unchanged.
+    const missingSelf = pkg === undefined || String((err as Error | null)?.message).includes(`'${pkg}'`);
+    if ((code === 'ERR_MODULE_NOT_FOUND' || code === 'MODULE_NOT_FOUND') && missingSelf) {
       throw new ConfigError([pkg
         ? `COATCHECK_PROVIDER '${name}' needs ${pkg}: npm install ${pkg}`
         : `COATCHECK_PROVIDER '${name}': module not found`]);

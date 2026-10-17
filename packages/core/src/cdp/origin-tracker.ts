@@ -103,7 +103,13 @@ export class OriginTracker {
       }
       case 'Target.detachedFromTarget': {
         const detached = msg.params?.sessionId;
-        if (typeof detached === 'string') this.sessions.delete(detached);
+        if (typeof detached !== 'string') return;
+        this.sessions.delete(detached);
+        // A navigate on a detached session is never answered; drop it so
+        // inbound frames stop being parsed on its account.
+        for (const pending of this.pendingNavigates) {
+          if (pending.startsWith(`${detached}\0`)) this.pendingNavigates.delete(pending);
+        }
         return;
       }
     }

@@ -4,7 +4,9 @@ import { ConfigError } from './config.js';
 import { createMemoryProvider } from './memory-provider.js';
 
 const ctx = { env: {} };
-const notFound = () => Promise.reject(Object.assign(new Error('Cannot find package'), { code: 'ERR_MODULE_NOT_FOUND' }));
+const notFoundError = (pkg: string) =>
+  Object.assign(new Error(`Cannot find package '${pkg}' imported from /app/x.js`), { code: 'ERR_MODULE_NOT_FOUND' });
+const notFound = (specifier: string) => Promise.reject(notFoundError(specifier.split('/').slice(0, 2).join('/')));
 
 describe('loadProvider', () => {
   it('maps built-in names to their packages and other values to module specifiers', async () => {
@@ -33,6 +35,11 @@ describe('loadProvider', () => {
     await expect(loadProvider('file', ctx, notFound)).rejects.toThrow(/needs @coatcheck\/provider-env: npm install @coatcheck\/provider-env/);
     await expect(loadProvider('aws', ctx, notFound)).rejects.toBeInstanceOf(ConfigError);
     await expect(loadProvider('./nope.js', ctx, notFound)).rejects.toThrow(/'\.\/nope\.js': module not found/);
+  });
+
+  it('surfaces a missing dependency of an installed built-in unchanged', async () => {
+    const nested = notFoundError('@aws-sdk/client-ssm');
+    await expect(loadProvider('aws', ctx, () => Promise.reject(nested))).rejects.toBe(nested);
   });
 
   it('rejects a module without a function default export', async () => {

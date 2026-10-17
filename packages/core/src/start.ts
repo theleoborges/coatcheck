@@ -63,6 +63,7 @@ export async function startCoatcheck(opts: StartOptions): Promise<RunningCoatche
     }
   } catch (err) {
     await coatcheck.close();
+    await opts.provider.close?.();
     throw err;
   }
 

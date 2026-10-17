@@ -24,6 +24,7 @@ describe('env provider', () => {
     COATCHECK_SECRET_GITHUB_TOKEN: 'gh-value',
     COATCHECK_SECRET_EMPTY: '',
     COATCHECK_SECRET_weird: 'ignored',
+    COATCHECK_SECRET_CACHE_TTL_SECONDS: '300',
     COATCHECK_SHARED_SECRET_BROWSERBASE_API_KEY: 'bb-value',
     UNRELATED: 'x',
   };
@@ -41,6 +42,12 @@ describe('env provider', () => {
   it('lists only names that map back, and never shared ones', async () => {
     const p = await createProvider({ env });
     expect(await p.secrets.list()).toEqual(['github-token']);
+  });
+
+  it('never serves core settings that share the prefix (COATCHECK_SECRET_CACHE_TTL_SECONDS)', async () => {
+    const p = await createProvider({ env });
+    expect(await p.secrets.get('cache-ttl-seconds')).toBeNull();
+    expect(await p.secrets.list()).not.toContain('cache-ttl-seconds');
   });
 
   it('is read-only', async () => {

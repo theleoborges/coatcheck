@@ -15,6 +15,8 @@ export const DEFAULT_ENV_PREFIX = 'COATCHECK_SECRET_';
 export const SHARED_ENV_PREFIX = 'COATCHECK_SHARED_SECRET_';
 export const ENV_SECRET_NAME = /^[a-z0-9-]+$/;
 const ENV_PREFIX = /^[A-Z][A-Z0-9_]*$/;
+/** Core settings that fall under the default prefix; never secrets. */
+const RESERVED_ENV_NAMES: ReadonlySet<string> = new Set(['COATCHECK_SECRET_CACHE_TTL_SECONDS']);
 
 /** `github-token` → `GITHUB_TOKEN`. Throws `InvalidSecretNameError` outside `[a-z0-9-]+`. */
 export function envSuffixFor(name: string): string {
@@ -51,14 +53,16 @@ export function loadEnvConfig(ctx: ProviderContext): EnvProviderConfig {
 export function createEnvProvider(env: ProviderContext['env'], config: EnvProviderConfig): SecretProvider {
   const snapshot = { ...env };
   const read = (prefix: string, name: string): Secret | null => {
-    const value = snapshot[prefix + envSuffixFor(name)];
+    const key = prefix + envSuffixFor(name);
+    if (RESERVED_ENV_NAMES.has(key)) return null;
+    const value = snapshot[key];
     return value === undefined || value === '' ? null : { value };
   };
   const secrets: SecretStore = {
     get: async name => read(config.prefix, name),
     exists: async name => read(config.prefix, name) !== null,
     list: async () => Object.keys(snapshot)
-      .filter(k => k.startsWith(config.prefix) && snapshot[k])
+      .filter(k => k.startsWith(config.prefix) && snapshot[k] && !RESERVED_ENV_NAMES.has(k))
       .map(k => nameForEnvSuffix(k.slice(config.prefix.length)))
       .filter((n): n is string => n !== null)
       .sort(),
