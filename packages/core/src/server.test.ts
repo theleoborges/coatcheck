@@ -696,6 +696,18 @@ describe('coatcheck server: request framing', () => {
     expect(upstream.received).toEqual([]);
   });
 
+  it('ignores empty lines before a request line (RFC 9112 §2.2)', async () => {
+    captureLogs();
+    const { upstream, tok, t } = await tunnel();
+    const responses = readResponses(t, 2);
+    // A stray CRLF after a body, as some clients send, must not be read as a request.
+    t.write('POST /a HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\nhi\r\n');
+    t.write(`GET /b HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${tok}\r\n\r\n`);
+    const [, r2] = await responses;
+    expect((JSON.parse(r2.body) as Echo).headers['x-key']).toBe('real-key');
+    expect(upstream.received.map(e => e.url)).toEqual(['/a', '/b']);
+  });
+
   it('matches Content-Length only as a whole header name', async () => {
     captureLogs();
     const { upstream, t } = await tunnel();

@@ -145,6 +145,11 @@ export function createConnectHandler(deps: MitmDeps) {
      */
     function processClientData() {
       while (!denied && !awaitingUpgrade && !rawPipe) {
+        // Empty lines before a request line are ignored (RFC 9112 §2.2), e.g.
+        // a stray CRLF some clients send after a request body.
+        while (requestData.length >= 2 && requestData[0] === 0x0d && requestData[1] === 0x0a) {
+          requestData = requestData.subarray(2);
+        }
         const headerEnd = requestData.indexOf('\r\n\r\n');
         if (headerEnd === -1) return; // need more data
 
@@ -187,14 +192,14 @@ export function createConnectHandler(deps: MitmDeps) {
           contentType: headerValue(headerStr, 'content-type'),
           contentEncoding: headerValue(headerStr, 'content-encoding'),
         }, swapTarget);
-        const denied = [...result.denied, ...(bodySwap?.result.denied ?? [])];
+        const deniedSwaps = [...result.denied, ...(bodySwap?.result.denied ?? [])];
         logSwapOutcome('https', hostname, {
           swaps: [...result.swaps, ...(bodySwap?.result.swaps ?? [])],
-          denied,
+          denied: deniedSwaps,
           skipped: bodySwap?.result.skipped,
         }, bodySwap ? `${result.output}\n${bodySwap.result.output}` : result.output);
-        if (denied.length > 0) {
-          denyAndClose(403, 'host-mismatch', hostMismatchBody(denied, hostname));
+        if (deniedSwaps.length > 0) {
+          denyAndClose(403, 'host-mismatch', hostMismatchBody(deniedSwaps, hostname));
           return;
         }
 
