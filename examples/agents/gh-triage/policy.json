@@ -1,0 +1,6 @@
+{
+  "secrets": {
+    "anthropic-api-key": { "allowed_hosts": ["api.anthropic.com"] },
+    "github-token": { "allowed_hosts": ["api.github.com"] }
+  }
+}

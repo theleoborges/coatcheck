@@ -1,0 +1,50 @@
+# browser-login: an agent that logs into a website through Browserbase without the
+# password entering its context. Secrets come from AWS (SSM + Secrets Manager) via
+# an assumed role. See ../README.md.
+name: coatcheck-browser-login
+services:
+  coatcheck:
+    build: { context: ../../.., dockerfile: Dockerfile }
+    environment:
+      - COATCHECK_PROVIDER=aws
+      - COATCHECK_AGENT_ID=browser-login
+      - COATCHECK_BIND_HOST=0.0.0.0
+      - COATCHECK_API_TOKEN=${COATCHECK_API_TOKEN:?run via ./run.sh}
+      - COATCHECK_POLICY_FILE=/etc/coatcheck/policy.json
+      - COATCHECK_CDP_ENABLED=1
+      - COATCHECK_CDP_ADVERTISE_HOST=coatcheck
+      - COATCHECK_AWS_SSM_PREFIX=/coatcheck/demo/secrets/
+      - COATCHECK_AWS_SHARED_PREFIX=coatcheck-demo/
+      - COATCHECK_AWS_ROLE_ARN=${COATCHECK_AWS_ROLE_ARN:?run via ./run.sh}
+      - COATCHECK_AWS_EXTERNAL_ID=${COATCHECK_AWS_EXTERNAL_ID:?run via ./run.sh}
+      - AWS_REGION=${AWS_REGION:?run via ./run.sh}
+      # Base credentials, only in this container. They can do nothing here
+      # except assume the broker role (which needs the ExternalId above).
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+    volumes:
+      - ./policy.json:/etc/coatcheck/policy.json:ro
+    networks: [agentnet, egress]
+
+  agent:
+    build: { context: .., dockerfile: Dockerfile }
+    depends_on: [coatcheck]
+    environment:
+      - COATCHECK_URL=http://coatcheck:3128
+      - COATCHECK_API_TOKEN=${COATCHECK_API_TOKEN}
+      - HTTPS_PROXY=http://coatcheck:${COATCHECK_API_TOKEN}@coatcheck:3128
+      - HTTP_PROXY=http://coatcheck:${COATCHECK_API_TOKEN}@coatcheck:3128
+      - NO_PROXY=coatcheck,localhost,127.0.0.1
+      - NODE_USE_ENV_PROXY=1
+      - NODE_PATH=/app/node_modules
+      - BROWSERBASE_PROJECT_ID=${BROWSERBASE_PROJECT_ID:-}
+      - AGENT_TRANSCRIPT=/out/transcript.json
+    volumes:
+      - ./${TASK:-task.md}:/task.md:ro
+      - ./out:/out
+    networks: [agentnet]
+
+networks:
+  agentnet: { internal: true }
+  egress: {}
