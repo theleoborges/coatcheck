@@ -1,0 +1,384 @@
+# v1 design decisions
+
+Status: **decided**. These decisions are the basis for `docs/ROADMAP.md`.
+Implement them as written. If one proves wrong during implementation (for
+example, a test shows it doesn't work), stop and raise it; don't redesign it
+inside a roadmap item. Each section names the alternatives that were rejected
+so they aren't reopened by accident.
+
+## 1. Repo layout
+
+npm workspaces with three published packages. The `coatcheck` bin lives in core
+and loads the provider dynamically.
+
+```
+package.json            private root: workspaces ["packages/*"], shared scripts, eslint, vitest workspace
+tsconfig.base.json      + per-package tsconfig with project references (tsc -b)
+Dockerfile, Dockerfile.dev   build all workspaces; runtime installs core + provider-aws + provider-env
+examples/               docker-compose.localstack.yml, docker-compose.env.yml (zero-AWS quickstart),
+                        localstack-init.sh, policy.example.json
+packages/core/          @coatcheck/core: proxy, MITM, CA, tickets, vault API, CDP, browser adapters,
+                        config, SecretProvider types, withCache, bin `coatcheck` -> dist/cli.js
+packages/provider-aws/  @coatcheck/provider-aws: SSM + Secrets Manager + STS (only package with @aws-sdk/*)
+packages/provider-env/  @coatcheck/provider-env: `.` = env provider, `./file` = JSON-file provider
+```
+
+- `COATCHECK_PROVIDER` chooses the provider at runtime:
+  - `aws`, `env` and `file` map to the packages above;
+  - any other value is treated as a module specifier and loaded with `import()`.
+
+  Each provider module default-exports `createProvider(ctx): Promise<SecretProvider>`.
+- Core also exports `startCoatcheck({ config, provider, adapters })` for library
+  users and tests.
+- Files move with `git mv`. Tests stay colocated.
+- Only `config.ts` and `cli.ts` read `process.env`. An eslint
+  `no-restricted-properties` rule enforces this. Providers receive the
+  environment through their factory context.
+- Rejected:
+  - A single package with optional AWS peer dependencies: it contradicts
+    `@coatcheck/*` naming and puts the AWS SDK in core's dependency surface.
+  - A separate `@coatcheck/server` app package: one more package to publish,
+    and it still needs the dynamic path for third-party providers.
+  - Separate repos: premature.
+
+## 2. SecretProvider interface and naming
+
+```ts
+export interface Secret {
+  value: string;
+  /** Provider-native host policy (e.g. tags). Unused in v1; in-band `_allowed_hosts` is parsed by core. */
+  allowedHosts?: string[];
+}
+export interface SecretStore {
+  get(name: string): Promise<Secret | null>;
+  exists(name: string): Promise<boolean>;
+  list(): Promise<string[]>;
+  put?(name: string, value: string): Promise<void>; // absent => /_vault/{name}/refresh returns 501
+}
+export interface SecretProvider {
+  readonly name: string;
+  secrets: SecretStore;                    // per-agent secrets
+  shared?: Pick<SecretStore, 'get'>;       // shared, allowlisted secrets; absent => /_secret/* returns 404
+  close?(): Promise<void>;
+}
+export interface ProviderContext { env: Readonly<Record<string, string | undefined>>; agentId?: string }
+export type CreateProvider = (ctx: ProviderContext) => Promise<SecretProvider>;
+export function withCache<T extends Pick<SecretStore, 'get'> & Partial<SecretStore>>(store: T, ttlMs: number): T;
+// withCache caches get() only; put() invalidates the entry.
+```
+
+- `get` returns a `Secret`, not a string, so that provider-native metadata can
+  be added later without breaking the interface.
+- Core validates every secret name before calling a provider:
+  `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`. The pattern rules out `/` and `..`.
+  A provider may be stricter (§4).
+- "Fleet" secrets are renamed to **shared** secrets. The route stays
+  `/_secret/{name}`.
+- `AGENT_LABEL` is renamed to **`COATCHECK_AGENT_ID`** and becomes optional. It is
+  used in three places:
+  - log lines;
+  - the default STS session name;
+  - `{agentId}` interpolation in provider prefixes.
+
+  If a prefix template references `{agentId}` and it is unset, startup fails.
+  Rejected names:
+  - `scope`: collides with OAuth scopes.
+  - `namespace`: collides with Kubernetes, and implies an isolation guarantee
+    coatcheck doesn't provide.
+- Store path prefixes become provider configuration (§4). There are no
+  hard-coded deployment-specific paths. Drop the hard-coded region fallback and
+  the manual `AWS_ENDPOINT_URL` plumbing; AWS SDK v3 handles both, which also
+  fixes STS ignoring the endpoint today.
+- Tests use a small in-memory `SecretProvider` helper in core instead of
+  ad-hoc mocks.
+
+## 3. Host-bound tickets
+
+### Where allowed hosts come from
+
+Each source can only narrow:
+
+1. **The policy file**, owned by the operator. It maps secret names to hosts,
+   and a trailing `*` is allowed in names (`google-*`). It also holds the
+   shared-secret allowlist.
+2. **An in-band `_allowed_hosts`** field in JSON secrets, next to `_cleartext`.
+   The user owns it, and it covers secrets added at runtime. A JSON secret
+   whose only non-underscore key is `value` is treated as a simple secret,
+   which lets a single-value secret carry metadata.
+3. Provider-native metadata (`Secret.allowedHosts`) has an interface slot. No
+   provider fills it in v1.
+
+A secret's effective hosts are the **intersection** of the sources that are
+present. If neither source is present, the secret is **unbound**.
+
+The agent can't write `_allowed_hosts`. The only write path is OAuth refresh,
+which spreads the existing object and copies only `access_token`,
+`refresh_token` and `expires_in` from the token endpoint. Mint-time narrowing
+by the agent is deferred, and if it is ever added it may only narrow.
+
+### Default: deny, at mint time
+
+- `/_vault/{name}` for an unbound secret returns `403` with an error naming the
+  secret. Failing at mint time is easier to debug than a silent miss at swap
+  time.
+- `COATCHECK_ALLOW_UNBOUND_SECRETS=1` is the explicit opt-out. It logs a warning
+  at startup and logs `result=unbound` on every swap.
+- Rejected: allow by default (ships the HIGH gap open), and deny at swap time
+  only (the agent holds a ticket that silently never works).
+
+### Matching
+
+- An entry is either an exact hostname or `*.example.com`. The wildcard matches
+  one or more labels; it does not match the apex.
+- Entries are normalised: lowercased, trailing dot removed, and
+  `url.domainToASCII` applied.
+- IP literals match exactly.
+- Ports are ignored.
+- HTTPS is implied. An entry must be written `http://host` to allow plaintext.
+- These entries are rejected: bare `*`, and wildcards with fewer than two
+  labels after `*.`.
+- Invalid entries fail closed. In the policy file, startup fails. In an in-band
+  field, minting fails with `500`.
+- Rejected: regular expressions (unescaped dots and missing anchors are
+  footguns) and arbitrary globs (there is no use case beyond the suffix
+  wildcard).
+
+### Enforcement
+
+- Tickets take a snapshot of `allowedHosts` at mint time.
+  `TokenStore.issue(name, value, { ttlSeconds, allowedHosts, sessionId })`
+  replaces both `issue` and `issueForSession`.
+- `replaceAll(input, target: { host, scheme })` requires the target, so the
+  compiler finds every call site.
+- **HTTPS MITM path.** The key is the validated CONNECT target. Upstream TLS
+  verification makes that host the real recipient. The key is never the
+  `Host` header or the SNI.
+- **Plain-HTTP forward path.** The key is the URL hostname as parsed by the
+  WHATWG URL parser, which is the host that is actually dialled.
+  - Plaintext requests only match entries written `http://`. Loopback and
+    private destinations therefore never match unless they are listed
+    explicitly, which closes the "agent runs its own listener" hole.
+  - The forward path strips `proxy-authorization` and hop-by-hop headers.
+- **On a mismatch** the request is not forwarded.
+  - The response is `403` with `X-Coatcheck-Denied: host-mismatch` and a JSON
+    body that names the secret and the host.
+  - The log line is `[swap] result=denied`.
+  - If one ticket in a request is denied, the whole request is denied.
+- **OAuth refresh.** The `token_url` host must be in the secret's allowed
+  hosts, because `client_secret` is sent there. The refreshed access-token
+  ticket inherits the binding.
+- Mint responses include `allowed_hosts`; they aren't secret.
+- **CDP origin binding:**
+  - Session-bound tickets carry the login secret's hosts.
+  - The proxy tracks each flattened CDP `sessionId`'s committed main-frame URL,
+    using inbound `Page.frameNavigated` events with no `parentId`.
+  - `Input.insertText` substitutes only when that host matches. On a mismatch,
+    or when the origin is unknown (for example, `Page` was never enabled), the
+    proxy drops the frame and returns a CDP error, the same way the keystroke
+    detector does.
+  - `Runtime.evaluate` and `Runtime.callFunctionOn` are no longer substitution
+    sites.
+  - A Playwright + Chromium e2e test must prove that `page.fill` still works on
+    text, email and password inputs. If it doesn't, the fallback is to
+    substitute in `callFunctionOn.arguments` only, never in
+    `functionDeclaration` or `expression`, and still gated on origin.
+- **Residual risk on CDP, documented rather than fixed:**
+  - Script that the agent runs on the allowed origin can read the filled value
+    and send it anywhere.
+  - Cross-origin iframe logins. Binding keys on the main frame because the
+    focused frame can't be attributed:
+    - A login form inside a cross-origin iframe, such as an embedded auth
+      widget, is refused when the main frame's origin isn't allowed.
+    - When the main frame is allowed, a fill whose focus is inside a
+      cross-origin iframe (including one injected by the agent) types the real
+      value into that iframe.
+
+## 4. Configuration
+
+Use environment variables for scalar settings, plus one optional JSON policy
+file.
+
+- Rejected: environment variables only (per-secret host lists in the
+  environment are unreadable), and a full config file that mirrors the
+  environment (two ways to set everything, which is awkward on ECS and
+  Kubernetes). JSON is chosen over YAML to avoid a dependency.
+- Old names are removed outright; there are no external users yet. If a legacy
+  name (`AGENT_LABEL`, `PROXY_PORT`, `PROXY_BIND_HOST`, `CA_DIR`,
+  `PROXY_ROLE_ARN`, `CDP_PROXY_*`) is set, startup fails with
+  "renamed to X".
+- `packages/core/src/config.ts` exports a pure `loadConfig(env, readFile)` that
+  returns a typed `Config`.
+
+| Core | Default | Notes |
+|---|---|---|
+| `COATCHECK_PROVIDER` | required | `aws` \| `env` \| `file` \| module specifier |
+| `COATCHECK_AGENT_ID` | unset | logs, `{agentId}` in templates, STS session name |
+| `COATCHECK_BIND_HOST` | `127.0.0.1` | both listeners |
+| `COATCHECK_PORT` | `3128` | |
+| `COATCHECK_API_TOKEN` | unset | required when the bind host isn't loopback; vault API `Authorization: Bearer`, proxy `Proxy-Authorization` |
+| `COATCHECK_POLICY_FILE` | unset | allowed hosts and the shared-secret allowlist |
+| `COATCHECK_ALLOW_UNBOUND_SECRETS` | `0` | opt out of deny-by-default |
+| `COATCHECK_TICKET_TTL_SECONDS` | `900` | HTTP tickets |
+| `COATCHECK_SECRET_CACHE_TTL_SECONDS` | `300` | `withCache` |
+| `COATCHECK_MITM` | `bound` | `bound`: MITM only hosts in the policy file, on live tickets, or on adapters. `always`: MITM every CONNECT (opt-in) |
+| `COATCHECK_PASSTHROUGH_HOSTS` | empty | never MITM (cert-pinned clients); exact or wildcard |
+| `COATCHECK_CA_DIR` | unset | unset: ephemeral in-memory CA. Set: persist the CA key and cert only |
+| `COATCHECK_CA_SUBJECT` | `CN=coatcheck CA,O=coatcheck` | |
+| `COATCHECK_MISSING_SECRET_URL` | unset | `vault_url` hint in 404s; omitted when unset |
+| `COATCHECK_CDP_ENABLED` | `0` | |
+| `COATCHECK_CDP_PORT` | `8444` | |
+| `COATCHECK_CDP_ADVERTISE_HOST` | `127.0.0.1` | |
+| `COATCHECK_BROWSER_ADAPTERS` | `browserbase` | comma-separated built-ins; custom adapters through the library API |
+
+| provider-aws | Default | Notes |
+|---|---|---|
+| `AWS_REGION`, `AWS_ENDPOINT_URL`, credentials | SDK chain | no hard-coded region |
+| `COATCHECK_AWS_SSM_PREFIX` | `/coatcheck/secrets/` | `{agentId}` is interpolated |
+| `COATCHECK_AWS_SHARED_PREFIX` | `coatcheck/` | Secrets Manager |
+| `COATCHECK_AWS_ROLE_ARN` | unset | broker role to assume |
+| `COATCHECK_AWS_EXTERNAL_ID` | unset | warns at startup if `ROLE_ARN` is set without it |
+| `COATCHECK_AWS_ROLE_SESSION_NAME` | `coatcheck-{agentId}`, or `coatcheck` | |
+
+| provider-env | Default | Notes |
+|---|---|---|
+| `COATCHECK_ENV_PREFIX` | `COATCHECK_SECRET_` | shared secrets use `COATCHECK_SHARED_SECRET_` |
+| `COATCHECK_SECRETS_FILE` | required for `file` | `{"secrets":{…},"shared":{…}}`; `put` writes to a temp file, then renames |
+
+**The env provider accepts only `[a-z0-9-]+` names.** That keeps the mapping
+reversible: `github-token` ↔ `COATCHECK_SECRET_GITHUB_TOKEN` (uppercase, `-` →
+`_`). If a name is outside that set, the provider rejects it as a bad request.
+When listing secrets, it ignores variables whose names don't map back. The
+provider's README and the core README both document this. The `file` provider
+uses core's name rules, because JSON keys need no mapping.
+
+Policy file:
+
+```json
+{
+  "secrets": {
+    "github-token": { "allowed_hosts": ["api.github.com"] },
+    "google-*":     { "allowed_hosts": ["*.googleapis.com", "oauth2.googleapis.com"] }
+  },
+  "shared": {
+    "browserbase-api-key": { "allowed_hosts": ["api.browserbase.com"] }
+  }
+}
+```
+
+## 5. MITM policy
+
+- **The default is `COATCHECK_MITM=bound`.** coatcheck MITMs a CONNECT when the
+  target matches any of:
+  - hosts in the policy file;
+  - the allowed hosts of a live ticket;
+  - an adapter host.
+
+  Every other CONNECT is a raw tunnel. A ticket can only ever substitute for
+  those hosts, so decrypting anything else gains nothing and risks breaking
+  clients.
+  - Residual: a keep-alive tunnel opened to a host that is bound only in-band,
+    before the first ticket for that host was minted, stays passthrough. The
+    request then fails closed: the upstream sees the literal ticket.
+  - `always` is opt-in, for when the host list isn't known in advance or for a
+    future egress allowlist.
+  - `COATCHECK_PASSTHROUGH_HOSTS` overrides both modes.
+- **The MITM TLS server advertises ALPN `http/1.1` only.** The request parser is
+  HTTP/1.1, so h2-capable clients have to negotiate HTTP/1.1, not fail or
+  stall. A test asserts the negotiated protocol.
+- After a `101 Switching Protocols` response, the connection switches to a raw
+  pipe, so WebSockets work through the MITM.
+
+## 6. Browser adapters
+
+```ts
+export interface BrowserAdapter {
+  name: string;
+  hosts: string[];  // REST hosts whose responses are rewritten (exact or wildcard)
+  /** Mutate parsed JSON in place; register(realWsUrl) returns the local ws URL. Return true if changed. */
+  rewriteJson(body: unknown, register: (realUrl: string) => string): boolean;
+}
+```
+
+- The HTTP/1.1 framing in `browserbase-rewrite.ts` is vendor-neutral and
+  becomes `createJsonResponseRewriter(transform)` in core. Adapters supply only
+  the JSON transform.
+  - Rejected: the earlier draft in which each adapter supplied a streaming
+    response rewriter, because every adapter would have to reimplement HTTP
+    framing.
+- The Browserbase adapter rewrites every string value that matches
+  `^wss?://[^/]*browserbase\.com/`, whatever its key. That covers `connectUrl`
+  and the debug endpoint's `debuggerUrl`, `debuggerFullscreenUrl`, `wsUrl` and
+  `pages[].debuggerUrl`. It also deletes `signingKey`. Rewriting only
+  `connectUrl` left a bypass: with a valid API-key ticket, the agent could call
+  `/v1/sessions/{id}/debug` and get raw CDP URLs. Check the field names against
+  the current API when implementing.
+- `CdpSessionStore.register(url, adapterName)` records the adapter name for
+  logging.
+- Existing CDP tests keep passing. `cdp/proxy.test.ts` registers sids directly,
+  and `browserbase-rewrite.test.ts` keeps working through a retained
+  `createConnectUrlRewriter` wrapper. The tests that intentionally change
+  belong to the origin-binding item.
+- Out of v1: a local `--remote-debugging-port` adapter, because it needs a
+  rewrite hook on the plain-HTTP forward path.
+
+## 7. Certificates
+
+- Use **`@peculiar/x509` on Node WebCrypto with ECDSA P-256** for the CA and
+  leaf certificates.
+  - Key generation takes about a millisecond.
+  - The library is pure TypeScript and supports SAN, BasicConstraints, KeyUsage
+    and EKU.
+  - It needs a `reflect-metadata` import.
+- **No RSA CA compatibility.** If `COATCHECK_CA_DIR` holds a CA whose key isn't
+  ECDSA P-256, startup fails with a message to delete it. coatcheck never
+  overwrites a trust anchor silently.
+- **Leaf certificates:**
+  - Generated asynchronously; the CONNECT handler awaits the certificate before
+    it writes `200 Connection Established`.
+  - Kept in an in-memory LRU capped at 1000, so many distinct hostnames can't
+    exhaust memory.
+  - Never written to disk. Only the CA is, and only when `COATCHECK_CA_DIR` is
+    set.
+  - IP-literal targets get an IP SAN.
+- Rejected:
+  - `node-forge`: slow pure-JS RSA key generation and a CVE history.
+  - `pkijs`: verbose.
+  - Node core: it can't issue certificates.
+- **Drop `openssl` and `ca-certificates` from both images.** Node uses its
+  bundled root CAs, and corporate CAs go through `NODE_EXTRA_CA_CERTS`.
+  `Dockerfile.dev` also drops `curl`, which nothing uses.
+
+## 8. Ticket prefix
+
+- The ticket prefix becomes **`cct_`** ("coatcheck ticket"). It is the same
+  length as `tok_`.
+  - Rejected: `ck_`, because WooCommerce consumer keys are `ck_` plus 40 hex
+    characters, so secret scanners would confuse the two formats in both
+    directions.
+- There is no dual-prefix window. Tickets live only in memory and never
+  survive a restart, so there is nothing to stay compatible with. The only
+  consumers that break are clients that pattern-match `tok_`, and they are
+  updated in the same change.
+- Export one `TICKET_PREFIX` / `TICKET_PATTERN` and use it everywhere,
+  including the CDP outbound pre-filter.
+- Deferred: a checksum suffix for registering the pattern with secret
+  scanners.
+
+## 9. Threat-model gaps: disposition
+
+| Gap | Disposition |
+|---|---|
+| MITM only when the token store is non-empty | Fixed by §5 (`bound` default, `always` opt-in) |
+| Vault API and proxy unauthenticated | Fixed: `COATCHECK_API_TOKEN`, required off loopback |
+| STS-assume pitfall | Fixed in provider-aws (`ExternalId` plus a warning) and the AWS deploy guide |
+| `mint-tokens` doesn't validate `sessionId` | Fixed: unknown sid returns `404` |
+| No CDP origin binding; `Runtime.evaluate` exfiltration | Fixed by §3 |
+| OAuth refresh logs the provider's body | Fixed: status and parsed `error` code only |
+| OAuth `token_url` unchecked | Fixed by §3 |
+| Secret names unvalidated | Fixed by §2 |
+| Unbounded leaf-certificate cache | Fixed by §7 |
+| Tickets reusable until TTL | Deferred past 1.0; host binding removes most of the risk. TTL becomes configurable |
+| Egress domain allowlist in the broker | Deferred past 1.0 (builds on `COATCHECK_MITM=always`) |
+| `Host` / SNI not compared with the CONNECT target | Documented: policy keys on the CONNECT target |
+| Transform-blind redaction, binary and screenshot frames, other routes to the browser, script-level exfiltration on an allowed origin, cross-origin iframe logins | Documented as accepted residual risk; README CDP claims corrected |
+| CA key readable on shared-filesystem deployments | Documented in the deploy guide |
