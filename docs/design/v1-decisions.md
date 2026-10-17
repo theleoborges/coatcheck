@@ -41,6 +41,40 @@ packages/provider-env/  @coatcheck/provider-env: `.` = env provider, `./file` = 
     and it still needs the dynamic path for third-party providers.
   - Separate repos: premature.
 
+### Packaging details (recorded while implementing roadmap item 12)
+
+- **Providers depend on core, never the reverse.** Provider packages import
+  `ConfigError`, `EnvReader`, `interpolateAgentId`, `isValidSecretName` and
+  the interface types from `@coatcheck/core`, declared as a
+  `peerDependency` so a deployment has exactly one copy of core. Core has no
+  dependency on any provider package: `aws`, `env` and `file` are mapped to
+  `@coatcheck/provider-aws`, `@coatcheck/provider-env` and
+  `@coatcheck/provider-env/file` and loaded with `import()`. If the package
+  isn't installed, startup fails with a `ConfigError` that names the package
+  to install. Rationale: a static dependency would make the AWS SDK part of
+  core's install again, which is what §1 rejects.
+- **A provider module's default export is its `CreateProvider`.** A module
+  without a function default export fails startup with a `ConfigError`.
+  `loadConfig` accepts any non-empty `COATCHECK_PROVIDER`; whether it resolves
+  is only known at `import()` time.
+- **`createMemoryProvider` stays in core** and is exported for tests and
+  embedding. It is not selectable through `COATCHECK_PROVIDER`.
+- **Workspace resolution without a build step.** Each package's `exports` has
+  a `@coatcheck/source` condition pointing at `src/*.ts` ahead of the
+  `types`/`default` entries that point at `dist`. vitest
+  (`resolve.conditions`) and `tsx` (`--conditions`) use it, so tests and
+  `npm run dev` run against source. Published tarballs ship `dist` only;
+  nobody else sets that condition. Rejected: vitest path aliases, which tsx
+  would not share.
+- **`type-check` is `tsc -b`.** Composite project references must emit
+  declarations for downstream packages, so type-check and build are the same
+  command; `build` is kept as a name for CI and the Dockerfiles.
+- **vitest uses inline `projects`**, one per package, from the root config.
+- **The demo files move to `examples/`.** `docker-compose.example.yml`
+  becomes `examples/docker-compose.localstack.yml`; both compose files build
+  from the repo root. The env quickstart uses `Dockerfile` (not
+  `Dockerfile.dev`) since it has nothing to iterate on.
+
 ## 2. SecretProvider interface and naming
 
 ```ts
