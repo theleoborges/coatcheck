@@ -15,7 +15,16 @@ import type { MatchTarget } from '../host-matcher.js';
 interface SessionState {
   mainFrameId?: string;
   url?: string;
+  /** The committed main frame's loaderId, for detecting a fresh navigation. */
+  loaderId?: string;
   /** A main-frame navigation has started and not yet committed or stopped. */
+  navigating: boolean;
+}
+
+/** A read-only view of a session's committed main frame, for the login driver. */
+export interface OriginSnapshot {
+  url?: string;
+  loaderId?: string;
   navigating: boolean;
 }
 
@@ -86,11 +95,12 @@ export class OriginTracker {
 
     switch (msg.method) {
       case 'Page.frameNavigated': {
-        const frame = msg.params?.frame as { id?: unknown; parentId?: unknown; url?: unknown } | undefined;
+        const frame = msg.params?.frame as { id?: unknown; parentId?: unknown; url?: unknown; loaderId?: unknown } | undefined;
         if (!frame || frame.parentId !== undefined || typeof frame.url !== 'string') return;
         const s = this.state(key);
         s.mainFrameId = typeof frame.id === 'string' ? frame.id : undefined;
         s.url = frame.url;
+        s.loaderId = typeof frame.loaderId === 'string' ? frame.loaderId : undefined;
         s.navigating = false;
         return;
       }
@@ -119,6 +129,12 @@ export class OriginTracker {
    * The committed main-frame origin of `sessionId` as a match target, or a
    * reason it is unknown (never navigated, navigating, or not http(s)).
    */
+  /** Read-only view of a session's committed main frame, for the login driver. */
+  snapshot(sessionId: string | undefined): OriginSnapshot {
+    const s = this.sessions.get(sessionId ?? ROOT);
+    return { url: s?.url, loaderId: s?.loaderId, navigating: s?.navigating ?? false };
+  }
+
   originFor(sessionId: string | undefined): { target: MatchTarget } | { unknown: string } {
     const s = this.sessions.get(sessionId ?? ROOT);
     if (!s || s.url === undefined) return { unknown: 'no committed navigation seen (enable Page and navigate first)' };

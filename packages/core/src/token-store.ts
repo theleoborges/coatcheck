@@ -106,6 +106,12 @@ function substitute(input: string, replacements: ReadonlyMap<string, string>): s
  */
 export class TokenStore {
   private tokens = new Map<string, TokenEntry>();
+  /**
+   * Real values registered for a CDP session's inbound-redaction set that are
+   * not tickets (broker-performed login: the login's field values for the life
+   * of the window). Dropped by `revokeSession` at teardown.
+   */
+  private sessionValueSets = new Map<string, SessionValue[]>();
   private cleanupTimer: NodeJS.Timeout;
 
   private readonly defaultTtlSeconds: number;
@@ -311,7 +317,21 @@ export class TokenStore {
       if (entry.sessionId !== sessionId) continue;
       out.push({ value: entry.realValue, secretName: entry.secretName });
     }
+    const registered = this.sessionValueSets.get(sessionId);
+    if (registered) out.push(...registered);
     return out;
+  }
+
+  /**
+   * Register real values for a session's inbound-redaction set without minting
+   * tickets (broker-performed login). They never substitute anywhere; they are
+   * only matched by the CDP proxy's inbound redactor and dropped at teardown.
+   */
+  registerSessionValues(sessionId: string, values: SessionValue[]): void {
+    const nonEmpty = values.filter(v => v.value.length > 0);
+    if (nonEmpty.length === 0) return;
+    const existing = this.sessionValueSets.get(sessionId) ?? [];
+    this.sessionValueSets.set(sessionId, [...existing, ...nonEmpty]);
   }
 
   /** Active token ids minted for a session, for the keystroke fail-closed detector. */
@@ -338,6 +358,7 @@ export class TokenStore {
         revoked++;
       }
     }
+    this.sessionValueSets.delete(sessionId);
     return revoked;
   }
 

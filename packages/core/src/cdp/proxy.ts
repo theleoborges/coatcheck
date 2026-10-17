@@ -262,6 +262,14 @@ export class CdpConnection implements CdpController {
 
     this.trackInbound(raw);
 
+    // Feed the login driver's event waiters (events carry no id).
+    if (this.eventListeners.size > 0 && id === undefined) {
+      const msg = parseJson(raw) as CdpMessage | null;
+      if (msg && typeof msg.method === 'string') {
+        for (const cb of [...this.eventListeners]) cb(msg);
+      }
+    }
+
     const result = substituteInbound(raw, this.tokenStore, this.sid);
     if (result.dropped) {
       console.warn(`[cdp] sid=${this.sid} inbound frame dropped (real value present)`);
@@ -360,6 +368,29 @@ export class CdpConnection implements CdpController {
 
   get queuedCount(): number { return this.agentQueue.length; }
 
+  /** Inbound-event listeners for the login driver. */
+  private readonly eventListeners = new Set<(m: CdpMessage) => void>();
+
+  /**
+   * Resolve with the first inbound browser event matching `pred`, or reject on
+   * timeout / connection close. Used by the login driver to await navigation,
+   * load and element-appearance.
+   */
+  waitForEvent(pred: (m: CdpMessage) => boolean, timeoutMs: number): Promise<CdpMessage> {
+    return new Promise<CdpMessage>((resolve, reject) => {
+      const timer = setTimeout(() => { cleanup(); reject(new Error('event-timeout')); }, timeoutMs);
+      timer.unref();
+      const listener = (m: CdpMessage) => {
+        if (m.method === '__aborted__') { cleanup(); reject(new Error('connection closed')); return; }
+        if (!pred(m)) return;
+        cleanup();
+        resolve(m);
+      };
+      const cleanup = () => { clearTimeout(timer); this.eventListeners.delete(listener); };
+      this.eventListeners.add(listener);
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // CdpController: broker-performed login
   // ---------------------------------------------------------------------------
@@ -379,6 +410,7 @@ export class CdpConnection implements CdpController {
   // ---------------------------------------------------------------------------
 
   get isUpstreamOpen(): boolean { return this.upstreamOpen; }
+  get isClosed(): boolean { return this.closed; }
 
   onUpstreamOpen(): void {
     this.upstreamOpen = true;
@@ -391,6 +423,7 @@ export class CdpConnection implements CdpController {
     this.closed = true;
     for (const waiter of this.pendingCoatcheck.values()) waiter.reject(new Error('connection closed'));
     this.pendingCoatcheck.clear();
+    for (const cb of [...this.eventListeners]) cb({ method: '__aborted__' });
     this.onTeardown();
   }
 }
