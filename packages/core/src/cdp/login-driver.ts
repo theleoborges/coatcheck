@@ -74,10 +74,15 @@ export async function runLogin(conn: CdpConnection, req: LoginRequest): Promise<
     }
 
     // --- Submit ---
+    // Snapshot the committed loaderId *before* submitting: submit() yields on
+    // its CDP round-trips, during which the post-submit navigation can already
+    // commit. Reading it after submit could capture the new loaderId and make
+    // `until: navigation` wait for a second navigation that never comes.
+    const loaderBeforeSubmit = conn.origins.snapshot(page).loaderId;
     await submit(conn, page, req);
 
     // --- Wait for the success condition ---
-    const ok = await waitUntil(conn, page, req, remaining());
+    const ok = await waitUntil(conn, page, req, remaining(), loaderBeforeSubmit);
     if (!ok) {
       await clearFields(conn, page, filled);
       outcome = 'no-success';
@@ -126,14 +131,13 @@ async function reload(conn: CdpConnection, page: string, timeoutMs: number): Pro
     m => m.method === 'Page.loadEventFired' && m.sessionId === page,
     timeoutMs,
   );
-  try {
-    await conn.sendCommand('Page.reload', {}, page);
-    await navigated;
-    await loaded;
-    return true;
-  } catch {
-    return false;
-  }
+  // Send the reload, then settle *both* waiters: awaiting them with
+  // Promise.allSettled (rather than `await navigated; await loaded`) means a
+  // reload-command failure or a navigation timeout can never leave the other
+  // waiter orphaned to reject later as an unhandled rejection.
+  await conn.sendCommand('Page.reload', {}, page).catch(() => { /* waiters will time out */ });
+  const [n, l] = await Promise.allSettled([navigated, loaded]);
+  return n.status === 'fulfilled' && l.status === 'fulfilled';
 }
 
 function isMainFrame(m: CdpMsg): boolean {
@@ -184,10 +188,10 @@ async function submit(conn: CdpConnection, page: string, req: LoginRequest): Pro
 }
 
 /** Wait for the `until` success condition within the remaining budget. */
-async function waitUntil(conn: CdpConnection, page: string, req: LoginRequest, timeoutMs: number): Promise<boolean> {
+async function waitUntil(conn: CdpConnection, page: string, req: LoginRequest, timeoutMs: number, loaderBefore?: string): Promise<boolean> {
   if (timeoutMs <= 0) return false;
   if (req.until.kind === 'navigation') {
-    const before = conn.origins.snapshot(page).loaderId;
+    const before = loaderBefore;
     try {
       await conn.waitForEvent(
         m => m.method === 'Page.frameNavigated' && isMainFrame(m) && m.sessionId === page

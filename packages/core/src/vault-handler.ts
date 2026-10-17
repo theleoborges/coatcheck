@@ -327,11 +327,11 @@ function handleLogin(
   const controller = deps.cdpSessionStore.controller(sessionId);
   if (!controller) {
     console.warn(`[login] secret=${secretName} rejected: no live CDP connection for session`);
-    return send(res, 404, { status: 'selector-not-found', error: 'Unknown or not-connected CDP session' });
+    return send(res, 404, { status: 'unknown-sid-or-secret', error: 'Unknown or not-connected CDP session' });
   }
 
   deps.provider.secrets.get(secretName).then(secret => {
-    if (secret === null) return send(res, 404, { status: 'selector-not-found', error: `No credential stored under '${secretName}'`, ...vaultUrlHint(deps) });
+    if (secret === null) return send(res, 404, { status: 'unknown-sid-or-secret', error: `No credential stored under '${secretName}'`, ...vaultUrlHint(deps) });
 
     const parsedSecret = parseSecretValue(secret.value);
     if (parsedSecret.kind !== 'multi') return send(res, 501, { error: `Secret '${secretName}' is not a multi-value web login` });
@@ -342,8 +342,11 @@ function handleLogin(
     // Every requested field must exist on the secret.
     const values: Record<string, string> = {};
     for (const field of Object.keys(selectors)) {
-      if (!fillable.has(field)) return send(res, 501, { error: `Secret '${secretName}' has no field '${field}'` });
-      values[field] = String(parsedSecret.fields[field]);
+      const fieldValue = parsedSecret.fields[field];
+      // A `_cleartext` entry can name a field that isn't actually present; don't
+      // fill the literal string "undefined".
+      if (!fillable.has(field) || fieldValue === undefined) return send(res, 501, { error: `Secret '${secretName}' has no field '${field}'` });
+      values[field] = String(fieldValue);
     }
 
     const binding = bindingFor(deps, secretName, parsedSecret.inBand);
