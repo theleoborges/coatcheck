@@ -10,6 +10,8 @@ export interface Policy {
   secrets: PolicyRule[];
   /** Shared secrets (exact names). Listed here = allowlisted for `/_secret/*`. */
   shared: ReadonlyMap<string, HostPattern[]>;
+  /** Shared secrets with an explicit `swap_body`. */
+  sharedSwapBody: ReadonlyMap<string, boolean>;
 }
 
 export interface PolicyRule {
@@ -17,9 +19,11 @@ export interface PolicyRule {
   name: string;
   wildcard: boolean;
   allowedHosts: HostPattern[];
+  /** Explicit `swap_body` (request body substitution, design §3); undefined when absent. */
+  swapBody?: boolean;
 }
 
-export const EMPTY_POLICY: Policy = { secrets: [], shared: new Map() };
+export const EMPTY_POLICY: Policy = { secrets: [], shared: new Map(), sharedSwapBody: new Map() };
 
 type Json = unknown;
 
@@ -54,36 +58,45 @@ export function parsePolicy(text: string, problems: string[], source = 'policy f
       continue;
     }
     const hosts = allowedHosts(entry, `secrets["${name}"]`, source, problems);
-    if (hosts) secrets.push({ name: base, wildcard, allowedHosts: hosts });
+    const swapBody = swapBodyOf(entry, `secrets["${name}"]`, source, problems);
+    if (hosts) secrets.push({ name: base, wildcard, allowedHosts: hosts, ...(swapBody === undefined ? {} : { swapBody }) });
   }
 
   const shared = new Map<string, HostPattern[]>();
+  const sharedSwapBody = new Map<string, boolean>();
   for (const [name, entry] of section(raw.shared, 'shared', source, problems)) {
     if (!isValidSecretName(name)) {
       problems.push(`${source}: shared["${name}"]: shared secrets must be exact, valid names`);
       continue;
     }
     const hosts = allowedHosts(entry, `shared["${name}"]`, source, problems);
+    const swapBody = swapBodyOf(entry, `shared["${name}"]`, source, problems);
     if (hosts) shared.set(name, hosts);
+    if (hosts && swapBody !== undefined) sharedSwapBody.set(name, swapBody);
   }
 
-  return { secrets, shared };
+  return { secrets, shared, sharedSwapBody };
 }
 
 /**
- * Allowed-host patterns for a per-agent secret, or undefined when no rule
- * matches. An exact name beats any wildcard; among wildcards the longest prefix wins.
+ * The rule for a per-agent secret, or undefined when none matches. An exact
+ * name beats any wildcard; among wildcards the longest prefix wins.
  */
-export function policyHostsFor(policy: Policy, secretName: string): HostPattern[] | undefined {
+export function policyRuleFor(policy: Policy, secretName: string): PolicyRule | undefined {
   let best: PolicyRule | undefined;
   for (const rule of policy.secrets) {
     if (!rule.wildcard) {
-      if (rule.name === secretName) return rule.allowedHosts;
+      if (rule.name === secretName) return rule;
       continue;
     }
     if (secretName.startsWith(rule.name) && (!best || rule.name.length > best.name.length)) best = rule;
   }
-  return best?.allowedHosts;
+  return best;
+}
+
+/** Allowed-host patterns for a per-agent secret, or undefined when no rule matches. */
+export function policyHostsFor(policy: Policy, secretName: string): HostPattern[] | undefined {
+  return policyRuleFor(policy, secretName)?.allowedHosts;
 }
 
 /** Every host pattern the policy names (per-agent rules and shared secrets). */
@@ -110,7 +123,9 @@ function allowedHosts(entry: Json, where: string, source: string, problems: stri
     return null;
   }
   for (const key of Object.keys(entry)) {
-    if (key !== 'allowed_hosts') problems.push(`${source}: ${where}: unknown key '${key}' (allowed: allowed_hosts)`);
+    if (key !== 'allowed_hosts' && key !== 'swap_body') {
+      problems.push(`${source}: ${where}: unknown key '${key}' (allowed: allowed_hosts, swap_body)`);
+    }
   }
   const list = entry.allowed_hosts;
   if (!Array.isArray(list) || list.length === 0) {
@@ -124,4 +139,13 @@ function allowedHosts(entry: Json, where: string, source: string, problems: stri
     else out.push(parsed);
   });
   return out.length === list.length ? out : null;
+}
+
+function swapBodyOf(entry: Json, where: string, source: string, problems: string[]): boolean | undefined {
+  if (!isObject(entry) || entry.swap_body === undefined) return undefined;
+  if (typeof entry.swap_body !== 'boolean') {
+    problems.push(`${source}: ${where}.swap_body must be true or false`);
+    return undefined;
+  }
+  return entry.swap_body;
 }

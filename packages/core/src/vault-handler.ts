@@ -3,9 +3,9 @@ import { TokenStore } from './token-store.js';
 import type { CertAuthority } from './ca.js';
 import type { CdpSessionStore } from './cdp-session-store.js';
 import { InvalidSecretNameError, isValidSecretName, type SecretProvider } from './secret-provider.js';
-import { policyHostsFor, type Policy } from './policy.js';
+import { policyRuleFor, type Policy } from './policy.js';
 import { matchesHost, type HostPattern } from './host-matcher.js';
-import { allowedHostsJson, parseSecretValue, resolveBinding, userFields, type Binding, type InBandHosts } from './secret-binding.js';
+import { allowedHostsJson, parseSecretValue, resolveBinding, userFields, type Binding, type InBandMetadata } from './secret-binding.js';
 
 export interface VaultDeps {
   tokenStore: TokenStore;
@@ -114,12 +114,12 @@ export function handleVaultRequest(
         // Every field shares the secret's binding.
         const binding = bindingFor(deps, secretName, parsed.inBand);
         if (!sendBindingError(res, binding)) return;
-        issueTicket(res, deps, `${secretName}:${field}`, String(fieldValue), binding.allowedHosts);
+        issueTicket(res, deps, `${secretName}:${field}`, String(fieldValue), binding);
       } else {
         // Simple secret — field param is ignored
         const binding = bindingFor(deps, secretName, parsed.inBand);
         if (!sendBindingError(res, binding)) return;
-        issueTicket(res, deps, secretName, parsed.value, binding.allowedHosts);
+        issueTicket(res, deps, secretName, parsed.value, binding);
       }
     }).catch(err => {
       sendProviderError(res, err, 'Error fetching secret:', 'Failed to fetch secret');
@@ -155,9 +155,10 @@ export function handleVaultRequest(
       }
       // The allowlist entry always carries hosts, so a shared secret is never unbound.
       const parsed = parseSecretValue(secret.value);
-      const binding = resolveBinding(secretName, deps.policy.shared.get(secretName), parsed.inBand, false);
+      const binding = resolveBinding(
+        secretName, deps.policy.shared.get(secretName), parsed.inBand, false, deps.policy.sharedSwapBody.get(secretName));
       if (!sendBindingError(res, binding)) return;
-      issueTicket(res, deps, `shared:${secretName}`, parsed.kind === 'simple' ? parsed.value : secret.value, binding.allowedHosts);
+      issueTicket(res, deps, `shared:${secretName}`, parsed.kind === 'simple' ? parsed.value : secret.value, binding);
     }).catch(err => {
       sendProviderError(res, err, `Error fetching shared secret '${secretName}':`, 'Failed to fetch shared secret');
     });
@@ -194,24 +195,31 @@ export function handleVaultRequest(
   return false;
 }
 
-/** Issue an HTTP(S) ticket and answer with it and its allowed hosts. */
+/** Issue an HTTP(S) ticket and answer with it, its allowed hosts and (when on) body swapping. */
 function issueTicket(
   res: http.ServerResponse,
   deps: VaultDeps,
   label: string,
   value: string,
-  allowedHosts: readonly HostPattern[] | undefined,
+  binding: { allowedHosts: readonly HostPattern[] | undefined; swapBody: boolean },
   via?: string,
 ): void {
-  const token = deps.tokenStore.issue(label, value, { allowedHosts });
-  console.log(`[issue] secret=${label} ttl_s=${token.ttlSeconds}${allowedHosts ? '' : ' unbound=1'}${via ? ` via=${via}` : ''}`);
+  const { allowedHosts, swapBody } = binding;
+  const token = deps.tokenStore.issue(label, value, { allowedHosts, swapBody });
+  console.log(`[issue] secret=${label} ttl_s=${token.ttlSeconds}${allowedHosts ? '' : ' unbound=1'}${swapBody ? ' swap_body=1' : ''}${via ? ` via=${via}` : ''}`);
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds, allowed_hosts: allowedHostsJson(allowedHosts) }));
+  res.end(JSON.stringify({
+    token: token.id,
+    expires_in: token.ttlSeconds,
+    allowed_hosts: allowedHostsJson(allowedHosts),
+    ...(swapBody ? { swap_body: true } : {}),
+  }));
 }
 
 /** A per-agent secret's binding: its policy rule intersected with its in-band hosts. */
-function bindingFor(deps: VaultDeps, secretName: string, inBand: InBandHosts): Binding {
-  return resolveBinding(secretName, policyHostsFor(deps.policy, secretName), inBand, !!deps.allowUnboundSecrets);
+function bindingFor(deps: VaultDeps, secretName: string, inBand: InBandMetadata): Binding {
+  const rule = policyRuleFor(deps.policy, secretName);
+  return resolveBinding(secretName, rule?.allowedHosts, inBand, !!deps.allowUnboundSecrets, rule?.swapBody);
 }
 
 /** Answer a refused binding. Returns true (and sends nothing) when the binding is ok. */
@@ -478,7 +486,7 @@ async function handleOAuthRefresh(
   await store.put(secretName, JSON.stringify(updated));
 
   // Issue a cct_* for the new access token
-  issueTicket(res, deps, `${secretName}:access_token`, tokens.access_token, binding.allowedHosts, 'oauth_refresh');
+  issueTicket(res, deps, `${secretName}:access_token`, tokens.access_token, binding, 'oauth_refresh');
 }
 
 const OAUTH_ERROR_CODE_MAX = 64;

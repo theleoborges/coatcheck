@@ -29,6 +29,16 @@ describe('parseSecretValue', () => {
   });
 });
 
+describe('parseSecretValue: _swap_body', () => {
+  it('parses a boolean _swap_body and refuses anything else', () => {
+    expect(parseSecretValue(JSON.stringify({ value: 'x', _swap_body: true }))).toEqual({ kind: 'simple', value: 'x', inBand: { swapBody: true } });
+    for (const bad of ['true', 1, null, []]) {
+      const v = parseSecretValue(JSON.stringify({ value: 'x', _swap_body: bad }));
+      expect('error' in v.inBand, JSON.stringify(bad)).toBe(true);
+    }
+  });
+});
+
 describe('userFields', () => {
   it('hides every underscore-prefixed key', () => {
     expect(userFields({ a: 1, _cleartext: [], _allowed_hosts: [], _future: 1, b: 2 })).toEqual(['a', 'b']);
@@ -38,22 +48,35 @@ describe('userFields', () => {
 describe('resolveBinding', () => {
   it('refuses an unbound secret unless unbound secrets are allowed', () => {
     expect(resolveBinding('k', undefined, {}, false)).toMatchObject({ ok: false, status: 403, error: expect.stringContaining("'k' is not bound") });
-    expect(resolveBinding('k', undefined, {}, true)).toEqual({ ok: true, allowedHosts: undefined });
+    expect(resolveBinding('k', undefined, {}, true)).toEqual({ ok: true, allowedHosts: undefined, swapBody: false });
   });
 
   it('uses whichever source is present', () => {
-    expect(resolveBinding('k', hosts('a.example.com'), {}, false)).toEqual({ ok: true, allowedHosts: hosts('a.example.com') });
-    expect(resolveBinding('k', undefined, { hosts: hosts('b.example.com') }, false)).toEqual({ ok: true, allowedHosts: hosts('b.example.com') });
+    expect(resolveBinding('k', hosts('a.example.com'), {}, false)).toEqual({ ok: true, allowedHosts: hosts('a.example.com'), swapBody: false });
+    expect(resolveBinding('k', undefined, { hosts: hosts('b.example.com') }, false)).toEqual({ ok: true, allowedHosts: hosts('b.example.com'), swapBody: false });
   });
 
   it('intersects the policy and in-band hosts: the secret can only narrow the operator', () => {
     const b = resolveBinding('k', hosts('*.example.com'), { hosts: hosts('api.example.com', 'attacker.example') }, false);
-    expect(b).toEqual({ ok: true, allowedHosts: hosts('api.example.com') });
+    expect(b).toEqual({ ok: true, allowedHosts: hosts('api.example.com'), swapBody: false });
   });
 
   it('refuses an empty intersection with 403 and an invalid in-band list with 500', () => {
     expect(resolveBinding('k', hosts('a.example.com'), { hosts: hosts('b.example.com') }, true)).toMatchObject({ ok: false, status: 403 });
     expect(resolveBinding('k', hosts('a.example.com'), { error: 'bad' }, true)).toMatchObject({ ok: false, status: 500 });
+  });
+
+  it('enables body swapping when either source opts in and neither opts out', () => {
+    const swap = (policy: boolean | undefined, inBand: boolean | undefined) => {
+      const b = resolveBinding('k', hosts('a.example.com'), inBand === undefined ? {} : { swapBody: inBand }, false, policy);
+      return b.ok && b.swapBody;
+    };
+    expect(swap(undefined, undefined)).toBe(false);
+    expect(swap(true, undefined)).toBe(true);
+    expect(swap(undefined, true)).toBe(true);
+    expect(swap(true, true)).toBe(true);
+    expect(swap(true, false)).toBe(false);
+    expect(swap(false, true)).toBe(false);
   });
 });
 

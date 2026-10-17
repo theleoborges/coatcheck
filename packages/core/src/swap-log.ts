@@ -3,12 +3,15 @@ import { TICKET_PATTERN, TICKET_PREFIX, type SwapInfo } from './token-store.js';
 export interface SwapOutcome {
   swaps: SwapInfo[];
   denied: SwapInfo[];
+  /** Tickets found in a request body whose secret doesn't opt in to body swapping. */
+  skipped?: SwapInfo[];
 }
 
 /**
  * Emit structured lines per outbound request describing the swap outcome:
  * `result=denied` (host mismatch, request not forwarded), `result=hit` (bound
- * tickets swapped), `result=unbound` (tickets without a host binding swapped).
+ * tickets swapped), `result=unbound` (tickets without a host binding swapped),
+ * `result=body-skipped` (a body ticket whose secret doesn't enable `swap_body`).
  * `postSwapText` is the text *after* swaps were applied — any ticket literal (`cct_<hex>`)
  * remaining in it is un-swapped (TTL-expired token, stale tunnel, or a literal
  * the agent typed by mistake). Never logs token values, IDs, or request bodies.
@@ -34,13 +37,20 @@ export function logSwapOutcome(
     console.warn(`[swap] scheme=${scheme} host=${hostname} result=unbound secrets=${names(unbound)} max_age_ms=${maxAge(unbound)}`);
   }
 
+  if (outcome.skipped && outcome.skipped.length > 0) {
+    console.warn(
+      `[swap] scheme=${scheme} host=${hostname} result=body-skipped secrets=${names(outcome.skipped)} ` +
+      '(ticket in the request body; its secret does not enable swap_body, so it was sent as a literal)'
+    );
+  }
+
   // Reset regex state — TICKET_PATTERN is a /g RegExp shared across calls.
   TICKET_PATTERN.lastIndex = 0;
   const unswapped = (postSwapText.match(TICKET_PATTERN) ?? []).length;
   if (unswapped > 0) {
     console.warn(
       `[swap] scheme=${scheme} host=${hostname} result=miss unswapped_ticket_literals=${unswapped} ` +
-      `(TTL expiry, passthrough tunnel, or never-issued token — request reaching upstream with ${TICKET_PREFIX}… intact)`
+      `(TTL expiry, passthrough tunnel, never-issued token, or body-skipped — request reaching upstream with ${TICKET_PREFIX}… intact)`
     );
   }
 }

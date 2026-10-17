@@ -32,6 +32,8 @@ interface TokenEntry {
   sessionId?: string;
   /** Hosts this ticket may be swapped for, snapshotted at mint. Undefined = unbound. */
   allowedHosts?: readonly HostPattern[];
+  /** Also swapped in request bodies (opt-in per secret), snapshotted at mint. */
+  swapBody: boolean;
 }
 
 export interface IssueOptions {
@@ -41,6 +43,8 @@ export interface IssueOptions {
   allowedHosts?: readonly HostPattern[];
   /** Bind to a CDP session: substitutes only on that session's frames, revoked when it closes. */
   sessionId?: string;
+  /** Also substitute in HTTP(S) request bodies (see replaceAllInBody). Default false. */
+  swapBody?: boolean;
 }
 
 export interface SessionValue {
@@ -69,6 +73,11 @@ export interface SwapResult {
    * must not forward the request.
    */
   denied: SwapInfo[];
+  /**
+   * replaceAllInBody only: tickets present in the body whose secret doesn't
+   * opt in to body swapping. Left as literals; they never deny.
+   */
+  skipped?: SwapInfo[];
 }
 
 /**
@@ -106,6 +115,7 @@ export class TokenStore {
       expiresAt: now + ttlSeconds * 1000,
       sessionId: opts.sessionId,
       allowedHosts: opts.allowedHosts,
+      swapBody: opts.swapBody ?? false,
     });
 
     return { id, ttlSeconds };
@@ -132,11 +142,26 @@ export class TokenStore {
    * ticket is reported in `denied`: one denied ticket denies the whole request.
    */
   replaceAll(input: string, target: MatchTarget): SwapResult {
+    return this.replaceHttp(input, target, false, v => v);
+  }
+
+  /**
+   * Like replaceAll, for a request body: only tickets whose secret opts in to
+   * body swapping (`swapBody`) are candidates, and each real value goes
+   * through `encode` (escaping for the body's content type). Tickets of other
+   * secrets are reported in `skipped` and left as literals.
+   */
+  replaceAllInBody(input: string, target: MatchTarget, encode: (value: string) => string): SwapResult {
+    return this.replaceHttp(input, target, true, encode);
+  }
+
+  private replaceHttp(input: string, target: MatchTarget, body: boolean, encode: (value: string) => string): SwapResult {
     if (this.tokens.size === 0) return { output: input, swaps: [], denied: [] };
 
     let result = input;
     const swaps: SwapInfo[] = [];
     const denied: SwapInfo[] = [];
+    const skipped: SwapInfo[] = [];
     const now = Date.now();
 
     for (const [tokenId, entry] of this.tokens) {
@@ -149,18 +174,25 @@ export class TokenStore {
       if (entry.sessionId !== undefined) continue;
       if (!input.includes(tokenId)) continue;
       const info: SwapInfo = { secretName: entry.secretName, ageMs: now - entry.createdAt };
+      if (body && !entry.swapBody) {
+        skipped.push(info);
+        continue;
+      }
       if (entry.allowedHosts === undefined) {
         info.unbound = true;
       } else if (!matchesHost(entry.allowedHosts, target)) {
         denied.push(info);
         continue;
       }
-      result = result.replaceAll(tokenId, entry.realValue);
+      // A replacer function: a string replacement would expand `$&`, `$'` etc. in the value.
+      const value = encode(entry.realValue);
+      result = result.replaceAll(tokenId, () => value);
       swaps.push(info);
     }
 
-    if (denied.length > 0) return { output: input, swaps: [], denied };
-    return { output: result, swaps, denied };
+    const extra = body ? { skipped } : {};
+    if (denied.length > 0) return { output: input, swaps: [], denied, ...extra };
+    return { output: result, swaps, denied, ...extra };
   }
 
   /**
@@ -211,7 +243,7 @@ export class TokenStore {
         denied.push(info);
         continue;
       }
-      result = result.replaceAll(tokenId, entry.realValue);
+      result = result.replaceAll(tokenId, () => entry.realValue);
       swaps.push(info);
     }
 

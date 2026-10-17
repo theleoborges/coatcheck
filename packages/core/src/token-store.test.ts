@@ -195,6 +195,42 @@ describe('TokenStore', () => {
     });
   });
 
+  it('inserts values literally, never expanding $ replacement patterns', () => {
+    store = new TokenStore();
+    const t = store.issue('k', "a$&b$'c$`d$$e");
+    expect(store.replaceAll(`x ${t.id} y`, ANY_HOST).output).toBe("x a$&b$'c$`d$$e y");
+  });
+
+  describe('body swapping', () => {
+    it('swaps only opted-in tickets, encoding the value, and reports the rest as skipped', () => {
+      store = new TokenStore();
+      const body = store.issue('body', 'v"1', { swapBody: true });
+      const header = store.issue('header', 'v2');
+      const r = store.replaceAllInBody(`${body.id} ${header.id}`, ANY_HOST, v => JSON.stringify(v).slice(1, -1));
+      expect(r.output).toBe(`v\\"1 ${header.id}`);
+      expect(r.swaps.map(s => s.secretName)).toEqual(['body']);
+      expect(r.skipped?.map(s => s.secretName)).toEqual(['header']);
+      // Headers are unaffected by the flag.
+      expect(store.replaceAll(`${body.id} ${header.id}`, ANY_HOST).output).toBe('v"1 v2');
+    });
+
+    it('applies host binding to opted-in tickets, but never denies on a skipped one', () => {
+      store = new TokenStore();
+      const bound = store.issue('gh', 'ghp_real', { allowedHosts: hosts('api.github.com'), swapBody: true });
+      const r = store.replaceAllInBody(bound.id, ANY_HOST, v => v);
+      expect(r).toMatchObject({ output: bound.id, swaps: [], denied: [{ secretName: 'gh' }] });
+
+      const plain = store.issue('plain', 'x', { allowedHosts: hosts('api.github.com') });
+      expect(store.replaceAllInBody(plain.id, ANY_HOST, v => v)).toMatchObject({ output: plain.id, denied: [], skipped: [{ secretName: 'plain' }] });
+    });
+
+    it('never swaps session-scoped tickets in a body', () => {
+      store = new TokenStore();
+      const t = store.issue('login:password', 'pw', { sessionId: 'sid', swapBody: true });
+      expect(store.replaceAllInBody(t.id, ANY_HOST, v => v)).toMatchObject({ output: t.id, swaps: [], skipped: [] });
+    });
+  });
+
   // --- Session-scoped tokens (CDP credential injection) ---
 
   describe('session-scoped tokens', () => {

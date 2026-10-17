@@ -221,6 +221,48 @@ by the agent is deferred, and if it is ever added it may only narrow.
   the parser can't interleave a synthetic response with in-flight upstream
   responses safely, and denial is an attack signal, not a normal outcome.
 
+### Request body substitution (recorded while implementing roadmap item 17)
+
+- **Off by default, opt-in per secret.** A body is where APIs echo input back
+  (validation errors, created resources), so swapping there widens what an
+  allowed host can reflect to the agent. Headers and the URL are swapped for
+  every ticket; the body only for tickets whose secret opts in.
+- **Two sources, deny wins.** `"swap_body": true` on a `secrets` or `shared`
+  entry in the policy file, or `"_swap_body": true` in a JSON secret. Either
+  one enables it; an explicit `false` in either source disables it, as the
+  allowed hosts take the intersection. Both must be booleans: a policy file
+  with anything else fails startup, an in-band value fails minting with
+  `500`. All fields of a multi-value secret share the setting, and the
+  refreshed OAuth access token inherits it.
+- **The ticket snapshots it at mint**, as it does its hosts
+  (`issue(name, value, { swapBody })`). Mint responses carry
+  `"swap_body": true` when it is on, so the agent knows a body ticket will
+  work.
+- **Host binding applies unchanged.** A body-swap ticket bound to another host
+  denies the whole request (`403 host-mismatch`, tunnel closed), the same as
+  in a header. A ticket in the body whose secret doesn't opt in is left as a
+  literal and doesn't deny: nothing is substituted, so nothing leaks. It is
+  logged as `[swap] result=body-skipped secrets=…`.
+- **Both paths.** On the MITM path the body comes from the item-16 framing;
+  on the forward path from Node's parser. Either way it is buffered whole.
+  When something is swapped:
+  - a `Content-Length` body gets a rewritten `Content-Length`;
+  - a chunked MITM body is re-sent as one chunk plus the last chunk and the
+    original trailers, so the framing headers stay as they were;
+  - the forward path always sends `Content-Length` (Node de-chunks the body).
+- **Encoding follows `Content-Type`.** JSON (`application/json`, `*/*+json`)
+  gets the value JSON-string-escaped, because a ticket in JSON sits inside a
+  string. `application/x-www-form-urlencoded` gets it percent-encoded. Every
+  other type gets the raw UTF-8 bytes. Rationale: a value holding `"` or `&`
+  would otherwise break the body or add a field. Rejected: escaping for
+  multipart and other formats, which have no single correct escaping.
+- **Encoded bodies are not scanned.** A body with a `Content-Encoding` other
+  than `identity` is forwarded as is; the ticket can't be found without
+  decompressing, and recompressing changes the bytes the client signed or
+  measured.
+- **Bytes outside tickets are preserved exactly** (the body is handled as
+  latin1, so binary bodies round-trip).
+
 ### Default: deny, at mint time
 
 - `/_vault/{name}` for an unbound secret returns `403` with an error naming the

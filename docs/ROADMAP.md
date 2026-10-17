@@ -217,7 +217,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 16. **[Done]** **Chunked request bodies.** Parse `Transfer-Encoding: chunked` in the MITM
     request parser so that keep-alive framing stays correct.
 
-17. **Request body substitution.** Opt in per secret, with `swap_body` in the
+17. **[Done]** **Request body substitution.** Opt in per secret, with `swap_body` in the
     policy file or `_swap_body` in-band. Host binding applies, and
     `Content-Length` is rewritten.
 

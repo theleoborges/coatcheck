@@ -10,7 +10,8 @@ import { parseConnectTarget } from './connect-target.js';
 import { matchesHost, parseHostPattern, type HostPattern } from './host-matcher.js';
 import { allPolicyHosts, type Policy } from './policy.js';
 import type { MitmMode } from './config.js';
-import { requestFraming, scanChunked } from './http1-framing.js';
+import { headerValue, requestFraming, scanChunked } from './http1-framing.js';
+import { swapRequestBody } from './body-swap.js';
 import { DENIED_HEADER, hostMismatchBody, logSwapOutcome } from './swap-log.js';
 
 export interface MitmDeps {
@@ -154,6 +155,7 @@ export function createConnectHandler(deps: MitmDeps) {
         // refused, since the upstream might read it differently (design §5).
         const framing = requestFraming(headerStr);
         let totalLength: number;
+        let chunked: { data: Buffer; trailers: Buffer } | undefined;
         if (framing.kind === 'invalid') {
           console.warn(`[connect] host=${hostname} rejected request: ${framing.reason}`);
           denyAndClose(400, 'bad-framing', JSON.stringify({ error: `Bad request framing: ${framing.reason}`, reason: 'bad-framing' }));
@@ -167,6 +169,7 @@ export function createConnectHandler(deps: MitmDeps) {
             return;
           }
           totalLength = scan.end;
+          chunked = scan;
         } else {
           totalLength = bodyStart + (framing.kind === 'length' ? framing.length : 0);
           if (requestData.length < totalLength) return; // need more data for body
@@ -175,18 +178,48 @@ export function createConnectHandler(deps: MitmDeps) {
         const body = requestData.subarray(bodyStart, totalLength);
         requestData = requestData.subarray(totalLength); // remainder for next request
 
-        // Swap tokens in headers. The binding key is the validated CONNECT
-        // target (upstream TLS proves it is the recipient), never Host or SNI.
-        const result = tokenStore.replaceAll(headerStr, { host: hostname, scheme: 'https' });
-        logSwapOutcome('https', hostname, result, result.output);
-        if (result.denied.length > 0) {
-          denyAndClose(403, 'host-mismatch', hostMismatchBody(result.denied, hostname));
+        // Swap tokens in headers, and in the body for secrets that opt in.
+        // The binding key is the validated CONNECT target (upstream TLS proves
+        // it is the recipient), never Host or SNI.
+        const swapTarget = { host: hostname, scheme: 'https' as const };
+        const result = tokenStore.replaceAll(headerStr, swapTarget);
+        const bodySwap = swapRequestBody(tokenStore, chunked ? chunked.data : body, {
+          contentType: headerValue(headerStr, 'content-type'),
+          contentEncoding: headerValue(headerStr, 'content-encoding'),
+        }, swapTarget);
+        const denied = [...result.denied, ...(bodySwap?.result.denied ?? [])];
+        logSwapOutcome('https', hostname, {
+          swaps: [...result.swaps, ...(bodySwap?.result.swaps ?? [])],
+          denied,
+          skipped: bodySwap?.result.skipped,
+        }, bodySwap ? `${result.output}\n${bodySwap.result.output}` : result.output);
+        if (denied.length > 0) {
+          denyAndClose(403, 'host-mismatch', hostMismatchBody(denied, hostname));
           return;
         }
 
+        let head = result.output;
+        let outBody: Buffer = body;
+        if (bodySwap && bodySwap.result.swaps.length > 0) {
+          const swapped = bodySwap.body;
+          if (chunked) {
+            // One chunk, then the last chunk and the trailers as received.
+            outBody = Buffer.concat([
+              Buffer.from(swapped.length > 0 ? `${swapped.length.toString(16)}\r\n` : ''),
+              swapped,
+              Buffer.from(swapped.length > 0 ? '\r\n0\r\n' : '0\r\n'),
+              chunked.trailers,
+            ]);
+          } else {
+            // Framing was validated: exactly one all-digit Content-Length.
+            head = head.replace(/^(content-length:[ \t]*)\d+/im, `$1${swapped.length}`);
+            outBody = swapped;
+          }
+        }
+
         const outBuf = Buffer.concat([
-          Buffer.from(result.output + '\r\n\r\n'),
-          body,
+          Buffer.from(head + '\r\n\r\n'),
+          outBody,
         ]);
 
         sendUpstream(outBuf);

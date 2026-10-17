@@ -2,11 +2,13 @@ import http from 'node:http';
 import { URL } from 'node:url';
 import type { TokenStore, SwapInfo } from './token-store.js';
 import { DENIED_HEADER, hostMismatchBody, logSwapOutcome } from './swap-log.js';
+import { swapRequestBody } from './body-swap.js';
 
 /**
  * Hop-by-hop headers (RFC 9110 §7.6.1) that must not be forwarded, plus
  * `proxy-authorization`, which is meant for coatcheck and not the upstream.
- * `transfer-encoding` is kept: Node re-frames the piped body according to it.
+ * The body is buffered and re-sent with `Content-Length`, so the client's
+ * framing headers are dropped too.
  */
 const HOP_BY_HOP = new Set([
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -15,9 +17,9 @@ const HOP_BY_HOP = new Set([
 
 /**
  * Forward a plain-HTTP proxy request (`GET http://host/path`), swapping tickets
- * in the path, query and headers. Tickets only swap for hosts their secret is
- * bound to with an `http://` entry; otherwise the request is answered `403`
- * and never forwarded.
+ * in the path, query and headers, and in the body for secrets that opt in
+ * (`swap_body`). Tickets only swap for hosts their secret is bound to with an
+ * `http://` entry; otherwise the request is answered `403` and never forwarded.
  */
 export function handleForwardRequest(
   req: http.IncomingMessage,
@@ -41,6 +43,7 @@ export function handleForwardRequest(
   const target = { host: hostname, scheme: 'http' as const };
   const swaps: SwapInfo[] = [];
   const denied: SwapInfo[] = [];
+  let skipped: SwapInfo[] | undefined;
   let postSwapText = '';
   const swap = (text: string): string => {
     const r = tokenStore.replaceAll(text, target);
@@ -61,45 +64,70 @@ export function handleForwardRequest(
     else if (Array.isArray(value)) headers[key] = value.map(swap);
   }
   headers.host = parsed.host;
+  const hadBody = req.headers['content-length'] !== undefined || req.headers['transfer-encoding'] !== undefined;
+  delete headers['content-length'];
+  delete headers['transfer-encoding'];
 
-  logSwapOutcome('http', hostname, { swaps, denied }, postSwapText);
-  if (denied.length > 0) {
-    req.resume();
-    res.writeHead(403, { 'Content-Type': 'application/json', [DENIED_HEADER]: 'host-mismatch' });
-    res.end(hostMismatchBody(denied, hostname));
-    return;
-  }
+  // Buffer the body: it may hold tickets of secrets that opt in to body swapping.
+  const chunks: Buffer[] = [];
+  req.on('data', (chunk: Buffer) => chunks.push(chunk));
+  req.on('error', () => res.destroy());
+  req.on('end', () => {
+    let body: Buffer = Buffer.concat(chunks);
+    const bodySwap = swapRequestBody(tokenStore, body, {
+      contentType: firstHeader(req.headers['content-type']),
+      contentEncoding: firstHeader(req.headers['content-encoding']),
+    }, target);
+    if (bodySwap) {
+      swaps.push(...bodySwap.result.swaps);
+      denied.push(...bodySwap.result.denied);
+      skipped = bodySwap.result.skipped;
+      postSwapText += bodySwap.result.output;
+      body = bodySwap.body;
+    }
 
-  let proxyReq: http.ClientRequest;
-  try {
-    proxyReq = http.request({
-      // WHATWG keeps IPv6 brackets in `hostname`; the dialler needs the bare address.
-      hostname: hostname.replace(/^\[(.*)\]$/, '$1'),
-      port: parsed.port || 80,
-      path,
-      method: req.method,
-      headers,
-    }, (proxyRes) => {
-      res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
-      proxyRes.pipe(res);
+    logSwapOutcome('http', hostname, { swaps, denied, skipped }, postSwapText);
+    if (denied.length > 0) {
+      res.writeHead(403, { 'Content-Type': 'application/json', [DENIED_HEADER]: 'host-mismatch' });
+      res.end(hostMismatchBody(denied, hostname));
+      return;
+    }
+    if (hadBody || body.length > 0) headers['content-length'] = body.length;
+
+    let proxyReq: http.ClientRequest;
+    try {
+      proxyReq = http.request({
+        // WHATWG keeps IPv6 brackets in `hostname`; the dialler needs the bare address.
+        hostname: hostname.replace(/^\[(.*)\]$/, '$1'),
+        port: parsed.port || 80,
+        path,
+        method: req.method,
+        headers,
+      }, (proxyRes) => {
+        res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
+        proxyRes.pipe(res);
+      });
+    } catch (err) {
+      // http.request throws synchronously on invalid header values (e.g. a real
+      // value with CR/LF); an uncaught throw here would take the process down.
+      console.error('HTTP proxy request rejected:', (err as NodeJS.ErrnoException).code ?? 'unknown');
+      res.writeHead(502);
+      res.end('Proxy error');
+      return;
+    }
+
+    proxyReq.on('error', (err) => {
+      console.error('HTTP proxy error:', err.message);
+      res.writeHead(502);
+      res.end('Proxy error');
     });
-  } catch (err) {
-    // http.request throws synchronously on invalid header values (e.g. a real
-    // value with CR/LF); an uncaught throw here would take the process down.
-    console.error('HTTP proxy request rejected:', (err as NodeJS.ErrnoException).code ?? 'unknown');
-    req.resume();
-    res.writeHead(502);
-    res.end('Proxy error');
-    return;
-  }
 
-  proxyReq.on('error', (err) => {
-    console.error('HTTP proxy error:', err.message);
-    res.writeHead(502);
-    res.end('Proxy error');
+    proxyReq.end(body);
   });
+}
 
-  req.pipe(proxyReq);
+function firstHeader(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
 }
 
 /** Percent-encode control, space and non-ASCII characters (UTF-8), leaving everything else as is. */

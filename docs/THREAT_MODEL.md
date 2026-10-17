@@ -226,12 +226,18 @@ target (the actual upstream, verified by upstream TLS), never on `Host` or
 SNI, so a mismatched `Host` can't widen a ticket's reach; it only reaches the
 upstream as a confusing request.
 
-### LOW: request bodies are not swapped
+### LOW: request bodies are swapped only on opt-in
 
-Only headers and URL are rewritten (`mitm.ts`, `forward.ts`). Body
-bytes pass through. This is a functional limitation (tickets in JSON or
-form bodies do not work) and narrows the substitution surface, which is
-mildly protective. The MITM parser frames `Transfer-Encoding: chunked` and
+Headers and URL are rewritten for every ticket (`mitm.ts`, `forward.ts`).
+Bodies are rewritten only for secrets with `swap_body` (policy) or
+`_swap_body` (in-band), because a body is where an allowed host is most
+likely to echo input back to the agent (validation errors, created
+objects). Opting in accepts that reflection risk for that secret: an agent
+that can get an allowed host to echo a request body can read the value.
+Host binding still applies to body tickets (a mis-bound one denies the
+request; test in `server.test.ts`), and a ticket of a secret that hasn't
+opted in reaches the upstream as a literal. Content-encoded bodies are not
+scanned. The MITM parser frames `Transfer-Encoding: chunked` and
 `Content-Length` bodies per RFC 9112 (`http1-framing.ts`), so body bytes can't
 be parsed as a new request whose header tickets would be swapped. Ambiguous
 framing (both headers, codings other than `chunked`, repeated or malformed

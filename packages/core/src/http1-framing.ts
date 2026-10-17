@@ -94,3 +94,13 @@ export function scanChunked(buf: Buffer, start: number): ChunkedScan {
     pos += size + 2;
   }
 }
+
+/** The value of the first `name` header in a header section (request line first), trimmed. */
+export function headerValue(head: string, name: string): string | undefined {
+  const lower = name.toLowerCase();
+  for (const line of head.split('\r\n').slice(1)) {
+    const colon = line.indexOf(':');
+    if (colon > 0 && line.slice(0, colon).toLowerCase() === lower) return line.slice(colon + 1).trim();
+  }
+  return undefined;
+}
