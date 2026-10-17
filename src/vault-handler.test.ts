@@ -711,6 +711,8 @@ describe('Vault Handler', () => {
         expect(fetchBody).toContain('refresh_token=1%2F%2Fold-refresh');
         expect(fetchBody).toContain('client_id=test-client-id');
         expect(fetchBody).toContain('grant_type=refresh_token');
+        // A redirect from token_url would re-POST client_secret to an unchecked host.
+        expect(fetchCall[1]?.redirect).toBe('error');
       } finally {
         globalThis.fetch = originalFetch;
       }

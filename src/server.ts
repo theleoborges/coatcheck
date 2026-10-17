@@ -10,7 +10,7 @@ import type { HostPattern } from './host-matcher.js';
 import type { MitmMode } from './config.js';
 import { handleForwardRequest } from './forward.js';
 import { createConnectHandler } from './mitm.js';
-import { createApiAuth, isOpenVaultPath, PROXY_AUTH_REQUIRED, sendUnauthorized } from './auth.js';
+import { createApiAuth, isOpenVaultPath, PROXY_AUTH_REQUIRED, sendProxyAuthRequired, sendUnauthorized } from './auth.js';
 
 export const BROWSERBASE_API_HOST = 'api.browserbase.com';
 
@@ -68,8 +68,7 @@ export function createCoatcheck(deps: CoatcheckDeps): Coatcheck {
       if (!auth.proxy(req)) {
         console.warn('[auth] rejected proxy request: missing or invalid Proxy-Authorization');
         req.resume();
-        res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="coatcheck"', 'Content-Length': '0' });
-        res.end();
+        sendProxyAuthRequired(res);
         return;
       }
       handleForwardRequest(req, res, deps.tokenStore);
@@ -81,9 +80,11 @@ export function createCoatcheck(deps: CoatcheckDeps): Coatcheck {
       sendUnauthorized(res);
       return;
     }
-    // Handle vault API requests directly
     if (handleVaultRequest(req, res, vaultDeps)) return;
-    handleForwardRequest(req, res, deps.tokenStore);
+    // Origin-form but not a vault route: not a proxy request either.
+    req.resume();
+    res.writeHead(400);
+    res.end('Bad request');
   });
 
   const onConnect = createConnectHandler({

@@ -3,8 +3,8 @@ import { TokenStore } from './token-store.js';
 import type { CertAuthority } from './ca.js';
 import { isValidSecretName, type SecretProvider } from './secret-provider.js';
 import { policyHostsFor, type Policy } from './policy.js';
-import { matchesHost } from './host-matcher.js';
-import { allowedHostsJson, parseSecretValue, resolveBinding, userFields, type Binding } from './secret-binding.js';
+import { matchesHost, type HostPattern } from './host-matcher.js';
+import { allowedHostsJson, parseSecretValue, resolveBinding, userFields, type Binding, type InBandHosts } from './secret-binding.js';
 
 export interface VaultDeps {
   tokenStore: TokenStore;
@@ -113,12 +113,12 @@ export function handleVaultRequest(
           return;
         }
         // Every field shares the secret's binding.
-        const binding = resolveBinding(secretName, policyHostsFor(deps.policy, secretName), parsed.inBand, !!deps.allowUnboundSecrets);
+        const binding = bindingFor(deps, secretName, parsed.inBand);
         if (!sendBindingError(res, binding)) return;
         issueTicket(res, deps, `${secretName}:${field}`, String(fieldValue), binding.allowedHosts);
       } else {
         // Simple secret — field param is ignored
-        const binding = resolveBinding(secretName, policyHostsFor(deps.policy, secretName), parsed.inBand, !!deps.allowUnboundSecrets);
+        const binding = bindingFor(deps, secretName, parsed.inBand);
         if (!sendBindingError(res, binding)) return;
         issueTicket(res, deps, secretName, parsed.value, binding.allowedHosts);
       }
@@ -208,13 +208,18 @@ function issueTicket(
   deps: VaultDeps,
   label: string,
   value: string,
-  allowedHosts: Parameters<typeof allowedHostsJson>[0],
+  allowedHosts: readonly HostPattern[] | undefined,
   via?: string,
 ): void {
   const token = deps.tokenStore.issue(label, value, { allowedHosts });
   console.log(`[issue] secret=${label} ttl_s=${token.ttlSeconds}${allowedHosts ? '' : ' unbound=1'}${via ? ` via=${via}` : ''}`);
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds, allowed_hosts: allowedHostsJson(allowedHosts) }));
+}
+
+/** A per-agent secret's binding: its policy rule intersected with its in-band hosts. */
+function bindingFor(deps: VaultDeps, secretName: string, inBand: InBandHosts): Binding {
+  return resolveBinding(secretName, policyHostsFor(deps.policy, secretName), inBand, !!deps.allowUnboundSecrets);
 }
 
 /** Answer a refused binding. Returns true (and sends nothing) when the binding is ok. */
@@ -325,7 +330,7 @@ function handleMintTokens(
     }
 
     // Snapshot the login's hosts now; the CDP path enforces them from roadmap item 15.
-    const binding = resolveBinding(secretName, policyHostsFor(deps.policy, secretName), secretValue.inBand, !!deps.allowUnboundSecrets);
+    const binding = bindingFor(deps, secretName, secretValue.inBand);
     if (!sendBindingError(res, binding)) return;
     const opts = { sessionId, ttlSeconds: ttl, allowedHosts: binding.allowedHosts };
     const usernameToken = tokenStore.issue(`${secretName}:username`, username, opts);
@@ -374,14 +379,13 @@ async function handleOAuthRefresh(
   }
   const raw = secret.value;
 
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
+  const secretValue = parseSecretValue(raw);
+  if (secretValue.kind !== 'multi') {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Secret is not a multi-value JSON secret' }));
     return;
   }
+  const parsed = secretValue.fields;
 
   const refreshToken = parsed.refresh_token as string | undefined;
   const tokenUrl = parsed.token_url as string | undefined;
@@ -398,7 +402,7 @@ async function handleOAuthRefresh(
 
   // client_secret is sent to token_url, so its host must be one the secret is
   // bound to; the refreshed access-token ticket inherits the same binding.
-  const binding = resolveBinding(secretName, policyHostsFor(deps.policy, secretName), parseSecretValue(raw).inBand, !!deps.allowUnboundSecrets);
+  const binding = bindingFor(deps, secretName, secretValue.inBand);
   if (!sendBindingError(res, binding)) return;
   let tokenHost: URL | null = null;
   try {
@@ -429,6 +433,8 @@ async function handleOAuthRefresh(
 
   const tokenRes = await fetch(tokenUrl, {
     method: 'POST',
+    // A 307/308 would re-POST client_secret to a host the check above never saw.
+    redirect: 'error',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
   });

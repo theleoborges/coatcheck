@@ -691,6 +691,22 @@ describe('coatcheck server: plain HTTP', () => {
     expect(JSON.stringify(upstream.received)).not.toContain('real-value');
   });
 
+  it('percent-encodes unsafe characters in a swapped path and survives invalid header values', async () => {
+    captureLogs();
+    const upstream = await startHttpUpstream();
+    const { tokenStore, port } = await startProxy();
+    const allowedHosts = hosts('http://127.0.0.1');
+    const spaced = tokenStore.issue('k', 'real value é', { allowedHosts }).id;
+    const ok = await viaProxy(port, `http://127.0.0.1:${upstream.port}/p?k=${spaced}`);
+    expect(ok.status).toBe(200);
+    expect(upstream.received[0].url).toBe('/p?k=real%20value%20%C3%A9');
+
+    // A real value Node refuses in a header must not throw out of the request handler.
+    const crlf = tokenStore.issue('h', 'bad\r\nx-injected: 1', { allowedHosts }).id;
+    expect((await viaProxy(port, `http://127.0.0.1:${upstream.port}/`, { 'x-key': crlf })).status).toBe(502);
+    expect((await fetch(`http://127.0.0.1:${port}/_health`)).status).toBe(200);
+  });
+
   it('rejects non-http absolute URLs with 400', async () => {
     const { port } = await startProxy();
     expect((await viaProxy(port, 'https://api.example.com/')).status).toBe(400);

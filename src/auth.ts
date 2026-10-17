@@ -63,8 +63,17 @@ export function sendUnauthorized(res: http.ServerResponse): void {
   res.end(JSON.stringify({ error: 'Missing or invalid API token (Authorization: Bearer <COATCHECK_API_TOKEN>)' }));
 }
 
+/** 407 for an absolute-form (forward proxy) request. */
+export function sendProxyAuthRequired(res: http.ServerResponse): void {
+  res.writeHead(407, { 'Proxy-Authenticate': PROXY_AUTHENTICATE, 'Content-Length': '0' });
+  res.end();
+}
+
+const PROXY_AUTHENTICATE = 'Basic realm="coatcheck"';
+
+/** Raw 407 for a `CONNECT` (written to the socket; there is no ServerResponse). */
 export const PROXY_AUTH_REQUIRED =
   'HTTP/1.1 407 Proxy Authentication Required\r\n' +
-  'Proxy-Authenticate: Basic realm="coatcheck"\r\n' +
+  `Proxy-Authenticate: ${PROXY_AUTHENTICATE}\r\n` +
   'Content-Length: 0\r\n' +
   'Connection: close\r\n\r\n';

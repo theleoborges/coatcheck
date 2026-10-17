@@ -52,7 +52,9 @@ export function handleForwardRequest(
 
   // Only the path and query: a ticket in the host or userinfo is left as a
   // literal, so swapping can never change where the request goes.
-  const path = swap(parsed.pathname + parsed.search);
+  // A real value may hold characters Node refuses in a request path (space,
+  // non-ASCII), so percent-encode those after the swap.
+  const path = percentEncodeUnsafe(swap(parsed.pathname + parsed.search));
   const headers: http.OutgoingHttpHeaders = {};
   for (const [key, value] of Object.entries(stripHopByHop(req.headers))) {
     if (typeof value === 'string') headers[key] = swap(value);
@@ -68,16 +70,28 @@ export function handleForwardRequest(
     return;
   }
 
-  const proxyReq = http.request({
-    hostname,
-    port: parsed.port || 80,
-    path,
-    method: req.method,
-    headers,
-  }, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
-    proxyRes.pipe(res);
-  });
+  let proxyReq: http.ClientRequest;
+  try {
+    proxyReq = http.request({
+      // WHATWG keeps IPv6 brackets in `hostname`; the dialler needs the bare address.
+      hostname: hostname.replace(/^\[(.*)\]$/, '$1'),
+      port: parsed.port || 80,
+      path,
+      method: req.method,
+      headers,
+    }, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+  } catch (err) {
+    // http.request throws synchronously on invalid header values (e.g. a real
+    // value with CR/LF); an uncaught throw here would take the process down.
+    console.error('HTTP proxy request rejected:', (err as NodeJS.ErrnoException).code ?? 'unknown');
+    req.resume();
+    res.writeHead(502);
+    res.end('Proxy error');
+    return;
+  }
 
   proxyReq.on('error', (err) => {
     console.error('HTTP proxy error:', err.message);
@@ -86,6 +100,13 @@ export function handleForwardRequest(
   });
 
   req.pipe(proxyReq);
+}
+
+/** Percent-encode control, space and non-ASCII characters (UTF-8), leaving everything else as is. */
+function percentEncodeUnsafe(path: string): string {
+  // eslint-disable-next-line no-control-regex -- matching control characters is the point
+  return path.replace(/[\u0000-\u0020\u007f-\uffff]+/g, run =>
+    [...Buffer.from(run, 'utf8')].map(b => `%${b.toString(16).toUpperCase().padStart(2, '0')}`).join(''));
 }
 
 function stripHopByHop(headers: http.IncomingHttpHeaders): http.IncomingHttpHeaders {
