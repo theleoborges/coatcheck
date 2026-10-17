@@ -2,9 +2,8 @@ import { WebSocketServer, WebSocket } from 'ws';
 import type { AddressInfo } from 'node:net';
 import type { TokenStore } from '../token-store.js';
 import type { CdpSessionStore, CdpController, LoginRequest, LoginResult } from '../cdp-session-store.js';
-import { substituteOutbound, substituteInbound } from './substitution.js';
+import { substituteInbound } from './substitution.js';
 import { OriginTracker } from './origin-tracker.js';
-import { KeystrokeDetector } from './keystroke-detector.js';
 import { runLogin } from './login-driver.js';
 
 const DEFAULT_PORT = 8444;
@@ -90,8 +89,7 @@ export class CdpConnection implements CdpController {
   private readonly agentQueue: Array<{ payload: string | Buffer; isBinary: boolean }> = [];
   private loginInProgress = false;
 
-  // --- legacy v1 substitution helpers (removed in a later commit) ---
-  private readonly detector = new KeystrokeDetector();
+  /** Committed main-frame origin per flattened session (login origin check + page selection). */
   readonly origins = new OriginTracker();
 
   private upstreamOpen = false;
@@ -132,39 +130,11 @@ export class CdpConnection implements CdpController {
 
     if (this.queueing) { this.enqueue(data, false); return; }
 
+    // No outbound substitution: since broker-performed login, no credential
+    // ticket is ever sent into the browser. We only track per-connection state
+    // (for the login window) and relay the frame unchanged.
     this.trackOutbound(raw);
-
-    // --- legacy v1 outbound substitution (removed in a later commit) ---
-    if (raw.indexOf('Input.dispatchKeyEvent') !== -1 || raw.indexOf('\\') !== -1) {
-      const text = extractKeyEventText(raw);
-      if (text !== null) {
-        const matched = this.detector.inspect(text, this.tokenStore.sessionTokenIds(this.sid));
-        if (matched) {
-          const { id, sessionId } = extractFrameRouting(raw);
-          console.warn(`[cdp] sid=${this.sid} FAIL-CLOSED: page.type() detected on a vault token`);
-          sendCdpError(this.clientWs, id, 'credential-flow violation: page.type() detected on a vault token; use page.fill() instead', sessionId);
-          return;
-        }
-        this.forwardUpstream(data, false);
-        return;
-      }
-    }
-
-    const result = substituteOutbound(raw, this.tokenStore, this.sid, cdpSessionId => this.origins.originFor(cdpSessionId));
-    if (result.denial) {
-      const { id, sessionId, secretNames, message } = result.denial;
-      console.warn(`[cdp] sid=${this.sid} FAIL-CLOSED: origin binding refused Input.insertText secrets=${secretNames.join(',')}`);
-      sendCdpError(this.clientWs, id, message, sessionId);
-      return;
-    }
-    if (result.unsupportedTokenMethod) {
-      const log = result.unsupportedTokenMethod.startsWith('Runtime.') ? console.log : console.warn;
-      log(`[cdp] sid=${this.sid} token observed in ${result.unsupportedTokenMethod} (not substituted)`);
-    }
-    if (result.substitutions > 0) {
-      console.log(`[cdp] sid=${this.sid} outbound substitutions=${result.substitutions}`);
-    }
-    this.forwardUpstream(result.payload, false);
+    this.forwardUpstream(data, false);
   }
 
   /** Track the per-connection state needed for a login window. Pure bookkeeping. */
@@ -537,18 +507,6 @@ function extractId(raw: string): number | string | undefined {
   const parsed = parseJson(raw);
   const id = parsed?.id;
   return typeof id === 'number' || typeof id === 'string' ? id : undefined;
-}
-
-function extractKeyEventText(raw: string): string | null {
-  try {
-    const parsed = JSON.parse(raw) as { method?: string; params?: { text?: unknown } };
-    if (parsed.method === 'Input.dispatchKeyEvent' && typeof parsed.params?.text === 'string') {
-      return parsed.params.text;
-    }
-  } catch {
-    /* ignore */
-  }
-  return null;
 }
 
 function parseJson(raw: string): Record<string, unknown> | null {

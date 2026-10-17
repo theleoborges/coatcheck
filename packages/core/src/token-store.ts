@@ -24,12 +24,6 @@ interface TokenEntry {
   realValue: string;
   createdAt: number;
   expiresAt: number;
-  /**
-   * When set, the token only substitutes on traffic for this CDP session
-   * (see replaceAllForSession). Unscoped tokens (sessionId undefined) keep the
-   * agent-wide behaviour used by the HTTP/platform paths.
-   */
-  sessionId?: string;
   /** Hosts this ticket may be swapped for, snapshotted at mint. Undefined = unbound. */
   allowedHosts?: readonly HostPattern[];
   /** Also swapped in request bodies (opt-in per secret), snapshotted at mint. */
@@ -41,8 +35,6 @@ export interface IssueOptions {
   ttlSeconds?: number;
   /** Hosts the ticket may be swapped for. Omit only for an unbound ticket (`COATCHECK_ALLOW_UNBOUND_SECRETS`). */
   allowedHosts?: readonly HostPattern[];
-  /** Bind to a CDP session: substitutes only on that session's frames, revoked when it closes. */
-  sessionId?: string;
   /** Also substitute in HTTP(S) request bodies (see replaceAllInBody). Default false. */
   swapBody?: boolean;
 }
@@ -123,10 +115,7 @@ export class TokenStore {
     this.cleanupTimer.unref();
   }
 
-  /**
-   * Issue a ticket for a secret. With `sessionId` the ticket only substitutes on
-   * that CDP session's traffic (replaceAllForSession) and never on HTTP(S).
-   */
+  /** Issue an HTTP(S) ticket for a secret, swapped on the wire for `target` hosts. */
   issue(secretName: string, realValue: string, opts: IssueOptions = {}): IssuedToken {
     const ttlSeconds = opts.ttlSeconds ?? this.defaultTtlSeconds;
     const id = TICKET_PREFIX + randomBytes(32).toString('hex');
@@ -138,7 +127,6 @@ export class TokenStore {
       realValue,
       createdAt: now,
       expiresAt: now + ttlSeconds * 1000,
-      sessionId: opts.sessionId,
       allowedHosts: opts.allowedHosts,
       swapBody: opts.swapBody ?? false,
     });
@@ -192,9 +180,6 @@ export class TokenStore {
     const now = Date.now();
 
     for (const [tokenId, entry] of this.ticketsIn(input, now)) {
-      // Session-scoped tokens (CDP credential injection) must never substitute
-      // on the agent-wide HTTP/TLS path — they only resolve inside their WS session.
-      if (entry.sessionId !== undefined) continue;
       const info: SwapInfo = { secretName: entry.secretName, ageMs: now - entry.createdAt };
       if (body && !entry.swapBody) {
         skipped.push(info);
@@ -241,7 +226,7 @@ export class TokenStore {
     const now = Date.now();
     for (const entry of this.tokens.values()) {
       if (swapBodyOnly && !entry.swapBody) continue;
-      if (now > entry.expiresAt || entry.sessionId !== undefined) continue;
+      if (now > entry.expiresAt) continue;
       if (entry.allowedHosts === undefined || matchesHost(entry.allowedHosts, target)) return true;
     }
     return false;
@@ -268,58 +253,13 @@ export class TokenStore {
   }
 
   /**
-   * Like replaceAll, but only substitutes tokens minted for the given CDP
-   * session, for a page at `origin` (the session's committed main-frame
-   * origin, or null when unknown). Used on the CDP proxy's outbound leg.
-   * A ticket bound to other hosts, or any ticket while the origin is unknown,
-   * is reported in `denied` and nothing is swapped. Unbound session tickets
-   * swap on any known origin.
-   */
-  replaceAllForSession(input: string, sessionId: string, origin: MatchTarget | null): SwapResult {
-    const swaps: SwapInfo[] = [];
-    const denied: SwapInfo[] = [];
-    const replacements = new Map<string, string>();
-    const now = Date.now();
-
-    for (const [tokenId, entry] of this.ticketsIn(input, now)) {
-      if (entry.sessionId !== sessionId) continue;
-      const info: SwapInfo = { secretName: entry.secretName, ageMs: now - entry.createdAt };
-      if (origin === null) {
-        denied.push(info);
-        continue;
-      }
-      if (entry.allowedHosts === undefined) {
-        info.unbound = true;
-      } else if (!matchesHost(entry.allowedHosts, origin)) {
-        denied.push(info);
-        continue;
-      }
-      replacements.set(tokenId, entry.realValue);
-      swaps.push(info);
-    }
-
-    if (denied.length > 0) return { output: input, swaps: [], denied };
-    return { output: substitute(input, replacements), swaps, denied };
-  }
-
-  /**
-   * Active (non-expired) real values for a session, for the CDP proxy's inbound
-   * leg: the byte-level pre-scan / drop-frame floor and the echo-back redactor.
+   * Real values registered for a CDP session's inbound redaction set, for the
+   * proxy's inbound leg (the byte-level drop-frame floor and the echo-back
+   * redactor). Populated by `registerSessionValues` during a broker-performed
+   * login; dropped by `revokeSession` at teardown.
    */
   sessionValues(sessionId: string): SessionValue[] {
-    const out: SessionValue[] = [];
-    const now = Date.now();
-    for (const [tokenId, entry] of this.tokens) {
-      if (now > entry.expiresAt) {
-        this.tokens.delete(tokenId);
-        continue;
-      }
-      if (entry.sessionId !== sessionId) continue;
-      out.push({ value: entry.realValue, secretName: entry.secretName });
-    }
-    const registered = this.sessionValueSets.get(sessionId);
-    if (registered) out.push(...registered);
-    return out;
+    return this.sessionValueSets.get(sessionId) ? [...this.sessionValueSets.get(sessionId)!] : [];
   }
 
   /**
@@ -334,32 +274,14 @@ export class TokenStore {
     this.sessionValueSets.set(sessionId, [...existing, ...nonEmpty]);
   }
 
-  /** Active token ids minted for a session, for the keystroke fail-closed detector. */
-  sessionTokenIds(sessionId: string): string[] {
-    const out: string[] = [];
-    const now = Date.now();
-    for (const [tokenId, entry] of this.tokens) {
-      if (now > entry.expiresAt) {
-        this.tokens.delete(tokenId);
-        continue;
-      }
-      if (entry.sessionId !== sessionId) continue;
-      out.push(tokenId);
-    }
-    return out;
-  }
-
-  /** Evict every token minted for a session. Called when its WS connection closes. */
+  /**
+   * Drop a CDP session's registered redaction values. Called when its WS
+   * connection closes. Returns the number of values dropped (for the log).
+   */
   revokeSession(sessionId: string): number {
-    let revoked = 0;
-    for (const [tokenId, entry] of this.tokens) {
-      if (entry.sessionId === sessionId) {
-        this.tokens.delete(tokenId);
-        revoked++;
-      }
-    }
+    const dropped = this.sessionValueSets.get(sessionId)?.length ?? 0;
     this.sessionValueSets.delete(sessionId);
-    return revoked;
+    return dropped;
   }
 
   /** Number of active (non-expired) tokens */

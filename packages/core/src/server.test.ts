@@ -541,7 +541,6 @@ describe('coatcheck server: MITM policy', () => {
     const upstream = await startHttpsUpstream();
     const { tokenStore, port } = await startProxy();
     tokenStore.issue('github-token', 'v', { allowedHosts: hosts('api.github.com') });
-    tokenStore.issue('login:password', 'v', { sessionId: 'sid' }); // CDP tickets never swap on HTTPS
     expect(await issuerSeen(port, upstream.port)).toBe('upstream');
   });
 

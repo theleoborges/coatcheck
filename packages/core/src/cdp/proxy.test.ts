@@ -4,9 +4,6 @@ import type { AddressInfo } from 'node:net';
 import { TokenStore } from '../token-store.js';
 import { CdpSessionStore } from '../cdp-session-store.js';
 import { startCdpProxy, type CdpProxyHandle } from './proxy.js';
-import { parseHostPattern, type HostPattern } from '../host-matcher.js';
-
-const hosts = (...entries: string[]) => entries.map(e => parseHostPattern(e) as HostPattern);
 
 function once<T = unknown>(emitter: { once(event: string, cb: (...a: unknown[]) => void): unknown }, event: string): Promise<T> {
   return new Promise(resolve => emitter.once(event, (...args: unknown[]) => resolve(args[0] as T)));
@@ -77,87 +74,29 @@ describe('CDP proxy', () => {
     expect(code).toBe(1008);
   });
 
-  /** The browser reports a committed main-frame navigation on flattened session T1. */
-  async function navigated(url: string, sessionId = 'T1') {
-    upstream.pushToClient(JSON.stringify({ method: 'Page.frameNavigated', sessionId, params: { frame: { id: 'F1', url } } }));
-    await once(client, 'message');
-  }
-
-  it('substitutes an outbound token (page.fill) on an allowed origin before it reaches upstream', async () => {
-    const sid = await setup();
-    const tok = tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid, allowedHosts: hosts('login.example.com') }).id;
-    await navigated('https://login.example.com/signin');
-
-    client.send(JSON.stringify({ id: 1, sessionId: 'T1', method: 'Input.insertText', params: { text: tok } }));
+  // Since broker login, an outbound credential ticket in a CDP frame is never
+  // substituted: coatcheck fills the form itself. A frame carrying a ticket-like
+  // string is relayed unchanged (there are no session tickets to resolve).
+  it('relays an outbound Input.insertText unchanged (no outbound substitution)', async () => {
+    await setup();
+    client.send(JSON.stringify({ id: 1, sessionId: 'T1', method: 'Input.insertText', params: { text: 'cct_notreal' } }));
     await new Promise(r => setTimeout(r, 50));
-
     expect(upstream.received).toHaveLength(1);
-    expect(JSON.parse(upstream.received[0]).params.text).toBe('real-secret-42');
+    expect(JSON.parse(upstream.received[0]).params.text).toBe('cct_notreal');
   });
 
-  // Attack (roadmap item 15): fill a login ticket into a page on another origin.
-  it('refuses a fill on another origin: nothing reaches upstream, the caller gets a CDP error', async () => {
+  it('closes with a client still connected, dropping its session redaction values', async () => {
     const sid = await setup();
-    const tok = tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid, allowedHosts: hosts('login.example.com') }).id;
-    await navigated('https://attacker.example/fake-login');
-
-    const errP = once<Buffer>(client, 'message');
-    client.send(JSON.stringify({ id: 9, sessionId: 'T1', method: 'Input.insertText', params: { text: tok } }));
-    const err = JSON.parse((await errP).toString());
-    expect(err).toEqual({
-      id: 9,
-      sessionId: 'T1',
-      error: { code: -32000, message: 'credential-origin violation: site:password not allowed on https://attacker.example' },
-    });
-    await new Promise(r => setTimeout(r, 50));
-    expect(upstream.received).toHaveLength(0);
-  });
-
-  it('refuses a fill when no navigation was seen, and during a navigation', async () => {
-    const sid = await setup();
-    const tok = tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid, allowedHosts: hosts('login.example.com') }).id;
-
-    let errP = once<Buffer>(client, 'message');
-    client.send(JSON.stringify({ id: 1, sessionId: 'T1', method: 'Input.insertText', params: { text: tok } }));
-    expect(JSON.parse((await errP).toString()).error.message).toContain('page origin unknown');
-
-    // On the login page, the agent starts navigating away and fills immediately.
-    await navigated('https://login.example.com/signin');
-    client.send(JSON.stringify({ id: 2, sessionId: 'T1', method: 'Page.navigate', params: { url: 'https://attacker.example/' } }));
-    errP = once<Buffer>(client, 'message');
-    client.send(JSON.stringify({ id: 3, sessionId: 'T1', method: 'Input.insertText', params: { text: tok } }));
-    expect(JSON.parse((await errP).toString()).error.message).toContain('a navigation is in progress');
-
-    await new Promise(r => setTimeout(r, 50));
-    expect(upstream.received.map(f => JSON.parse(f).method)).toEqual(['Page.navigate']);
-    expect(upstream.received.join('')).not.toContain('real-secret-42');
-  });
-
-  // Attack: hide Page.navigate from the substring pre-filter with a JSON escape.
-  it('treats a JSON-escaped Page.navigate as a navigation', async () => {
-    const sid = await setup();
-    const tok = tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid, allowedHosts: hosts('login.example.com') }).id;
-    await navigated('https://login.example.com/signin');
-    client.send('{"id":2,"sessionId":"T1","method":"Page\\u002enavigate","params":{"url":"https://attacker.example/"}}');
-    const errP = once<Buffer>(client, 'message');
-    client.send(JSON.stringify({ id: 3, sessionId: 'T1', method: 'Input.insertText', params: { text: tok } }));
-    expect(JSON.parse((await errP).toString()).error.message).toContain('a navigation is in progress');
-    await new Promise(r => setTimeout(r, 50));
-    expect(upstream.received.join('')).not.toContain('real-secret-42');
-  });
-
-  it('closes with a client still connected, revoking its session tokens', async () => {
-    const sid = await setup();
-    tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid });
+    tokenStore.registerSessionValues(sid, [{ value: 'real-secret-42', secretName: 'site:password' }]);
     await proxy.close();
     await new Promise(r => setTimeout(r, 50));
     expect(tokenStore.sessionValues(sid)).toHaveLength(0);
     expect(cdpSessionStore.has(sid)).toBe(false);
   });
 
-  it('redacts an inbound echo-back of the real value', async () => {
+  it('redacts an inbound echo-back of a registered real value', async () => {
     const sid = await setup();
-    tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid });
+    tokenStore.registerSessionValues(sid, [{ value: 'real-secret-42', secretName: 'site:password' }]);
 
     const msgP = once<Buffer>(client, 'message');
     upstream.pushToClient(JSON.stringify({ id: 2, result: { value: 'real-secret-42' } }));
@@ -165,9 +104,21 @@ describe('CDP proxy', () => {
     expect(JSON.parse(msg.toString()).result.value).toBe('[REDACTED:site:password]');
   });
 
+  it('redacts a percent-encoded echo-back (browser-applied encoding)', async () => {
+    const sid = await setup();
+    tokenStore.registerSessionValues(sid, [{ value: 'p@ss word/42', secretName: 'site:password' }]);
+
+    const msgP = once<Buffer>(client, 'message');
+    // A form POST body the browser reports back carries the value percent-encoded.
+    upstream.pushToClient(JSON.stringify({ method: 'Network.requestWillBeSent', params: { request: { postData: `pw=${encodeURIComponent('p@ss word/42')}` } } }));
+    const msg = await msgP;
+    expect(msg.toString()).not.toContain('p%40ss');
+    expect(msg.toString()).toContain('[REDACTED:site:password]');
+  });
+
   it('drops an inbound frame that carries the real value unparseably', async () => {
     const sid = await setup();
-    tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid });
+    tokenStore.registerSessionValues(sid, [{ value: 'real-secret-42', secretName: 'site:password' }]);
 
     const msgP = once<Buffer>(client, 'message');
     upstream.pushToClient('GARBAGE real-secret-42 GARBAGE'); // should be dropped
@@ -176,29 +127,9 @@ describe('CDP proxy', () => {
     expect(JSON.parse(msg.toString()).sentinel).toBe(true);
   });
 
-  it('fails closed when page.type() spells a token, and never forwards the completing keystroke', async () => {
+  it('drops a session\'s redaction values when the client disconnects', async () => {
     const sid = await setup();
-    const tok = tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid }).id;
-
-    const errP = once<Buffer>(client, 'message');
-    for (const ch of tok) {
-      client.send(JSON.stringify({ id: 99, method: 'Input.dispatchKeyEvent', params: { text: ch } }));
-    }
-    const err = await errP;
-    const parsed = JSON.parse(err.toString());
-    expect(parsed.error.code).toBe(-32000);
-    expect(parsed.error.message).toContain('page.fill()');
-
-    await new Promise(r => setTimeout(r, 50));
-    // The completing keystroke was dropped: upstream saw fewer frames than chars typed.
-    expect(upstream.received.length).toBeLessThan(tok.length);
-    // and the real value never reached upstream
-    expect(upstream.received.join('')).not.toContain('real-secret-42');
-  });
-
-  it('revokes session tokens when the client disconnects', async () => {
-    const sid = await setup();
-    tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid });
+    tokenStore.registerSessionValues(sid, [{ value: 'real-secret-42', secretName: 'site:password' }]);
     expect(tokenStore.sessionValues(sid)).toHaveLength(1);
 
     client.close();

@@ -17,8 +17,8 @@ export interface VaultDeps {
   policy: Policy;
   /** `COATCHECK_ALLOW_UNBOUND_SECRETS`: mint unbound tickets instead of refusing with 403. */
   allowUnboundSecrets?: boolean;
-  /** Live CDP sessions: `mint-tokens` / `login` refuse an unknown, expired or closed sid with 404. */
-  cdpSessionStore: Pick<CdpSessionStore, 'has' | 'controller'>;
+  /** Live CDP sessions: `login` refuses a session with no attached controller with 404. */
+  cdpSessionStore: Pick<CdpSessionStore, 'controller'>;
 }
 
 /**
@@ -165,21 +165,6 @@ export function handleVaultRequest(
     return true;
   }
 
-  // Mint session-scoped credential tokens for a web login (CDP injection).
-  // The credential is an ordinary multi-value secret (short handle like `example-login`,
-  // since vault names can't be FQDNs) with `username` and `password` fields.
-  // Tokens are bound to the agent's CDP session so they only resolve on that
-  // session's WebSocket frames.
-  if (url === '/_vault/mint-tokens' && req.method === 'POST') {
-    readJsonBody(req).then(body => {
-      handleMintTokens(body, res, deps);
-    }).catch(() => {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Invalid JSON body' }));
-    });
-    return true;
-  }
-
   // Broker-performed browser login (CDP injection). coatcheck fills and submits
   // the login form itself over the agent's CDP connection; no credential ticket
   // ever enters the browser. Replaces mint-tokens.
@@ -298,92 +283,6 @@ function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown
       }
     });
     req.on('error', reject);
-  });
-}
-
-const MINT_DEFAULT_TTL_SECONDS = 600; // 10 minutes
-const MINT_MAX_TTL_SECONDS = 1800; // 30 minutes — cap to bound credential exposure
-
-/**
- * Mint session-scoped username/password tokens for a stored web login.
- *
- * The credential is a normal multi-value secret (vault names are alphanumeric +
- * dashes, so it's a short handle like `example-login`, NOT a domain) with `username` +
- * `password` fields. The user tells the agent which secret to use. Tokens are
- * bound to the caller's CDP session id so they only substitute on that session's
- * frames and are revoked when the session closes.
- */
-function handleMintTokens(
-  body: Record<string, unknown>,
-  res: http.ServerResponse,
-  deps: VaultDeps,
-): void {
-  const { tokenStore, provider } = deps;
-  const secretName = typeof body.secretName === 'string' ? body.secretName : '';
-  const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
-
-  if (!secretName || !sessionId) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Both `secretName` and `sessionId` are required' }));
-    return;
-  }
-  if (!isValidSecretName(secretName)) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Invalid secret name' }));
-    return;
-  }
-  // Only sessions coatcheck created (via an adapter rewrite) and that are still
-  // live can take credentials; checked before the provider is consulted.
-  if (!deps.cdpSessionStore.has(sessionId)) {
-    console.warn(`[mint] secret=${secretName} rejected: unknown or expired CDP session`);
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Unknown or expired CDP session' }));
-    return;
-  }
-
-  let ttl = MINT_DEFAULT_TTL_SECONDS;
-  if (typeof body.expires_in === 'number' && body.expires_in > 0) {
-    ttl = Math.min(body.expires_in, MINT_MAX_TTL_SECONDS);
-  }
-
-  provider.secrets.get(secretName).then(secret => {
-    if (secret === null) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        error: `No credential stored under '${secretName}'`,
-        ...vaultUrlHint(deps),
-      }));
-      return;
-    }
-
-    const secretValue = parseSecretValue(secret.value);
-    const parsed = secretValue.kind === 'multi' ? secretValue.fields : null;
-    const username = parsed?.username;
-    const password = parsed?.password;
-    if (!parsed || typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        error: `Secret '${secretName}' is not a web login — it must be a multi-value secret with 'username' and 'password' fields`,
-      }));
-      return;
-    }
-
-    // Snapshot the login's hosts now; the CDP path enforces them from roadmap item 15.
-    const binding = bindingFor(deps, secretName, secretValue.inBand);
-    if (!sendBindingError(res, binding)) return;
-    const opts = { sessionId, ttlSeconds: ttl, allowedHosts: binding.allowedHosts };
-    const usernameToken = tokenStore.issue(`${secretName}:username`, username, opts);
-    const passwordToken = tokenStore.issue(`${secretName}:password`, password, opts);
-    console.log(`[mint] secret=${secretName} session=${sessionId} ttl_s=${ttl}${binding.allowedHosts ? '' : ' unbound=1'}`);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      username_token: usernameToken.id,
-      password_token: passwordToken.id,
-      expires_in: ttl,
-      allowed_hosts: allowedHostsJson(binding.allowedHosts),
-    }));
-  }).catch(err => {
-    sendProviderError(res, err, `Error minting tokens for '${secretName}':`, 'Failed to mint tokens');
   });
 }
 

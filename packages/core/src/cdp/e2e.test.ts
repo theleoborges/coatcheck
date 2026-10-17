@@ -1,15 +1,18 @@
 /**
- * End-to-end CDP injection (roadmap item 15): a real Chromium, driven by
- * Playwright through coatcheck's CDP proxy. Two hostnames resolve to one
- * local HTTP server; login tickets are bound to `http://login.test` only.
+ * End-to-end broker-performed login (roadmap item 20): a real Chromium, driven
+ * by Playwright through coatcheck's CDP proxy. The agent calls the login
+ * controller (what `POST /_vault/{name}/login` invokes); coatcheck fills and
+ * submits the form itself over the CDP connection. No credential ticket ever
+ * enters the browser. Two hostnames resolve to one local HTTP server; the login
+ * is bound to `http://login.test` only.
  */
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
 import net, { type AddressInfo } from 'node:net';
 import { chromium, type Browser } from 'playwright';
 import { TokenStore } from '../token-store.js';
-import { CdpSessionStore } from '../cdp-session-store.js';
-import { startCdpProxy, type CdpProxyHandle } from './proxy.js';
+import { CdpSessionStore, type LoginRequest } from '../cdp-session-store.js';
+import { startCdpProxy, type CdpProxyHandle, type CdpConnection } from './proxy.js';
 import { parseHostPattern, type HostPattern } from '../host-matcher.js';
 
 const REAL = { user: 'alice', email: 'alice@example.com', pass: 'hunter2-real-pw' };
@@ -55,10 +58,6 @@ function freePort(): Promise<number> {
   });
 }
 
-/**
- * Launch Chromium (Playwright's build and flags) with an extra CDP port, and
- * return its browser WebSocket URL: the "remote browser" behind coatcheck.
- */
 async function launchChrome(): Promise<string> {
   const cdpPort = await freePort();
   launched = await chromium.launch({
@@ -74,9 +73,13 @@ beforeAll(async () => {
   tokenStore = new TokenStore();
   cdpSessionStore = new CdpSessionStore();
   proxy = await startCdpProxy({ tokenStore, cdpSessionStore, port: 0, bindHost: '127.0.0.1' });
-  // As a browser adapter would after rewriting a session-create response.
-  (globalThis as { __sid?: string }).__sid = cdpSessionStore.register(browserWsUrl, 'test');
+  (globalThis as { __wsUrl?: string }).__wsUrl = browserWsUrl;
 }, 30_000);
+
+/** A fresh sid for one test (the proxy revokes a sid when its connection closes). */
+function newSid(): string {
+  return cdpSessionStore.register((globalThis as { __wsUrl?: string }).__wsUrl!, 'test');
+}
 
 afterAll(async () => {
   await proxy?.close();
@@ -86,52 +89,60 @@ afterAll(async () => {
   server?.close();
 });
 
-describe('CDP injection e2e (Playwright + Chromium)', () => {
-  it('page.fill substitutes on the allowed origin and is refused on another origin', async () => {
-    const sid = (globalThis as { __sid?: string }).__sid!;
-    const allowedHosts = [parseHostPattern('http://login.test') as HostPattern];
-    const opts = { sessionId: sid, allowedHosts };
-    const tickets = {
-      user: tokenStore.issue('example-login:user', REAL.user, opts).id,
-      email: tokenStore.issue('example-login:email', REAL.email, opts).id,
-      pass: tokenStore.issue('example-login:password', REAL.pass, opts).id,
-    };
+const loginHosts = (...h: string[]) => h.map(x => parseHostPattern(x) as HostPattern);
 
+/** The login request the vault handler would build for the test credential. */
+function loginReq(over: Partial<LoginRequest> = {}): LoginRequest {
+  return {
+    fields: { user: '#user', email: '#email', password: '#pass' },
+    values: { user: REAL.user, email: REAL.email, password: REAL.pass },
+    cleartextFields: [],
+    secretName: 'example-login',
+    allowedHosts: loginHosts('http://login.test'),
+    submit: { selector: '#go' },
+    until: { kind: 'navigation' },
+    timeoutMs: 8000,
+    ...over,
+  };
+}
+
+describe('broker-performed login e2e (Playwright + Chromium)', () => {
+  it('fills and submits a full-page login on the allowed origin; the agent never sends the values', async () => {
+    const sid = newSid();
     const browser: Browser = await chromium.connectOverCDP(`ws://127.0.0.1:${proxy.port}/cdp/${sid}`);
     try {
       const context = browser.contexts()[0] ?? await browser.newContext();
       const page = await context.newPage();
-
-      // Allowed origin: text, email and password inputs all receive the real value.
       await page.goto(`http://login.test:${httpPort}/`);
-      await page.fill('#user', tickets.user);
-      await page.fill('#email', tickets.email);
-      await page.fill('#pass', tickets.pass);
-      await Promise.all([page.waitForSelector('#done'), page.click('#go')]);
-      const login = received.find(r => r.host === 'login.test' && r.body !== '');
-      expect(new URLSearchParams(login!.body)).toEqual(new URLSearchParams(REAL));
+      await new Promise(r => setTimeout(r, 200)); // let attach/frameNavigated settle
 
-      // Attack: same tickets, page on another origin. The fill is refused and
-      // the site never sees the real value.
+      const conn = cdpSessionStore.controller(sid) as unknown as CdpConnection;
+      tokenStore.registerSessionValues(sid, [{ value: REAL.pass, secretName: 'example-login:password' }]);
+      const result = await conn.login(loginReq());
+
+      expect(result.status).toBe(200);
+      const login = received.find(r => r.host === 'login.test' && r.body !== '');
+      expect(login).toBeDefined();
+      expect(new URLSearchParams(login!.body)).toEqual(new URLSearchParams(REAL));
+    } finally {
+      await browser.close();
+    }
+  }, 60_000);
+
+  it('refuses a login on a disallowed origin (403); the site never receives the real password', async () => {
+    const sid = newSid();
+    const browser: Browser = await chromium.connectOverCDP(`ws://127.0.0.1:${proxy.port}/cdp/${sid}`);
+    try {
+      const context = browser.contexts()[0] ?? await browser.newContext();
+      const page = await context.newPage();
       await page.goto(`http://evil.test:${httpPort}/`);
-      // Playwright retries any CDP error that isn't a JavaScript or session-closed
-      // error, so every retry is refused until the action times out.
-      const warn = vi.spyOn(console, 'warn');
-      try {
-        await expect(page.fill('#pass', tickets.pass, { timeout: 2000 })).rejects.toThrow(/Timeout 2000ms exceeded/);
-        const denials = warn.mock.calls.map(c => String(c[0])).filter(l => l.includes('origin binding refused Input.insertText secrets=example-login:password'));
-        expect(denials.length).toBeGreaterThan(0);
-      } finally {
-        warn.mockRestore();
-      }
-      expect(await page.inputValue('#pass')).toBe('');
-      await page.fill('#user', 'not-a-ticket'); // ordinary typing still works there
-      await Promise.all([page.waitForSelector('#done'), page.click('#go')]);
-      const evil = received.filter(r => r.host === 'evil.test' && r.body !== '');
-      expect(evil).toHaveLength(1);
-      expect(new URLSearchParams(evil[0].body).get('user')).toBe('not-a-ticket');
-      expect(new URLSearchParams(evil[0].body).get('pass')).toBe('');
-      expect(received.filter(r => r.host !== 'login.test').map(r => r.body).join('')).not.toContain(REAL.pass);
+      await new Promise(r => setTimeout(r, 200));
+
+      const conn = cdpSessionStore.controller(sid) as unknown as CdpConnection;
+      const result = await conn.login(loginReq());
+      expect(result.status).toBe(403);
+      // Nothing the site received on evil.test carries the real password.
+      expect(received.filter(r => r.host === 'evil.test').map(r => r.body).join('')).not.toContain(REAL.pass);
     } finally {
       await browser.close();
     }

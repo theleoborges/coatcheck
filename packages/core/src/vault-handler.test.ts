@@ -432,14 +432,19 @@ describe('Vault Handler', () => {
       expect(tokenStore.replaceAll(`${body.token}`, https('attacker.example')).denied).toHaveLength(1);
     });
 
-    it('binds web-login tickets and refuses unbound logins', async () => {
+    it('binds a web login to the policy hosts and refuses an unbound login', async () => {
       const login = JSON.stringify({ username: 'alice', password: 'pw' });
       await setup({ 'example-login': login, 'other-login': login });
-      const ok = await postJSON(port, '/_vault/mint-tokens', { secretName: 'example-login', sessionId: sid });
-      expect(ok.body.allowed_hosts).toEqual(['login.example.com']);
-      const refused = await postJSON(port, '/_vault/mint-tokens', { secretName: 'other-login', sessionId: sid });
+      let seen: import('./cdp-session-store.js').LoginRequest | undefined;
+      cdpSessionStore.attach(sid, { login: async req => { seen = req; return { status: 200, url: 'https://login.example.com/' }; } });
+      const body = { sessionId: sid, fields: { username: '#u', password: '#p' }, submit: '#go', until: 'navigation' };
+
+      const ok = await postJSON(port, '/_vault/example-login/login', body);
+      expect(ok.status).toBe(200);
+      expect(seen?.allowedHosts?.length).toBeGreaterThan(0);
+      // other-login has no policy rule → unbound → refused at binding (403), never reaches the driver.
+      const refused = await postJSON(port, '/_vault/other-login/login', body);
       expect(refused.status).toBe(403);
-      expect(tokenStore.size).toBe(2);
     });
   });
 
@@ -510,9 +515,9 @@ describe('Vault Handler', () => {
   // --- Provider capabilities and name validation on POST routes ---
 
   describe('provider capabilities', () => {
-    it('rejects mint-tokens with an invalid secret name', async () => {
+    it('rejects a login with an invalid secret name in the path', async () => {
       await setup({});
-      const { status, body } = await postJSON(port, '/_vault/mint-tokens', { secretName: '../example-login', sessionId: 'abc' });
+      const { status, body } = await postJSON(port, '/_vault/..%2Fexample-login/login', { sessionId: 'abc', fields: { u: '#u' }, submit: '#go' });
       expect(status).toBe(400);
       expect(body.error).toContain('Invalid secret name');
     });
@@ -623,110 +628,16 @@ describe('Vault Handler', () => {
     });
   });
 
-  // --- Web-login token minting (/_vault/mint-tokens) ---
+  // --- mint-tokens is gone (replaced by /login) ---
 
-  describe('/_vault/mint-tokens', () => {
-    const login = JSON.stringify({ username: 'alice@example.com', password: 'hunter2' });
-
-    it('mints session-scoped username/password tokens by secret name', async () => {
-      await setup({ 'example-login': login });
-      const { status, body } = await postJSON(port, '/_vault/mint-tokens', {
-        secretName: 'example-login',
-        sessionId: sid,
+  describe('/_vault/mint-tokens (removed)', () => {
+    it('returns 404: the route no longer exists', async () => {
+      await setup({ 'example-login': JSON.stringify({ username: 'a', password: 'b' }) });
+      const res = await realFetch(`http://127.0.0.1:${port}/_vault/mint-tokens`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ secretName: 'example-login', sessionId: sid }),
       });
-      expect(status).toBe(200);
-      expect(body.username_token).toMatch(/^cct_/);
-      expect(body.password_token).toMatch(/^cct_/);
-      expect(body.expires_in).toBe(600);
-
-      // Tokens resolve only within their session
-      const swap = tokenStore.replaceAllForSession(`${body.username_token} ${body.password_token}`, sid, https('login.example.com'));
-      expect(swap.output).toBe('alice@example.com hunter2');
-      // ...and not on the HTTP path
-      const httpSwap = tokenStore.replaceAll(`${body.password_token}`, https('login.example.com'));
-      expect(httpSwap.output).toBe(body.password_token);
-    });
-
-    it('returns 404 when no credential is stored under that name', async () => {
-      await setup({});
-      const { status, body } = await postJSON(port, '/_vault/mint-tokens', {
-        secretName: 'example-login',
-        sessionId: sid,
-      });
-      expect(status).toBe(404);
-      expect(body.error).toContain('No credential stored');
-    });
-
-    it('returns 400 when the secret lacks username/password fields', async () => {
-      await setup({ 'example-login': JSON.stringify({ 'api-key': 'x' }) });
-      const { status, body } = await postJSON(port, '/_vault/mint-tokens', {
-        secretName: 'example-login',
-        sessionId: sid,
-      });
-      expect(status).toBe(400);
-      expect(body.error).toContain('not a web login');
-    });
-
-    it('returns 400 when secretName or sessionId is missing', async () => {
-      await setup({ 'example-login': login });
-      const { status, body } = await postJSON(port, '/_vault/mint-tokens', { secretName: 'example-login' });
-      expect(status).toBe(400);
-      expect(body.error).toContain('required');
-    });
-
-    // Attack (roadmap item 14): mint credential tickets for a session id the
-    // caller made up, or for a session that is over. coatcheck must refuse
-    // before reading the credential, and issue nothing.
-    it('refuses a made-up session id with 404, before reading the secret', async () => {
-      const deps = await setup({ 'example-login': login });
-      const get = vi.spyOn(deps.provider.secrets, 'get');
-      const { status, body } = await postJSON(port, '/_vault/mint-tokens', {
-        secretName: 'example-login',
-        sessionId: 'deadbeefdeadbeefdeadbeef',
-      });
-      expect(status).toBe(404);
-      expect(body.error).toBe('Unknown or expired CDP session');
-      expect(get).not.toHaveBeenCalled();
-      expect(tokenStore.size).toBe(0);
-    });
-
-    it('refuses an expired or revoked session id', async () => {
-      await setup({ 'example-login': login });
-      const expired = cdpSessionStore.register('wss://browser.test/old', 'test', -1);
-      const closed = cdpSessionStore.register('wss://browser.test/closed', 'test');
-      cdpSessionStore.revoke(closed);
-      for (const sessionId of [expired, closed]) {
-        const { status } = await postJSON(port, '/_vault/mint-tokens', { secretName: 'example-login', sessionId });
-        expect(status).toBe(404);
-      }
-      expect(tokenStore.size).toBe(0);
-    });
-
-    it('accepts a connected session past its registration TTL', async () => {
-      await setup({ 'example-login': login });
-      vi.useFakeTimers({ toFake: ['Date'] });
-      try {
-        const connected = cdpSessionStore.register('wss://browser.test/long', 'test', 1);
-        cdpSessionStore.markConnected(connected);
-        vi.setSystemTime(Date.now() + 3_600_000);
-        expect(cdpSessionStore.has(connected)).toBe(true);
-        expect(cdpSessionStore.has(sid)).toBe(false); // never connected: expired
-        const { status } = await postJSON(port, '/_vault/mint-tokens', { secretName: 'example-login', sessionId: connected });
-        expect(status).toBe(200);
-      } finally {
-        vi.useRealTimers();
-      }
-    });
-
-    it('caps an over-long requested TTL', async () => {
-      await setup({ 'example-login': login });
-      const { status, body } = await postJSON(port, '/_vault/mint-tokens', {
-        secretName: 'example-login',
-        sessionId: sid,
-        expires_in: 99999,
-      });
-      expect(status).toBe(200);
-      expect(body.expires_in).toBe(1800);
+      expect(res.status).toBe(404);
     });
   });
 
