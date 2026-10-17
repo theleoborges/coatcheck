@@ -14,17 +14,19 @@ services:
       context: .
       dockerfile: Dockerfile.dev
     environment:
-      - AGENT_LABEL=demo
+      - COATCHECK_PROVIDER=aws
+      - COATCHECK_AGENT_ID=demo
       - AWS_REGION=us-east-1
       - AWS_ACCESS_KEY_ID=test
       - AWS_SECRET_ACCESS_KEY=test
       - AWS_ENDPOINT_URL=http://localstack:4566
       # Published ports need a non-loopback bind. In production run as a
       # sidecar and keep the default 127.0.0.1.
-      - PROXY_BIND_HOST=0.0.0.0
-      - CDP_PROXY_ENABLED=${CDP_PROXY_ENABLED:-0}
-      - CDP_PROXY_ADVERTISE_HOST=${CDP_PROXY_ADVERTISE_HOST:-127.0.0.1}
-      # No PROXY_ROLE_ARN: STS AssumeRole is skipped, static creds are used.
+      - COATCHECK_BIND_HOST=0.0.0.0
+      - COATCHECK_CDP_ENABLED=${COATCHECK_CDP_ENABLED:-0}
+      - COATCHECK_CDP_ADVERTISE_HOST=${COATCHECK_CDP_ADVERTISE_HOST:-127.0.0.1}
+      # No COATCHECK_AWS_ROLE_ARN: STS AssumeRole is skipped, static creds are used.
+      # Default prefixes: /coatcheck/secrets/ (SSM) and coatcheck/ (Secrets Manager).
     ports:
       - '3128:3128'
       - '8444:8444'
@@ -36,7 +38,6 @@ services:
     image: localstack/localstack:3.8
     environment:
       - SERVICES=ssm,secretsmanager,sts
-      - AGENT_LABEL=demo
     volumes:
       - ./examples/localstack-init.sh:/etc/localstack/init/ready.d/seed.sh:ro
     healthcheck:

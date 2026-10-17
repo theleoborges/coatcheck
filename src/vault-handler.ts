@@ -7,6 +7,8 @@ export interface VaultDeps {
   tokenStore: TokenStore;
   provider: SecretProvider;
   ca: Pick<CertAuthority, 'caCertPem'>;
+  /** Where users manage secrets; returned as `vault_url` in 404s when set. */
+  missingSecretUrl?: string;
 }
 
 /**
@@ -83,7 +85,7 @@ export function handleVaultRequest(
     provider.secrets.get(secretName).then(secret => {
       if (secret === null) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `Secret '${secretName}' not found`, vault_url: 'https://example.com/dashboard/integrations' }));
+        res.end(JSON.stringify({ error: `Secret '${secretName}' not found`, ...vaultUrlHint(deps) }));
         return;
       }
       const value = secret.value;
@@ -212,6 +214,10 @@ export function handleVaultRequest(
   return false;
 }
 
+function vaultUrlHint(deps: VaultDeps): { vault_url?: string } {
+  return deps.missingSecretUrl ? { vault_url: deps.missingSecretUrl } : {};
+}
+
 /**
  * Decode a secret name from a URL path segment and validate it. On failure,
  * answers 400 and returns null. Names never reach a provider unvalidated.
@@ -290,7 +296,7 @@ function handleMintTokens(
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         error: `No credential stored under '${secretName}'`,
-        vault_url: 'https://example.com/dashboard/integrations',
+        ...vaultUrlHint(deps),
       }));
       return;
     }

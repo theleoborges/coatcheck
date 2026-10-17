@@ -9,9 +9,14 @@ import {
   SecretsManagerClient,
   GetSecretValueCommand,
 } from '@aws-sdk/client-secrets-manager';
-import { withCache, type Secret, type SecretProvider, type SecretStore } from '../secret-provider.js';
+import type { ProviderContext, Secret, SecretProvider, SecretStore } from '../secret-provider.js';
+import { ConfigError, EnvReader, interpolateAgentId } from '../config.js';
 
-const SECRET_CACHE_TTL_MS = 300_000; // 5 minutes
+const DEFAULT_SSM_PREFIX = '/coatcheck/secrets/';
+const DEFAULT_SHARED_PREFIX = 'coatcheck/';
+const SSM_PREFIX = /^\/(?:[A-Za-z0-9_.-]+\/)*$/;
+const SHARED_PREFIX = /^[A-Za-z0-9_./+=@-]*$/;
+const ROLE_SESSION_NAME = /^[\w+=,.@-]{2,64}$/;
 const CREDENTIALS_REFRESH_MS = 2_700_000; // 45 minutes (STS session is 1h by default)
 
 interface AssumedCredentials {
@@ -21,10 +26,48 @@ interface AssumedCredentials {
   assumedAt: number;
 }
 
-export interface AwsProviderOptions {
-  label: string;
-  region?: string;
+export interface AwsProviderConfig {
+  /** SSM path prefix for per-agent secrets, ending in `/`. */
+  ssmPrefix: string;
+  /** Secrets Manager name prefix for shared secrets. */
+  sharedPrefix: string;
+  /** Broker role to assume before any call; unset uses the default credential chain. */
   roleArn?: string;
+  roleSessionName: string;
+}
+
+/**
+ * Parse the AWS provider's settings from the environment. Region, endpoint
+ * (`AWS_ENDPOINT_URL`) and credentials are left to the SDK's default chain.
+ */
+export function loadAwsConfig(ctx: ProviderContext): AwsProviderConfig {
+  const r = new EnvReader(ctx.env);
+  const ssmPrefix = interpolateAgentId(
+    r.string('COATCHECK_AWS_SSM_PREFIX') ?? DEFAULT_SSM_PREFIX, ctx.agentId, 'COATCHECK_AWS_SSM_PREFIX', r.problems);
+  const sharedPrefix = interpolateAgentId(
+    r.string('COATCHECK_AWS_SHARED_PREFIX') ?? DEFAULT_SHARED_PREFIX, ctx.agentId, 'COATCHECK_AWS_SHARED_PREFIX', r.problems);
+  const roleSessionName = interpolateAgentId(
+    r.string('COATCHECK_AWS_ROLE_SESSION_NAME') ?? (ctx.agentId ? 'coatcheck-{agentId}' : 'coatcheck'),
+    ctx.agentId, 'COATCHECK_AWS_ROLE_SESSION_NAME', r.problems);
+  const roleArn = r.string('COATCHECK_AWS_ROLE_ARN');
+
+  if (r.problems.length === 0) {
+    if (!SSM_PREFIX.test(ssmPrefix)) {
+      r.problems.push(`COATCHECK_AWS_SSM_PREFIX must be an SSM path starting and ending with '/' (got '${ssmPrefix}')`);
+    }
+    if (!SHARED_PREFIX.test(sharedPrefix)) {
+      r.problems.push(`COATCHECK_AWS_SHARED_PREFIX contains characters Secrets Manager names cannot (got '${sharedPrefix}')`);
+    }
+    if (!ROLE_SESSION_NAME.test(roleSessionName)) {
+      r.problems.push(`COATCHECK_AWS_ROLE_SESSION_NAME must be 2-64 characters of [\\w+=,.@-] (got '${roleSessionName}')`);
+    }
+  }
+  if (roleArn !== undefined && !/^arn:aws[a-z-]*:iam::\d{12}:role\/.+$/.test(roleArn)) {
+    r.problems.push('COATCHECK_AWS_ROLE_ARN must be an IAM role ARN');
+  }
+
+  if (r.problems.length > 0) throw new ConfigError(r.problems);
+  return { ssmPrefix, sharedPrefix, roleArn, roleSessionName };
 }
 
 /**
@@ -44,36 +87,29 @@ export function awsErrorCode(err: unknown): string {
  */
 class AwsBackend {
   private readonly basePath: string;
-  private readonly region: string;
   private assumedCreds: AssumedCredentials | null = null;
 
-  constructor(private readonly opts: AwsProviderOptions) {
-    this.basePath = `/liv/agents/${opts.label}/user-secrets/`;
-    this.region = opts.region ?? process.env.AWS_REGION ?? 'ap-southeast-2';
+  constructor(private readonly opts: AwsProviderConfig) {
+    this.basePath = opts.ssmPrefix;
   }
 
-  /** SSM client options — includes endpoint override for LocalStack in dev */
-  private get ssmBaseOptions(): Record<string, unknown> {
-    const opts: Record<string, unknown> = { region: this.region };
-    if (process.env.AWS_ENDPOINT_URL) {
-      opts.endpoint = process.env.AWS_ENDPOINT_URL;
-    }
-    return opts;
-  }
-
-  /** Resolve AWS client options, assuming the broker role if configured */
+  /**
+   * Resolve AWS client options, assuming the broker role if configured.
+   * Region and endpoint (`AWS_REGION`, `AWS_ENDPOINT_URL`) come from the SDK's
+   * default chain.
+   */
   private async getAwsClientOptions(): Promise<Record<string, unknown>> {
     if (!this.opts.roleArn) {
       // No role to assume — use default credentials (task role or env creds)
-      return this.ssmBaseOptions;
+      return {};
     }
 
     // Refresh assumed credentials if expired or not yet assumed
     if (!this.assumedCreds || Date.now() - this.assumedCreds.assumedAt > CREDENTIALS_REFRESH_MS) {
-      const sts = new STSClient({ region: this.region });
+      const sts = new STSClient({});
       const result = await sts.send(new AssumeRoleCommand({
         RoleArn: this.opts.roleArn,
-        RoleSessionName: `secret-proxy-${this.opts.label}`,
+        RoleSessionName: this.opts.roleSessionName,
         DurationSeconds: 3600,
       }));
 
@@ -91,7 +127,6 @@ class AwsBackend {
     }
 
     return {
-      ...this.ssmBaseOptions,
       credentials: {
         accessKeyId: this.assumedCreds.accessKeyId,
         secretAccessKey: this.assumedCreds.secretAccessKey,
@@ -108,12 +143,12 @@ class AwsBackend {
     return new SecretsManagerClient(await this.getAwsClientOptions());
   }
 
-  /** Shared secret from Secrets Manager at `liv/{name}`, or null if absent. */
+  /** Shared secret from Secrets Manager at `{sharedPrefix}{name}`, or null if absent. */
   async getShared(name: string): Promise<Secret | null> {
     const sm = await this.getSecretsManagerClient();
     try {
       const result = await sm.send(new GetSecretValueCommand({
-        SecretId: `liv/${name}`,
+        SecretId: this.opts.sharedPrefix + name,
       }));
       return result.SecretString === undefined ? null : { value: result.SecretString };
     } catch (err: unknown) {
@@ -193,8 +228,8 @@ class AwsBackend {
   }
 }
 
-export function createAwsProvider(opts: AwsProviderOptions): SecretProvider {
-  const backend = new AwsBackend(opts);
+export function createAwsProvider(config: AwsProviderConfig): SecretProvider {
+  const backend = new AwsBackend(config);
   const secrets: SecretStore = {
     get: name => backend.get(name),
     exists: name => backend.exists(name),
@@ -203,7 +238,7 @@ export function createAwsProvider(opts: AwsProviderOptions): SecretProvider {
   };
   return {
     name: 'aws',
-    secrets: withCache(secrets, SECRET_CACHE_TTL_MS),
+    secrets,
     shared: { get: name => backend.getShared(name) },
   };
 }

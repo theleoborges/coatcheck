@@ -45,7 +45,7 @@ go around it to the secret store. Three properties are required.
 
 As shipped, the AWS provider (`src/providers/aws.ts`) reads per-agent secrets from SSM Parameter
 Store under a per-agent prefix and shared secrets from Secrets Manager, and
-optionally assumes a role named by `PROXY_ROLE_ARN` via STS before doing so
+optionally assumes a role named by `COATCHECK_AWS_ROLE_ARN` via STS before doing so
 (`src/providers/aws.ts`).
 
 - Agent task role: explicit `Deny` on `ssm:GetParameter*` for
@@ -122,7 +122,7 @@ ticket into a request to any destination.
 | Shared secrets are allowlisted | `/_secret/{name}` refuses names outside a hard-coded allowlist (`src/vault-handler.ts`) |
 | Secret names are validated before any provider call | `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (no `/`, no leading `.`), checked after URL-decoding on every route that takes a name; invalid names get `400` (`isValidSecretName`, `src/secret-provider.ts`; `src/vault-handler.ts`) |
 | Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`src/mitm.ts`) |
-| CONNECT targets cannot reach a shell or the filesystem | Targets are parsed strictly (RFC 1123 DNS name or IP literal, port 1–65535; otherwise `400`) (`src/connect-target.ts`). Certificates are generated in-process with WebCrypto; leaf keys stay in memory (LRU, 1000 entries) and only the CA is written to disk, when `CA_DIR` is set (`src/ca.ts`). |
+| CONNECT targets cannot reach a shell or the filesystem | Targets are parsed strictly (RFC 1123 DNS name or IP literal, port 1–65535; otherwise `400`) (`src/connect-target.ts`). Certificates are generated in-process with WebCrypto; leaf keys stay in memory (LRU, 1000 entries) and only the CA is written to disk, when `COATCHECK_CA_DIR` is set (`src/ca.ts`). |
 | Logs carry no values | Swap logs record secret names, host, and ticket age only (`src/swap-log.ts`) |
 | OAuth refresh failures don't log provider bodies | Only the HTTP status and the RFC 6749 `error` code (sanitised to `[A-Za-z0-9_.-]`, at most 64 chars) are logged (`oauthErrorCode`, `src/vault-handler.ts`) |
 
@@ -172,7 +172,7 @@ and any future allowlist would not apply to those tunnels.
 `/_vault`, `/_vault/{name}`, `/_vault/mint-tokens`, `/_vault/{name}/refresh`,
 and `/_secret/{name}` accept any caller (`vault-handler.ts:26-203`). Isolation
 rests entirely on the listener binding to `127.0.0.1` (`index.ts`). Setting
-`PROXY_BIND_HOST=0.0.0.0` (intended for local dev) lets anything that can
+`COATCHECK_BIND_HOST=0.0.0.0` (intended for local dev) lets anything that can
 reach the port mint tickets and, combined with the host-binding gap, read every
 secret. The CDP listener uses the same bind host and authenticates only by
 sid.

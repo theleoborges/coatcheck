@@ -80,7 +80,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 
    No other behaviour change.
 
-7. **Configuration.** Add a pure `loadConfig(env)`. It is the only reader of
+7. **[Done]** **Configuration.** Add a pure `loadConfig(env)`. It is the only reader of
    `process.env`, which an eslint rule enforces.
    - All settings move to the `COATCHECK_*` names in
      `docs/design/v1-decisions.md`. A legacy name fails startup with

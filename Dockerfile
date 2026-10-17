@@ -14,7 +14,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist/ ./dist/
 
-# 3128: HTTP(S) proxy + vault API. 8444: CDP WebSocket proxy (CDP_PROXY_ENABLED=1).
+# 3128: HTTP(S) proxy + vault API. 8444: CDP WebSocket proxy (COATCHECK_CDP_ENABLED=1).
 # Binds 127.0.0.1 by default — run as a sidecar sharing the agent's network namespace.
 EXPOSE 3128 8444
 

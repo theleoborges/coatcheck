@@ -1,6 +1,6 @@
 # Browser credential injection via CDP substitution
 
-Status: **implemented (v1)**, behind `CDP_PROXY_ENABLED=1`.
+Status: **implemented (v1)**, behind `COATCHECK_CDP_ENABLED=1`.
 Code: `src/cdp/proxy.ts`, `src/cdp/substitution.ts`, `src/cdp/keystroke-detector.ts`,
 `src/cdp-session-store.ts`, `src/browserbase-rewrite.ts`, wiring in `src/mitm.ts` and `src/index.ts`,
 mint endpoint in `src/vault-handler.ts`.
@@ -59,8 +59,8 @@ agent ── ws://127.0.0.1:8444/cdp/{sid} ──▶ coatcheck :8444 (CDP proxy)
 ```
 
 Both listeners run in one process and share the `TokenStore`. The CDP
-listener binds to the same host as the HTTP listener (`PROXY_BIND_HOST`,
-default `127.0.0.1`), port `CDP_PROXY_PORT` (default 8444)
+listener binds to the same host as the HTTP listener (`COATCHECK_BIND_HOST`,
+default `127.0.0.1`), port `COATCHECK_CDP_PORT` (default 8444)
 (`src/index.ts`). If the CDP listener fails to bind,
 the process exits (`src/index.ts`), so a deployment that gates the agent
 on broker health also gates it on the CDP listener.
@@ -87,7 +87,7 @@ is a small HTTP/1.1 response parser:
 The replacement is produced by `CdpSessionStore.register(realConnectUrl)`
 (`src/cdp-session-store.ts:32`), which stores the real URL under a random
 24-hex-char `sid` (12 random bytes) with a 10-minute TTL, and returns
-`ws://{CDP_PROXY_ADVERTISE_HOST}:{CDP_PROXY_PORT}/cdp/{sid}`. The signing key
+`ws://{COATCHECK_CDP_ADVERTISE_HOST}:{COATCHECK_CDP_PORT}/cdp/{sid}`. The signing key
 in the real URL never reaches the agent.
 
 The rewrite only happens on a MITM'd connection. The MITM is only engaged when
@@ -234,7 +234,7 @@ session remains the client's job.
 
 | Condition | Behaviour |
 |---|---|
-| `CDP_PROXY_ENABLED` unset | No CDP listener; `connectUrl` not rewritten; agent receives the real vendor URL (`src/mitm.ts`, `src/index.ts`). Credential injection unavailable. |
+| `COATCHECK_CDP_ENABLED` unset | No CDP listener; `connectUrl` not rewritten; agent receives the real vendor URL (`src/mitm.ts`, `src/index.ts`). Credential injection unavailable. |
 | Token store empty at CONNECT time | Tunnel is passthrough; `connectUrl` not rewritten for that connection (`src/mitm.ts`). |
 | sid unknown or expired (10 min) | WebSocket closed 1008. |
 | Second concurrent CDP connection | Closed 1013. |
@@ -315,10 +315,10 @@ browser then becomes a new adapter rather than a fork. See `docs/ROADMAP.md`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CDP_PROXY_ENABLED` | off | `1` enables the listener and `connectUrl` rewrite. |
-| `CDP_PROXY_PORT` | `8444` | Listener port. |
-| `CDP_PROXY_ADVERTISE_HOST` | `127.0.0.1` | Host written into rewritten URLs. Override when the client is in a different network namespace (e.g. separate containers in local dev). |
-| `PROXY_BIND_HOST` | `127.0.0.1` | Bind address for both listeners. |
+| `COATCHECK_CDP_ENABLED` | `0` | `1` enables the listener and `connectUrl` rewrite. |
+| `COATCHECK_CDP_PORT` | `8444` | Listener port. |
+| `COATCHECK_CDP_ADVERTISE_HOST` | `127.0.0.1` | Host written into rewritten URLs. Override when the client is in a different network namespace (e.g. separate containers in local dev). |
+| `COATCHECK_BIND_HOST` | `127.0.0.1` | Bind address for both listeners. |
 
 ## Logging
 

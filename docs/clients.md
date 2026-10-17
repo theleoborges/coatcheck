@@ -36,7 +36,7 @@ export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ```
 
-The CA is generated in memory on every start unless `CA_DIR` is set and
+The CA is generated in memory on every start unless `COATCHECK_CA_DIR` is set and
 persists across restarts. If it is regenerated, clients must re-fetch it.
 
 ## 2. Get a ticket
@@ -153,7 +153,7 @@ Fetch the ticket first, or open a fresh connection after fetching it.
 
 ## 6. Browser logins (CDP injection)
 
-Requires `CDP_PROXY_ENABLED=1` on coatcheck. The credential is a JSON secret
+Requires `COATCHECK_CDP_ENABLED=1` on coatcheck. The credential is a JSON secret
 with `username` and `password` fields, addressed by its secret name.
 
 1. Create the remote-browser session **through the proxy**, with the vendor

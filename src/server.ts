@@ -17,6 +17,8 @@ export interface CoatcheckDeps {
   cdpSessionStore: CdpSessionStore;
   /** Set when CDP injection is enabled: where rewritten connectUrls point. */
   cdp?: { port: number; advertiseHost: string };
+  /** `vault_url` hint in 404s (`COATCHECK_MISSING_SECRET_URL`). */
+  missingSecretUrl?: string;
   /** Defaults to `api.browserbase.com`. */
   browserbaseApiHost?: string;
   /** Extra trust anchors for upstream TLS (tests). */
@@ -34,7 +36,12 @@ export interface Coatcheck {
  * CONNECT (MITM or passthrough). No side effects until `listen`.
  */
 export function createCoatcheck(deps: CoatcheckDeps): Coatcheck {
-  const vaultDeps = { tokenStore: deps.tokenStore, provider: deps.provider, ca: deps.ca };
+  const vaultDeps = {
+    tokenStore: deps.tokenStore,
+    provider: deps.provider,
+    ca: deps.ca,
+    missingSecretUrl: deps.missingSecretUrl,
+  };
 
   const server = http.createServer((req, res) => {
     // Handle vault API requests directly

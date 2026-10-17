@@ -60,20 +60,20 @@ To add your own secret to LocalStack:
 
 ```bash
 aws --endpoint-url http://localhost:4566 --region us-east-1 ssm put-parameter \
-  --type SecureString --name /liv/agents/demo/user-secrets/github-token --value 'ghp_…'
+  --type SecureString --name /coatcheck/secrets/github-token --value 'ghp_…'
 ```
 
 ### Secret backend layout (AWS)
 
 | Kind | Where coatcheck reads it | Served by |
 |---|---|---|
-| Named secret | SSM SecureString at `/liv/agents/{AGENT_LABEL}/user-secrets/{name}` | `/_vault/{name}` |
+| Named secret | SSM SecureString at `{COATCHECK_AWS_SSM_PREFIX}{name}` (default `/coatcheck/secrets/{name}`) | `/_vault/{name}` |
 | Multi-value secret | Same location, with a JSON object as the value (`{"username":…,"password":…}`) | `/_vault/{name}?field=…` |
-| Shared key | Secrets Manager `liv/{name}`, which must also be in a compiled-in allowlist | `/_secret/{name}` |
+| Shared key | Secrets Manager `{COATCHECK_AWS_SHARED_PREFIX}{name}` (default `coatcheck/{name}`), which must also be in a compiled-in allowlist | `/_secret/{name}` |
 
-The path prefix is hardcoded for now. It becomes configurable when the provider interface lands. coatcheck caches backend reads in memory for 5 minutes, so a rotated secret can take that long to show up.
+Both prefixes may contain `{agentId}`, replaced with `COATCHECK_AGENT_ID` (for example `/acme/agents/{agentId}/secrets/`); coatcheck refuses to start if a prefix uses `{agentId}` and it is unset. coatcheck caches backend reads in memory for `COATCHECK_SECRET_CACHE_TTL_SECONDS` (default 5 minutes), so a rotated secret can take that long to show up.
 
-If `PROXY_ROLE_ARN` is set, coatcheck assumes that role through STS (1-hour sessions, renewed every 45 minutes) before reading secrets. The intended deployment gives backend read access to that role only, and gives the agent's own identity none.
+If `COATCHECK_AWS_ROLE_ARN` is set, coatcheck assumes that role through STS (1-hour sessions, renewed every 45 minutes) before reading secrets. The intended deployment gives backend read access to that role only, and gives the agent's own identity none.
 
 ## HTTP API
 
@@ -100,18 +100,26 @@ Errors are JSON `{"error":…}` with status 400, 403, 404, 500, 501, or 502.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AGENT_LABEL` | (required) | Identifies the agent. Scopes the SSM path. coatcheck exits if it is unset. |
-| `PROXY_PORT` | `3128` | Port for the proxy and the HTTP API. |
-| `PROXY_BIND_HOST` | `127.0.0.1` | Bind address for the proxy and the CDP proxy. Use `0.0.0.0` only for local docker-compose. |
-| `CA_DIR` | (unset) | Where to persist the CA key and cert (`ca.key`, `ca.crt`). If unset, coatcheck generates an in-memory CA on every start. If an existing ECDSA P-256 CA is found there, coatcheck reuses it; any other key type (for example an RSA CA from an older version) fails startup until the files are deleted. Per-host certificates are never written to disk. |
-| `CDP_PROXY_ENABLED` | off | Set to `1` to run the CDP proxy and rewrite browser-service `connectUrl`s. |
-| `CDP_PROXY_PORT` | `8444` | CDP WebSocket proxy port. |
-| `CDP_PROXY_ADVERTISE_HOST` | `127.0.0.1` | Host written into the rewritten `connectUrl`. Override it when the Playwright client is in a different container. |
-| `AWS_REGION` | `ap-southeast-2` | Region for SSM, Secrets Manager, and STS. |
-| `AWS_ENDPOINT_URL` | (unset) | Endpoint override for SSM and Secrets Manager, e.g. LocalStack. |
-| `PROXY_ROLE_ARN` | (unset) | IAM role to assume before reading secrets. If unset, the default AWS credential chain is used. |
+| `COATCHECK_PROVIDER` | (required) | Secret backend. Currently `aws`. |
+| `COATCHECK_AGENT_ID` | (unset) | Optional agent identity: used in logs, in `{agentId}` templates, and in the default STS session name. Same character rules as secret names. |
+| `COATCHECK_PORT` | `3128` | Port for the proxy and the HTTP API. |
+| `COATCHECK_BIND_HOST` | `127.0.0.1` | Bind address for the proxy and the CDP proxy. Use `0.0.0.0` only for local docker-compose. |
+| `COATCHECK_TICKET_TTL_SECONDS` | `900` | Lifetime of tickets from `/_vault` and `/_secret`. |
+| `COATCHECK_SECRET_CACHE_TTL_SECONDS` | `300` | How long backend reads are cached; `0` disables the cache. |
+| `COATCHECK_MISSING_SECRET_URL` | (unset) | Returned as `vault_url` in 404s, e.g. a dashboard where users add secrets. Omitted when unset. |
+| `COATCHECK_CA_SUBJECT` | `CN=coatcheck CA, O=coatcheck` | Subject of a newly generated CA. |
+| `COATCHECK_CA_DIR` | (unset) | Where to persist the CA key and cert (`ca.key`, `ca.crt`). If unset, coatcheck generates an in-memory CA on every start. If an existing ECDSA P-256 CA is found there, coatcheck reuses it; any other key type (for example an RSA CA from an older version) fails startup until the files are deleted. Per-host certificates are never written to disk. |
+| `COATCHECK_CDP_ENABLED` | `0` | Set to `1` to run the CDP proxy and rewrite browser-service `connectUrl`s. |
+| `COATCHECK_CDP_PORT` | `8444` | CDP WebSocket proxy port. |
+| `COATCHECK_CDP_ADVERTISE_HOST` | `127.0.0.1` | Host written into the rewritten `connectUrl`. Override it when the Playwright client is in a different container. |
+| `COATCHECK_AWS_SSM_PREFIX` | `/coatcheck/secrets/` | SSM path prefix for named secrets (`aws` provider). Must start and end with `/`; may contain `{agentId}`. |
+| `COATCHECK_AWS_SHARED_PREFIX` | `coatcheck/` | Secrets Manager name prefix for shared keys (`aws` provider); may contain `{agentId}`. |
+| `COATCHECK_AWS_ROLE_ARN` | (unset) | IAM role to assume before reading secrets. If unset, the default AWS credential chain is used. |
+| `COATCHECK_AWS_ROLE_SESSION_NAME` | `coatcheck-{agentId}`, or `coatcheck` | STS session name when assuming the role. |
 
-Standard AWS SDK credential variables apply. Certificates are generated in-process (ECDSA P-256); coatcheck needs no `openssl` binary.
+Region, endpoint (`AWS_REGION`, `AWS_ENDPOINT_URL` for LocalStack) and credentials come from the standard AWS SDK chain; there is no built-in default region.
+
+Earlier variable names (`AGENT_LABEL`, `PROXY_PORT`, `PROXY_BIND_HOST`, `CA_DIR`, `PROXY_ROLE_ARN`, `CDP_PROXY_*`) are rejected at startup with a message naming the replacement. Certificates are generated in-process (ECDSA P-256); coatcheck needs no `openssl` binary.
 
 ## Trusting the CA in the agent container
 
@@ -141,7 +149,7 @@ export HTTP_PROXY=http://127.0.0.1:3128
 export NO_PROXY=localhost,127.0.0.1,169.254.169.254,169.254.170.2   # plus internal services
 ```
 
-Unless `CA_DIR` is set and on persistent storage, each coatcheck restart generates a new CA, and the agent has to fetch `/_ca` again.
+Unless `COATCHECK_CA_DIR` is set and on persistent storage, each coatcheck restart generates a new CA, and the agent has to fetch `/_ca` again.
 
 ## Using tickets
 
@@ -166,9 +174,9 @@ If an upstream returns 401 while you are using a ticket, assume the swap did not
 
 ## Browser / CDP credential injection
 
-This lets an agent log into a website through a remote browser without the password entering its context. Set `CDP_PROXY_ENABLED=1`. Browserbase is the only supported browser service today.
+This lets an agent log into a website through a remote browser without the password entering its context. Set `COATCHECK_CDP_ENABLED=1`. Browserbase is the only supported browser service today.
 
-1. The agent creates a session with `POST https://api.browserbase.com/v1/sessions` **through `HTTPS_PROXY`**, authenticating with a `/_secret/browserbase-api-key` ticket. coatcheck rewrites the response's `connectUrl` from the real `wss://…` URL, which carries Browserbase's signing key, to `ws://{CDP_PROXY_ADVERTISE_HOST}:8444/cdp/{sid}`. The agent never sees the real URL. A `sid` is valid for 10 minutes until a client connects.
+1. The agent creates a session with `POST https://api.browserbase.com/v1/sessions` **through `HTTPS_PROXY`**, authenticating with a `/_secret/browserbase-api-key` ticket. coatcheck rewrites the response's `connectUrl` from the real `wss://…` URL, which carries Browserbase's signing key, to `ws://{COATCHECK_CDP_ADVERTISE_HOST}:8444/cdp/{sid}`. The agent never sees the real URL. A `sid` is valid for 10 minutes until a client connects.
 2. The agent mints session-bound tickets with `POST /_vault/mint-tokens {"secretName":"example-login","sessionId":"{sid}"}`.
 3. The agent connects (`chromium.connectOverCDP(connectUrl)`) and fills the form:
 
@@ -223,7 +231,7 @@ coatcheck makes different trade-offs:
 npm install
 npm test          # vitest
 npm run build     # tsc -> dist/
-AGENT_LABEL=demo AWS_ENDPOINT_URL=http://localhost:4566 npm run dev
+COATCHECK_PROVIDER=aws AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:4566 npm run dev
 ```
 
 ## Docs

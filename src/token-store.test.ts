@@ -36,6 +36,12 @@ describe('TokenStore', () => {
     expect(legacy.match(TICKET_PATTERN)).toBeNull();
   });
 
+  it('uses the configured default TTL', () => {
+    store = new TokenStore({ defaultTtlSeconds: 60 });
+    expect(store.issue('k', 'v').ttlSeconds).toBe(60);
+    expect(store.issue('k', 'v', 5).ttlSeconds).toBe(5);
+  });
+
   it('resolves a valid token to its real value', () => {
     store = new TokenStore();
     const token = store.issue('my-secret', 'real-value-123');

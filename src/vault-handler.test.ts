@@ -81,7 +81,7 @@ describe('Vault Handler', () => {
   async function setup(
     secrets: Record<string, string>,
     sharedSecrets: Record<string, string> = {},
-    opts: Pick<MemoryProviderInit, 'writable'> & { noShared?: boolean } = {},
+    opts: Pick<MemoryProviderInit, 'writable'> & { noShared?: boolean; missingSecretUrl?: string } = {},
   ) {
     tokenStore = new TokenStore();
     const provider = createMemoryProvider({
@@ -90,7 +90,7 @@ describe('Vault Handler', () => {
       writable: opts.writable,
     });
     if (provider.secrets.put) vi.spyOn(provider.secrets, 'put');
-    const deps: VaultDeps = { tokenStore, provider, ca: mockCa() };
+    const deps: VaultDeps = { tokenStore, provider, ca: mockCa(), missingSecretUrl: opts.missingSecretUrl };
     server = createTestServer(deps);
     port = await listen(server);
     return deps;
@@ -163,11 +163,18 @@ describe('Vault Handler', () => {
   });
 
   it('returns 404 for missing secret', async () => {
-    await setup({});
+    await setup({}, {}, { missingSecretUrl: 'https://dashboard.example.com/integrations' });
     const { status, body } = await fetchJSON(port, '/_vault/nope');
     expect(status).toBe(404);
     expect(body.error).toContain('not found');
-    expect(body.vault_url).toContain('integrations');
+    expect(body.vault_url).toBe('https://dashboard.example.com/integrations');
+  });
+
+  it('omits vault_url when no missing-secret URL is configured', async () => {
+    await setup({});
+    const { status, body } = await fetchJSON(port, '/_vault/nope');
+    expect(status).toBe(404);
+    expect(body).not.toHaveProperty('vault_url');
   });
 
   // --- Multi-value secret ---

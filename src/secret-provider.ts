@@ -68,3 +68,9 @@ export function withCache<T extends Readable>(store: T, ttlMs: number): T {
   }
   return cached as T;
 }
+
+/** Wrap a provider's per-agent store in `withCache`. `ttlMs` 0 leaves it uncached. */
+export function withProviderCache(provider: SecretProvider, ttlMs: number): SecretProvider {
+  if (ttlMs <= 0) return provider;
+  return { ...provider, secrets: withCache(provider.secrets, ttlMs) };
+}
