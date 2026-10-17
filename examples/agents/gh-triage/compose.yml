@@ -1,0 +1,41 @@
+# gh-triage: an agent that triages GitHub issues with unmodified tools (gh, curl),
+# secrets from the env provider. See ../README.md.
+#
+# The agent sits on an internal network: its only route out is coatcheck.
+name: coatcheck-gh-triage
+services:
+  coatcheck:
+    build: { context: ../../.., dockerfile: Dockerfile }
+    environment:
+      - COATCHECK_PROVIDER=env
+      - COATCHECK_AGENT_ID=gh-triage
+      - COATCHECK_BIND_HOST=0.0.0.0
+      - COATCHECK_API_TOKEN=${COATCHECK_API_TOKEN:?run via ./run.sh}
+      - COATCHECK_POLICY_FILE=/etc/coatcheck/policy.json
+      - COATCHECK_SECRET_ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY}
+      - COATCHECK_SECRET_GITHUB_TOKEN=${GITHUB_TOKEN:?run via ./run.sh}
+    volumes:
+      - ./policy.json:/etc/coatcheck/policy.json:ro
+    networks: [agentnet, egress]
+
+  agent:
+    build: { context: .., dockerfile: Dockerfile }
+    depends_on: [coatcheck]
+    environment:
+      - COATCHECK_URL=http://coatcheck:3128
+      - COATCHECK_API_TOKEN=${COATCHECK_API_TOKEN}
+      - HTTPS_PROXY=http://coatcheck:${COATCHECK_API_TOKEN}@coatcheck:3128
+      - HTTP_PROXY=http://coatcheck:${COATCHECK_API_TOKEN}@coatcheck:3128
+      - NO_PROXY=coatcheck,localhost,127.0.0.1
+      - NODE_USE_ENV_PROXY=1
+      - GH_REPO=${GH_REPO:-theleoborges/coatcheck}
+      - AGENT_MAX_TURNS=${AGENT_MAX_TURNS:-30}
+      - AGENT_TRANSCRIPT=/out/transcript.json
+    volumes:
+      - ./${TASK:-task.md}:/task.md:ro
+      - ./out:/out
+    networks: [agentnet]
+
+networks:
+  agentnet: { internal: true }
+  egress: {}
