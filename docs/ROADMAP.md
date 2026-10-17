@@ -13,7 +13,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 ## Phase 1: shell injection (HIGH)
 
-1. **Validate CONNECT targets.** Parse `host:port` strictly:
+1. **[Done]** **Validate CONNECT targets.** Parse `host:port` strictly:
    - the host must be a DNS name (RFC 1123 labels, at most 253 chars) or an
      IP literal (`net.isIP`, with IPv6 in brackets);
    - the port must be 1–65535.

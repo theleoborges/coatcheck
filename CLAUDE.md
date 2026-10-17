@@ -20,7 +20,8 @@ Repo is **private** until we're ready to publish. Target license Apache-2.0.
 | File | Role |
 |---|---|
 | `src/index.ts` | HTTP server on 3128: vault API routing, plain-HTTP forwarding, `CONNECT` → MITM (only when token store non-empty) or passthrough; header/URL token swap; swap-outcome logging |
-| `src/ca.ts` | Self-signed root CA + per-host leaf certs via `openssl` `execSync` (**unsafe**: hostname unvalidated) |
+| `src/ca.ts` | Self-signed root CA + per-host leaf certs via `openssl` `execSync` (hostname validated upstream; shell-out removed in roadmap item 2) |
+| `src/connect-target.ts` | Strict `CONNECT` target parser (RFC 1123 DNS name or IP literal, port 1–65535); invalid → 400 |
 | `src/token-store.ts` | In-memory tickets, TTL 900s default, optional CDP session binding, `replaceAll` / `replaceAllForSession` |
 | `src/vault-handler.ts` | `/_health`, `/_ca`, `/_vault*`, `/_secret/*`, `mint-tokens`, OAuth `refresh`; multi-field JSON secrets + `_cleartext` |
 | `src/secret-fetcher.ts` | **The only AWS-coupled file**: SSM (user vault get/exists/put/list), Secrets Manager (shared secrets), STS AssumeRole. Will move behind a `SecretProvider` interface |
@@ -33,7 +34,7 @@ Repo is **private** until we're ready to publish. Target license Apache-2.0.
 ## Known security gaps (fix before going public)
 
 1. **Tickets are not bound to destination hosts** — `swapTokensInRawHeaders` (`src/index.ts`) gets the hostname but only logs it. A ticket sent to any host gets the real value. Fix: per-secret allowed hosts/pattern, enforced at swap time (HTTP and CDP).
-2. **Shell injection / path traversal in `src/ca.ts`** — `CONNECT` hostname interpolated into `execSync` openssl commands and file paths. Fix: in-process cert generation (`@peculiar/x509` or `node-forge`) + hostname validation.
+2. **Shell-out in `src/ca.ts`** — the `CONNECT` hostname is now validated (`src/connect-target.ts`), but certs are still minted by interpolating it into `execSync` openssl commands and file paths. Fix: in-process cert generation (`@peculiar/x509`, roadmap item 2).
 3. **Plain-HTTP forward path also swaps** — `curl -x proxy http://127.0.0.1:<agent-listener>/?k=tok_…` hands the agent the plaintext without leaving the box, so egress enforcement alone doesn't close gap 1. Host binding must cover the HTTP path too.
 4. **The AWS "sidecar assumes a separate role" pattern Liv used was bypassable** — both containers in an ECS task share one task role, and that role was allowed `sts:AssumeRole` on the proxy role, so the agent could assume it directly. `docs/THREAT_MODEL.md` documents correct patterns (separate task, ExternalId only injected into the sidecar, blocking 169.254.170.2). Any AWS deployment guide/provider must not repeat this.
 

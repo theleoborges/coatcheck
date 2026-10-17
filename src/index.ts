@@ -9,6 +9,7 @@ import { handleVaultRequest } from './vault-handler.js';
 import { CdpSessionStore } from './cdp-session-store.js';
 import { startCdpProxy } from './cdp/proxy.js';
 import { createConnectUrlRewriter } from './browserbase-rewrite.js';
+import { parseConnectTarget } from './connect-target.js';
 
 const PROXY_PORT = parseInt(process.env.PROXY_PORT ?? '3128', 10);
 const AGENT_LABEL = process.env.AGENT_LABEL;
@@ -78,13 +79,15 @@ const server = http.createServer((req, res) => {
 
 // HTTPS CONNECT tunneling with MITM for token swapping
 server.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
-  const [hostname, portStr] = (req.url ?? '').split(':');
-  const port = parseInt(portStr ?? '443', 10);
-
-  if (!hostname) {
+  // Strict DNS-name / IP-literal validation: the hostname reaches certificate
+  // generation and the upstream dial, so reject anything else up front.
+  const target = parseConnectTarget(req.url);
+  if (!target) {
+    console.warn('[connect] rejected invalid CONNECT target');
     clientSocket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
     return;
   }
+  const { hostname, port } = target;
 
   // Prevent unhandled socket errors from crashing the process
   clientSocket.on('error', (err) => {
