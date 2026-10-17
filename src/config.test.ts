@@ -29,6 +29,8 @@ describe('loadConfig', () => {
       policy: EMPTY_POLICY,
       policyFile: undefined,
       allowUnboundSecrets: false,
+      mitm: 'bound',
+      passthroughHosts: [],
     });
   });
 
@@ -47,6 +49,8 @@ describe('loadConfig', () => {
       COATCHECK_CDP_PORT: '9444',
       COATCHECK_CDP_ADVERTISE_HOST: 'coatcheck',
       COATCHECK_ALLOW_UNBOUND_SECRETS: '1',
+      COATCHECK_MITM: 'always',
+      COATCHECK_PASSTHROUGH_HOSTS: 'pinned.example.com, *.Pinned.example.org',
     });
     expect(config).toEqual({
       provider: 'aws',
@@ -61,6 +65,11 @@ describe('loadConfig', () => {
       policy: EMPTY_POLICY,
       policyFile: undefined,
       allowUnboundSecrets: true,
+      mitm: 'always',
+      passthroughHosts: [
+        { kind: 'exact', host: 'pinned.example.com', plaintext: false },
+        { kind: 'wildcard', host: 'pinned.example.org', plaintext: false },
+      ],
     });
   });
 
@@ -92,8 +101,12 @@ describe('loadConfig', () => {
       COATCHECK_CDP_ENABLED: 'yes',
       COATCHECK_CDP_PORT: '84a4',
       COATCHECK_ALLOW_UNBOUND_SECRETS: 'maybe',
+      COATCHECK_MITM: 'sometimes',
+      COATCHECK_PASSTHROUGH_HOSTS: 'ok.example.com,*,http://x.example.com,host:443',
     });
-    expect(found).toHaveLength(6);
+    expect(found).toHaveLength(10);
+    expect(found).toContain("COATCHECK_MITM must be 'bound' or 'always' (got 'sometimes')");
+    expect(found).toContainEqual(expect.stringContaining("COATCHECK_PASSTHROUGH_HOSTS entry 'http://x.example.com': must not have a scheme"));
   });
 
   it('rejects an agent id that could escape a store path', () => {

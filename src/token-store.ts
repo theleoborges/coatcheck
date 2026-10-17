@@ -164,6 +164,20 @@ export class TokenStore {
   }
 
   /**
+   * True when a live HTTP(S) ticket could be swapped for `target`: one bound to
+   * it, or any unbound ticket. Session-bound tickets don't count (they never
+   * swap on HTTP(S)). Drives the `COATCHECK_MITM=bound` decision.
+   */
+  hasLiveTicketFor(target: MatchTarget): boolean {
+    const now = Date.now();
+    for (const entry of this.tokens.values()) {
+      if (now > entry.expiresAt || entry.sessionId !== undefined) continue;
+      if (entry.allowedHosts === undefined || matchesHost(entry.allowedHosts, target)) return true;
+    }
+    return false;
+  }
+
+  /**
    * Like replaceAll, but only substitutes tokens minted for the given CDP
    * session. Used on the CDP proxy's outbound (agent → Browserbase) leg so a
    * session's credential tokens resolve only on that session's frames.

@@ -134,7 +134,7 @@ rejected, are in `docs/design/v1-decisions.md`.
      does a variant using a loopback listener.
    - Fix a duplicate type check in `policy.ts`.
 
-10. **MITM policy.** Add `COATCHECK_MITM`:
+10. **[Done]** **MITM policy.** Add `COATCHECK_MITM`:
     - `bound` (the default) MITMs a CONNECT only when the target is a host in
       the policy file, on a live ticket, or on an adapter. Everything else is
       a raw tunnel.

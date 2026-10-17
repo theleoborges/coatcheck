@@ -348,6 +348,26 @@ Policy file:
   - `always` is opt-in, for when the host list isn't known in advance or for a
     future egress allowlist.
   - `COATCHECK_PASSTHROUGH_HOSTS` overrides both modes.
+- **Details recorded while implementing roadmap item 10:**
+  - *Unbound tickets match every host.* With `COATCHECK_ALLOW_UNBOUND_SECRETS=1`
+    a live unbound ticket can be swapped anywhere, so while one is live every
+    CONNECT is MITM'd. Otherwise the opt-out would silently stop working on
+    hosts outside the policy.
+  - *Session-bound (CDP) tickets don't count.* They never swap on HTTP(S).
+  - *An adapter host counts only when CDP is enabled*, because that is the
+    only time its responses are rewritten. Its API key ticket is normally
+    covered by the policy's `shared` hosts anyway.
+  - *`COATCHECK_PASSTHROUGH_HOSTS` uses the allowed-host syntax* (exact, `*.`
+    wildcard, IP) without `http://`, which means nothing for a CONNECT.
+    Invalid entries fail startup.
+  - *Upgrade handling.* After forwarding a request that carries an `Upgrade`
+    header, coatcheck stops parsing the client stream and holds further
+    bytes until the upstream's next response head. `101` turns both
+    directions into a raw pipe (no swapping in frames); anything else resumes
+    request parsing. An upgrade request pipelined behind other unanswered
+    requests isn't supported (clients open a fresh connection for upgrades).
+  - Each CONNECT logs `mode=mitm|passthrough` with a `reason`
+    (`policy`, `ticket`, `adapter`, `always`, `passthrough-list`, `not-bound`).
 - **The MITM TLS server advertises ALPN `http/1.1` only.** The request parser is
   HTTP/1.1, so h2-capable clients have to negotiate HTTP/1.1, not fail or
   stall. A test asserts the negotiated protocol.

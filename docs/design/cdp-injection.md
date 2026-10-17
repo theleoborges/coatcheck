@@ -90,10 +90,10 @@ The replacement is produced by `CdpSessionStore.register(realConnectUrl)`
 `ws://{COATCHECK_CDP_ADVERTISE_HOST}:{COATCHECK_CDP_PORT}/cdp/{sid}`. The signing key
 in the real URL never reaches the agent.
 
-The rewrite only happens on a MITM'd connection. The MITM is only engaged when
-the token store is non-empty at CONNECT time (`src/mitm.ts`); in practice
-the session-create request carries the API-key ticket, so the store is
-non-empty.
+The rewrite only happens on a MITM'd connection. With CDP enabled, the
+browser service's API host is always intercepted in the default
+`COATCHECK_MITM=bound` mode, as an adapter host (`src/mitm.ts`); unless it is
+listed in `COATCHECK_PASSTHROUGH_HOSTS`, which disables the rewrite.
 
 ### Step 2: session-bound tickets (`POST /_vault/mint-tokens`)
 

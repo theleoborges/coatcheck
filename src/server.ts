@@ -6,6 +6,8 @@ import type { CertAuthority } from './ca.js';
 import type { CdpSessionStore } from './cdp-session-store.js';
 import { handleVaultRequest } from './vault-handler.js';
 import { EMPTY_POLICY, type Policy } from './policy.js';
+import type { HostPattern } from './host-matcher.js';
+import type { MitmMode } from './config.js';
 import { handleForwardRequest } from './forward.js';
 import { createConnectHandler } from './mitm.js';
 
@@ -22,6 +24,10 @@ export interface CoatcheckDeps {
   policy?: Policy;
   /** `COATCHECK_ALLOW_UNBOUND_SECRETS`. Default: false (unbound secrets get 403 at mint). */
   allowUnboundSecrets?: boolean;
+  /** `COATCHECK_MITM`. Default: `bound`. */
+  mitm?: MitmMode;
+  /** `COATCHECK_PASSTHROUGH_HOSTS`. Default: none. */
+  passthroughHosts?: HostPattern[];
   /** `vault_url` hint in 404s (`COATCHECK_MISSING_SECRET_URL`). */
   missingSecretUrl?: string;
   /** Defaults to `api.browserbase.com`. */
@@ -63,6 +69,9 @@ export function createCoatcheck(deps: CoatcheckDeps): Coatcheck {
     cdp: deps.cdp,
     browserbaseApiHost: deps.browserbaseApiHost ?? BROWSERBASE_API_HOST,
     upstreamCa: deps.upstreamCa,
+    policy: vaultDeps.policy,
+    mitm: deps.mitm ?? 'bound',
+    passthroughHosts: deps.passthroughHosts ?? [],
   });
   server.on('connect', (req, socket, head) => { void onConnect(req, socket as Socket, head); });
 

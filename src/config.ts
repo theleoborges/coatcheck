@@ -7,6 +7,10 @@
 
 import { isValidSecretName } from './secret-provider.js';
 import { EMPTY_POLICY, parsePolicy, type Policy } from './policy.js';
+import { parseHostPattern, type HostPattern } from './host-matcher.js';
+
+/** `COATCHECK_MITM`: `bound` MITMs only hosts a ticket could be swapped for; `always` MITMs every CONNECT. */
+export type MitmMode = 'bound' | 'always';
 
 export type Env = Readonly<Record<string, string | undefined>>;
 
@@ -30,6 +34,9 @@ export interface Config {
   policyFile?: string;
   /** `COATCHECK_ALLOW_UNBOUND_SECRETS`: mint tickets for secrets with no allowed hosts (they swap for any host). */
   allowUnboundSecrets: boolean;
+  mitm: MitmMode;
+  /** `COATCHECK_PASSTHROUGH_HOSTS`: never MITM'd, in either mode (cert-pinned clients). */
+  passthroughHosts: HostPattern[];
 }
 
 /** Reads the policy file. Injected so `loadConfig` stays pure. */
@@ -140,6 +147,17 @@ export function loadConfig(env: Env, readFile?: ReadFile): Config {
     if (text !== undefined) policy = parsePolicy(text, r.problems, `COATCHECK_POLICY_FILE '${policyFile}'`);
   }
 
+  const mitmRaw = r.string('COATCHECK_MITM') ?? 'bound';
+  if (mitmRaw !== 'bound' && mitmRaw !== 'always') {
+    r.problems.push(`COATCHECK_MITM must be 'bound' or 'always' (got '${mitmRaw}')`);
+  }
+  const passthroughHosts: HostPattern[] = [];
+  for (const entry of (r.string('COATCHECK_PASSTHROUGH_HOSTS') ?? '').split(',').map(e => e.trim()).filter(Boolean)) {
+    const p = entry.toLowerCase().startsWith('http://') ? 'must not have a scheme' : parseHostPattern(entry);
+    if (typeof p === 'string') r.problems.push(`COATCHECK_PASSTHROUGH_HOSTS entry '${entry}': ${p}`);
+    else passthroughHosts.push(p);
+  }
+
   const cdpEnabled = r.bool('COATCHECK_CDP_ENABLED', false);
   const cdpPort = r.int('COATCHECK_CDP_PORT', 8444, 1, 65535);
   const config: Config = {
@@ -160,6 +178,8 @@ export function loadConfig(env: Env, readFile?: ReadFile): Config {
     policy,
     policyFile,
     allowUnboundSecrets: r.bool('COATCHECK_ALLOW_UNBOUND_SECRETS', false),
+    mitm: mitmRaw === 'always' ? 'always' : 'bound',
+    passthroughHosts,
   };
 
   if (r.problems.length > 0) throw new ConfigError(r.problems);

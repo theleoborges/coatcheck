@@ -301,7 +301,8 @@ describe('coatcheck server: host-bound tickets', () => {
   it('blocks the exfiltration over HTTPS: keyed on the CONNECT target, not Host', async () => {
     const logs = captureLogs();
     const upstream = await startHttpsUpstream(); // stands in for attacker.example
-    const { port } = await startProxy({ provider: provider(), policy });
+    // `always`: the tunnel is MITM'd, so the swap itself is what refuses.
+    const { port } = await startProxy({ provider: provider(), policy, mitm: 'always' });
     const tok = await mint(port);
 
     const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
@@ -317,6 +318,21 @@ describe('coatcheck server: host-bound tickets', () => {
     expect(upstream.received).toHaveLength(0);
     expect(logs).toContainEqual(expect.stringContaining('[swap] scheme=https host=127.0.0.1 result=denied secrets=github-token'));
     expect(logs.join('\n')).not.toContain('ghp_REAL_VALUE');
+  });
+
+  it('under the default bound mode, sends the HTTPS exfiltration down a raw tunnel: only the literal ticket leaves', async () => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ provider: provider(), policy });
+    const tok = await mint(port);
+
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, upstreamCa.caCertPem); // not intercepted: the upstream's own cert
+    expect(issuerCn(t)).toContain('CN=upstream test CA');
+    t.write(`GET / HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: Bearer ${tok}\r\n\r\n`);
+    await readResponses(t, 1);
+    expect(upstream.received[0].headers.authorization).toBe(`Bearer ${tok}`);
+    expect(logs).toContainEqual(expect.stringContaining('mode=passthrough reason=not-bound'));
   });
 
   it('denies a keep-alive tunnel on the first request carrying a mis-bound ticket', async () => {
@@ -356,6 +372,179 @@ describe('coatcheck server: host-bound tickets', () => {
     expect(plain.received[0].url).toBe('/p?k=real-http');
     // The HTTPS-only ticket is refused over plaintext.
     expect((await viaProxy(port, `http://127.0.0.1:${plain.port}/p?k=${tlsTok}`)).status).toBe(403);
+  });
+});
+
+/**
+ * Raw TLS upstream on 127.0.0.1 (byte-level control for upgrade tests). Answers
+ * `Upgrade: websocket` with 101 then echoes bytes; any other Upgrade with 426;
+ * plain requests with 200 whose body is the request head.
+ */
+async function startRawTlsUpstream() {
+  const leaf = await upstreamCa.getCertForHost('127.0.0.1');
+  const heads: string[] = [];
+  const server = tls.createServer({ key: leaf.key, cert: leaf.cert }, sock => {
+    let buf = Buffer.alloc(0);
+    let echo = false;
+    sock.on('error', () => {});
+    sock.on('data', d => {
+      if (echo) { sock.write(d); return; }
+      buf = Buffer.concat([buf, d]);
+      for (;;) {
+        const end = buf.indexOf('\r\n\r\n');
+        if (end === -1) return;
+        const head = buf.subarray(0, end).toString();
+        buf = buf.subarray(end + 4);
+        heads.push(head);
+        if (/^upgrade: websocket/im.test(head)) {
+          sock.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
+          echo = true;
+          if (buf.length > 0) sock.write(buf);
+          return;
+        }
+        if (/^upgrade:/im.test(head)) sock.write('HTTP/1.1 426 Upgrade Required\r\nContent-Length: 2\r\n\r\nno');
+        else sock.write(`HTTP/1.1 200 OK\r\nContent-Length: ${Buffer.byteLength(head)}\r\n\r\n${head}`);
+      }
+    });
+  });
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+  cleanups.push(() => new Promise<void>(r => server.close(() => r())));
+  return { port: (server.address() as AddressInfo).port, heads };
+}
+
+describe('coatcheck server: MITM policy', () => {
+  /** Issuer of the certificate the client sees on a CONNECT to the upstream: proxy CA = MITM'd. */
+  async function issuerSeen(proxyPort: number, upstreamPort: number): Promise<'proxy' | 'upstream'> {
+    const { status, socket } = await connect(proxyPort, `127.0.0.1:${upstreamPort}`);
+    expect(status).toBe('HTTP/1.1 200 Connection Established');
+    const t = await new Promise<tls.TLSSocket>((resolve, reject) => {
+      // Trust both CAs; the issuer tells us which side terminated TLS.
+      const sock = tls.connect({ socket, ca: [proxyCa.caCertPem, upstreamCa.caCertPem], host: '127.0.0.1' }, () => resolve(sock));
+      sock.once('error', reject);
+    });
+    cleanups.push(() => { t.destroy(); });
+    return issuerCn(t).includes('CN=proxy test CA') ? 'proxy' : 'upstream';
+  }
+  const loopbackPolicy = parsePolicy(JSON.stringify({ secrets: { k: { allowed_hosts: ['127.0.0.1'] } } }), []);
+
+  it('bound (default): MITMs a policy host even before any ticket exists', async () => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ policy: loopbackPolicy });
+    expect(await issuerSeen(port, upstream.port)).toBe('proxy');
+    expect(logs).toContainEqual(expect.stringContaining('mode=mitm reason=policy'));
+  });
+
+  it('bound: MITMs a host on a live ticket, and only while one is live', async () => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy();
+    expect(await issuerSeen(port, upstream.port)).toBe('upstream');
+    tokenStore.issue('k', 'v', { allowedHosts: hosts('127.0.0.1') });
+    expect(await issuerSeen(port, upstream.port)).toBe('proxy');
+    expect(logs).toContainEqual(expect.stringContaining('mode=mitm reason=ticket'));
+  });
+
+  it('bound: tunnels hosts no ticket is bound to, even while other tickets are live', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy();
+    tokenStore.issue('github-token', 'v', { allowedHosts: hosts('api.github.com') });
+    tokenStore.issue('login:password', 'v', { sessionId: 'sid' }); // CDP tickets never swap on HTTPS
+    expect(await issuerSeen(port, upstream.port)).toBe('upstream');
+  });
+
+  it('bound: a live unbound ticket (COATCHECK_ALLOW_UNBOUND_SECRETS) MITMs every host', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy();
+    tokenStore.issue('unbound', 'v');
+    expect(await issuerSeen(port, upstream.port)).toBe('proxy');
+  });
+
+  it('bound: MITMs the browser adapter host when CDP is enabled', async () => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ cdp: { port: 8444, advertiseHost: '127.0.0.1' }, browserbaseApiHost: '127.0.0.1' });
+    expect(await issuerSeen(port, upstream.port)).toBe('proxy');
+    expect(logs).toContainEqual(expect.stringContaining('mode=mitm reason=adapter'));
+  });
+
+  it('always: MITMs every CONNECT', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ mitm: 'always' });
+    expect(await issuerSeen(port, upstream.port)).toBe('proxy');
+  });
+
+  it('passthrough hosts override both modes (cert-pinned clients)', async () => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream();
+    const passthroughHosts = hosts('127.0.0.1');
+    for (const mitm of ['bound', 'always'] as const) {
+      const { tokenStore, port } = await startProxy({ mitm, passthroughHosts, policy: loopbackPolicy });
+      tokenStore.issue('k', 'v', { allowedHosts: hosts('127.0.0.1') });
+      expect(await issuerSeen(port, upstream.port), mitm).toBe('upstream');
+    }
+    expect(logs).toContainEqual(expect.stringContaining('mode=passthrough reason=passthrough-list'));
+  });
+
+  it('negotiates http/1.1 with an h2-capable client', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ mitm: 'always' });
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await new Promise<tls.TLSSocket>((resolve, reject) => {
+      const sock = tls.connect({ socket, ca: proxyCa.caCertPem, host: '127.0.0.1', ALPNProtocols: ['h2', 'http/1.1'] }, () => resolve(sock));
+      sock.once('error', reject);
+    });
+    expect(t.alpnProtocol).toBe('http/1.1');
+    t.write('GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+    const [res] = await readResponses(t, 1);
+    expect(res.head).toMatch(/^HTTP\/1\.1 200/);
+  });
+
+  it('turns the tunnel into a raw pipe after 101 Switching Protocols, so WebSockets work', async () => {
+    captureLogs();
+    const upstream = await startRawTlsUpstream();
+    const { tokenStore, port } = await startProxy();
+    const tok = tokenStore.issue('k', 'real-ws-key', { allowedHosts: hosts('127.0.0.1') }).id;
+
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    expect(issuerCn(t)).toContain('CN=proxy test CA');
+    // Frame bytes sent right behind the upgrade request are held until the 101.
+    t.write(`GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nAuthorization: Bearer ${tok}\r\n\r\nearly`);
+    const [res] = await readResponses(t, 1);
+    expect(res.head).toMatch(/^HTTP\/1\.1 101 /);
+    expect(upstream.heads[0]).toContain('Authorization: Bearer real-ws-key');
+
+    // Binary-ish frames with no CRLFCRLF would stall an HTTP parser; a raw pipe echoes them.
+    let echoed = res.body;
+    const frame = '\x81\x05hello';
+    t.write(frame);
+    await new Promise<void>(resolve => {
+      const onData = (d: Buffer) => { echoed += d.toString('latin1'); if (echoed.includes(frame)) { t.off('data', onData); resolve(); } };
+      t.on('data', onData);
+    });
+    expect(echoed.startsWith('early')).toBe(true);
+    expect(upstream.heads).toHaveLength(1);
+  });
+
+  it('keeps parsing (and swapping) when the upstream refuses an upgrade', async () => {
+    captureLogs();
+    const upstream = await startRawTlsUpstream();
+    const { tokenStore, port } = await startProxy();
+    const tok = tokenStore.issue('k', 'real-key', { allowedHosts: hosts('127.0.0.1') }).id;
+
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write('GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n');
+    const [refused] = await readResponses(t, 1);
+    expect(refused.head).toMatch(/^HTTP\/1\.1 426 /);
+    t.write(`GET /next HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${tok}\r\n\r\n`);
+    const [next] = await readResponses(t, 1);
+    expect(next.body).toContain('X-Key: real-key');
   });
 });
 

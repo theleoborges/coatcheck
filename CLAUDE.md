@@ -20,13 +20,13 @@ Repo is **private** until we're ready to publish. Target license Apache-2.0.
 | File | Role |
 |---|---|
 | `src/index.ts` | Entrypoint: loads config + provider, builds deps, listens on 3128, starts the CDP proxy, SIGTERM |
-| `src/config.ts` | Pure `loadConfig(env)` → typed `Config`; every `COATCHECK_*` core setting; legacy names fail with "renamed to X"; `ConfigError` lists all problems |
+| `src/config.ts` | Pure `loadConfig(env)` → typed `Config`; every `COATCHECK_*` core setting (incl. `COATCHECK_MITM`, `COATCHECK_PASSTHROUGH_HOSTS`, `COATCHECK_ALLOW_UNBOUND_SECRETS`); legacy names fail with "renamed to X"; `ConfigError` lists all problems |
 | `src/policy.ts` | `COATCHECK_POLICY_FILE` parser (strict schema): per-secret `allowed_hosts` rules (exact or `prefix*`, exact > longest prefix) and the `shared` allowlist for `/_secret/*`; `policyHostsFor` |
 | `src/host-matcher.ts` | Allowed-host patterns: exact, `*.suffix` (not apex, ≥2 labels), `http://` opt-in for plaintext, IP exact; normalised (lowercase, punycode); `matchesHost(patterns, {host, scheme})`, `intersectHostPatterns`, `formatHostPattern` |
 | `src/secret-binding.ts` | Mint-time binding: `parseSecretValue` (simple / multi, `{value,_allowed_hosts}` is simple, `_`-keys are metadata), `resolveBinding` (policy ∩ in-band; unbound → 403 unless `COATCHECK_ALLOW_UNBOUND_SECRETS`) |
 | `src/providers/index.ts` | `loadProvider(name, ctx)`: `COATCHECK_PROVIDER` → provider factory |
 | `src/server.ts` | `createCoatcheck(deps)`: side-effect-free factory for the proxy + vault API server (tests start it on port 0) |
-| `src/mitm.ts` | `CONNECT` → MITM (only when token store non-empty) or passthrough; header/URL token swap on keep-alive requests, keyed on the CONNECT target; host mismatch → 403 + close tunnel; `connectUrl` rewrite wiring |
+| `src/mitm.ts` | `CONNECT` → MITM or passthrough per `COATCHECK_MITM` (`bound`: policy hosts, live-ticket hosts, adapter host; `always`) with `COATCHECK_PASSTHROUGH_HOSTS` overriding; ALPN `http/1.1` only; raw pipe after `101`; header/URL token swap on keep-alive requests, keyed on the CONNECT target; host mismatch → 403 + close tunnel; `connectUrl` rewrite wiring |
 | `src/forward.ts` | Plain-HTTP forward proxy: path/query/header swap keyed on the URL host (plaintext needs `http://` entries); strips `proxy-authorization` + hop-by-hop; mismatch → 403 |
 | `src/swap-log.ts` | Structured swap-outcome lines per request (`hit`/`unbound`/`denied`/`miss`; names, counts, ages; never values); `hostMismatchBody` |
 | `src/ca.ts` | In-process ECDSA P-256 root CA + per-host leaf certs (`@peculiar/x509` on WebCrypto); leafs in an in-memory LRU; only the CA persists, and only when `CA_DIR` is set |

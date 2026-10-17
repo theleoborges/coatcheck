@@ -165,14 +165,19 @@ ticket's allowed hosts can carry the same ticket for 15 minutes
 session-bound tickets are revoked early (on CDP disconnect). There is no
 single-use option.
 
-### MEDIUM: MITM engages only when the token store is non-empty
+### LOW: `bound` MITM mode decides per tunnel, at CONNECT time
 
-At CONNECT time, an empty store means a raw TCP tunnel (`mitm.ts`). A
-tunnel opened before the first ticket was issued stays passthrough for its
-whole life, so a client with a keep-alive connection pool can later send a
-ticket down an un-MITM'd tunnel. It fails closed (the upstream sees `cct_…`
-and rejects it), but it is surprising, and it also means traffic inspection
-and any future allowlist would not apply to those tunnels.
+Fixed in part by roadmap item 10: interception no longer depends on whether
+the token store is empty. With `COATCHECK_MITM=bound` (the default) a
+`CONNECT` is intercepted when its target is a policy host, an allowed host of
+a live ticket, or the browser adapter host with CDP enabled; everything else
+is a raw tunnel, because no ticket could be swapped there (`mitm.ts`). The
+residual: a keep-alive tunnel opened to a host bound only in-band
+(`_allowed_hosts`), before the first ticket for that host was minted, stays
+passthrough for its whole life. It fails closed (the upstream sees `cct_…` and
+rejects it). `COATCHECK_MITM=always` intercepts everything, and
+`COATCHECK_PASSTHROUGH_HOSTS` exempts cert-pinned hosts in both modes (tickets
+sent there are never swapped).
 
 ### MEDIUM: vault endpoints are unauthenticated
 
@@ -199,8 +204,10 @@ bytes pass through. This is a functional limitation (tickets in JSON or
 form bodies do not work) and narrows the substitution surface, which is
 mildly protective. Related: `Transfer-Encoding: chunked` request bodies are not
 parsed (`mitm.ts`), so a chunked body can misalign the request parser
-on a keep-alive tunnel. The MITM also assumes HTTP/1.1 request/response:
-WebSocket upgrades or other protocols tunneled through a MITM'd CONNECT stall.
+on a keep-alive tunnel. The MITM speaks HTTP/1.1 only and advertises
+just `http/1.1` over ALPN. After a `101 Switching Protocols` response the
+tunnel becomes a raw pipe, so WebSocket frames are neither swapped nor
+inspected.
 
 ### Browser injection
 
