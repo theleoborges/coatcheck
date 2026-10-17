@@ -28,6 +28,8 @@ export interface Config {
   /** From `COATCHECK_POLICY_FILE`; empty (no shared secrets, nothing bound) when unset. */
   policy: Policy;
   policyFile?: string;
+  /** `COATCHECK_ALLOW_UNBOUND_SECRETS`: mint tickets for secrets with no allowed hosts (they swap for any host). */
+  allowUnboundSecrets: boolean;
 }
 
 /** Reads the policy file. Injected so `loadConfig` stays pure. */
@@ -157,6 +159,7 @@ export function loadConfig(env: Env, readFile?: ReadFile): Config {
       : undefined,
     policy,
     policyFile,
+    allowUnboundSecrets: r.bool('COATCHECK_ALLOW_UNBOUND_SECRETS', false),
   };
 
   if (r.problems.length > 0) throw new ConfigError(r.problems);

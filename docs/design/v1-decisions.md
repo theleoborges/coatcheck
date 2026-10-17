@@ -142,6 +142,46 @@ by the agent is deferred, and if it is ever added it may only narrow.
 - **No policy file means no shared secrets.** `/_secret/*` returns `403` for
   every name.
 
+### Host binding details (recorded while implementing roadmap item 9)
+
+- **Intersection is computed, not deferred.** The effective list is the
+  pairwise intersection of the two pattern lists: exact ∩ exact is the host
+  when equal, exact ∩ wildcard is the exact host when the wildcard covers it,
+  and wildcard ∩ wildcard is the narrower wildcard when one suffix contains the
+  other. An entry allows plaintext only when both sides do. Rationale: one
+  concrete list can be snapshotted on the ticket and shown in the mint
+  response.
+- **An empty intersection is refused at mint time** (`403`, naming the
+  secret). The ticket could never be used, so this is the same reasoning as
+  deny-at-mint for unbound secrets.
+- **Underscore keys are metadata.** In a JSON secret, every key starting with
+  `_` (`_cleartext`, `_allowed_hosts`, and any future one) is hidden from the
+  field list and can't be requested as a field. This follows from the
+  "only non-underscore key is `value`" rule.
+- **`_allowed_hosts` must be a non-empty array of valid entries.** Anything
+  else (not an array, empty, a non-string, an invalid entry) fails minting
+  with `500`, as an invalid in-band entry does.
+- **Every minting route applies the binding:** `/_vault/{name}` (all fields of
+  a multi-value secret share the secret's hosts), `/_secret/{name}` (policy
+  `shared` hosts ∩ in-band), `/_vault/{name}/refresh`, and
+  `/_vault/mint-tokens`. Session-bound CDP tickets snapshot the login secret's
+  hosts now; enforcing them against the page origin is roadmap item 15.
+  Cleartext fields aren't tickets and are returned whether or not the secret
+  is bound.
+- **Unbound tickets in the token store.** A ticket issued without
+  `allowedHosts` is unbound and substitutes for any host. The vault API only
+  issues one when `COATCHECK_ALLOW_UNBOUND_SECRETS=1`; the mint response then
+  carries `"allowed_hosts": null`.
+- **Forward path swaps only in the path and query.** Swapping into the URL's
+  host or userinfo would change the host being dialled after the check (and
+  leak the value in a DNS query), so tickets there are left as literals. Only
+  `http:` absolute-form URLs are forwarded; anything else gets `400`.
+- **A denied MITM request closes the tunnel.** coatcheck answers `403` with
+  `Connection: close` and drops the upstream connection. Requests pipelined
+  ahead of it that the upstream hasn't answered yet are abandoned. Rationale:
+  the parser can't interleave a synthetic response with in-flight upstream
+  responses safely, and denial is an attack signal, not a normal outcome.
+
 ### Default: deny, at mint time
 
 - `/_vault/{name}` for an unbound secret returns `403` with an error naming the

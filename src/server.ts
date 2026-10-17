@@ -20,6 +20,8 @@ export interface CoatcheckDeps {
   cdp?: { port: number; advertiseHost: string };
   /** Operator policy (`COATCHECK_POLICY_FILE`). Default: empty. */
   policy?: Policy;
+  /** `COATCHECK_ALLOW_UNBOUND_SECRETS`. Default: false (unbound secrets get 403 at mint). */
+  allowUnboundSecrets?: boolean;
   /** `vault_url` hint in 404s (`COATCHECK_MISSING_SECRET_URL`). */
   missingSecretUrl?: string;
   /** Defaults to `api.browserbase.com`. */
@@ -45,6 +47,7 @@ export function createCoatcheck(deps: CoatcheckDeps): Coatcheck {
     ca: deps.ca,
     missingSecretUrl: deps.missingSecretUrl,
     policy: deps.policy ?? EMPTY_POLICY,
+    allowUnboundSecrets: deps.allowUnboundSecrets ?? false,
   };
 
   const server = http.createServer((req, res) => {

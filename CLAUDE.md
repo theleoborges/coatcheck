@@ -22,15 +22,16 @@ Repo is **private** until we're ready to publish. Target license Apache-2.0.
 | `src/index.ts` | Entrypoint: loads config + provider, builds deps, listens on 3128, starts the CDP proxy, SIGTERM |
 | `src/config.ts` | Pure `loadConfig(env)` → typed `Config`; every `COATCHECK_*` core setting; legacy names fail with "renamed to X"; `ConfigError` lists all problems |
 | `src/policy.ts` | `COATCHECK_POLICY_FILE` parser (strict schema): per-secret `allowed_hosts` rules (exact or `prefix*`, exact > longest prefix) and the `shared` allowlist for `/_secret/*`; `policyHostsFor` |
-| `src/host-matcher.ts` | Allowed-host patterns: exact, `*.suffix` (not apex, ≥2 labels), `http://` opt-in for plaintext, IP exact; normalised (lowercase, punycode); `matchesHost(patterns, {host, scheme})`. **Not enforced at swap time until roadmap item 9** |
+| `src/host-matcher.ts` | Allowed-host patterns: exact, `*.suffix` (not apex, ≥2 labels), `http://` opt-in for plaintext, IP exact; normalised (lowercase, punycode); `matchesHost(patterns, {host, scheme})`, `intersectHostPatterns`, `formatHostPattern` |
+| `src/secret-binding.ts` | Mint-time binding: `parseSecretValue` (simple / multi, `{value,_allowed_hosts}` is simple, `_`-keys are metadata), `resolveBinding` (policy ∩ in-band; unbound → 403 unless `COATCHECK_ALLOW_UNBOUND_SECRETS`) |
 | `src/providers/index.ts` | `loadProvider(name, ctx)`: `COATCHECK_PROVIDER` → provider factory |
 | `src/server.ts` | `createCoatcheck(deps)`: side-effect-free factory for the proxy + vault API server (tests start it on port 0) |
-| `src/mitm.ts` | `CONNECT` → MITM (only when token store non-empty) or passthrough; header/URL token swap on keep-alive requests; `connectUrl` rewrite wiring |
-| `src/forward.ts` | Plain-HTTP forward proxy with URL/header token swap |
-| `src/swap-log.ts` | One structured swap-outcome line per request (names, counts, ages; never values) |
+| `src/mitm.ts` | `CONNECT` → MITM (only when token store non-empty) or passthrough; header/URL token swap on keep-alive requests, keyed on the CONNECT target; host mismatch → 403 + close tunnel; `connectUrl` rewrite wiring |
+| `src/forward.ts` | Plain-HTTP forward proxy: path/query/header swap keyed on the URL host (plaintext needs `http://` entries); strips `proxy-authorization` + hop-by-hop; mismatch → 403 |
+| `src/swap-log.ts` | Structured swap-outcome lines per request (`hit`/`unbound`/`denied`/`miss`; names, counts, ages; never values); `hostMismatchBody` |
 | `src/ca.ts` | In-process ECDSA P-256 root CA + per-host leaf certs (`@peculiar/x509` on WebCrypto); leafs in an in-memory LRU; only the CA persists, and only when `CA_DIR` is set |
 | `src/connect-target.ts` | Strict `CONNECT` target parser (RFC 1123 DNS name or IP literal, port 1–65535); invalid → 400 |
-| `src/token-store.ts` | In-memory tickets, TTL 900s default, optional CDP session binding, `replaceAll` / `replaceAllForSession` |
+| `src/token-store.ts` | In-memory tickets, TTL 900s default; `issue(name, value, {ttlSeconds, allowedHosts, sessionId})`; `replaceAll(input, {host, scheme})` denies the whole request if any ticket is bound elsewhere; `replaceAllForSession` (CDP; origin check is roadmap item 15) |
 | `src/vault-handler.ts` | `/_health`, `/_ca`, `/_vault*`, `/_secret/*`, `mint-tokens`, OAuth `refresh`; multi-field JSON secrets + `_cleartext` |
 | `src/secret-provider.ts` | `SecretProvider` / `SecretStore` / `Secret` interfaces, `withCache`, secret-name validation (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, enforced in `vault-handler.ts` before any provider call) |
 | `src/providers/aws.ts` | **The only AWS-coupled file**; `loadAwsConfig` parses `COATCHECK_AWS_*` (prefixes with `{agentId}`, role ARN, session name): SSM (per-agent secrets: get/exists/put/list), Secrets Manager (shared secrets), STS AssumeRole; `awsErrorCode` checks `err.name` and `err.Code` |
@@ -43,9 +44,9 @@ Repo is **private** until we're ready to publish. Target license Apache-2.0.
 
 ## Known security gaps (fix before going public)
 
-1. **Tickets are not bound to destination hosts** — the MITM path (`src/mitm.ts`) knows the hostname but only logs it. A ticket sent to any host gets the real value. The policy file and matcher exist (`src/policy.ts`, `src/host-matcher.ts`); enforcement at swap time (HTTP and CDP) is roadmap item 9.
+1. ~~**Tickets are not bound to destination hosts**~~ — fixed on HTTP(S) (roadmap item 9): tickets snapshot allowed hosts (policy ∩ in-band `_allowed_hosts`), unbound secrets are refused at mint, and the MITM/forward paths deny mismatches with `403`. CDP origin binding is still open (roadmap item 15).
 2. ~~**Shell injection / path traversal in `src/ca.ts`**~~ — fixed: strict `CONNECT` target validation (`src/connect-target.ts`) and in-process cert generation (`src/ca.ts`, no `openssl`).
-3. **Plain-HTTP forward path also swaps** — `curl -x proxy http://127.0.0.1:<agent-listener>/?k=cct_…` hands the agent the plaintext without leaving the box, so egress enforcement alone doesn't close gap 1. Host binding must cover the HTTP path too.
+3. ~~**Plain-HTTP forward path also swaps**~~ — fixed with gap 1: plaintext only matches `http://` entries, so an agent-run loopback listener never receives a value (test in `src/server.test.ts`).
 4. **The AWS "sidecar assumes a separate role" pattern Liv used was bypassable** — both containers in an ECS task share one task role, and that role was allowed `sts:AssumeRole` on the proxy role, so the agent could assume it directly. `docs/THREAT_MODEL.md` documents correct patterns (separate task, ExternalId only injected into the sidecar, blocking 169.254.170.2). Any AWS deployment guide/provider must not repeat this.
 
 Full list with severities: `docs/THREAT_MODEL.md`. Proxy integration tests (MITM, passthrough, forward, `connectUrl` rewrite): `src/server.test.ts`.

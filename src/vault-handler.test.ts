@@ -5,10 +5,21 @@ import { TokenStore } from './token-store.js';
 import { createMemoryProvider, type MemoryProviderInit } from './providers/memory.js';
 import { EMPTY_POLICY, parsePolicy, type Policy } from './policy.js';
 
-/** The policy these tests run under: one allowlisted shared secret. */
+/** The policy these tests run under: the per-agent secrets they use are bound, plus one allowlisted shared secret. */
 const TEST_POLICY: Policy = parsePolicy(JSON.stringify({
+  secrets: {
+    github: { allowed_hosts: ['api.github.com'] },
+    supabase: { allowed_hosts: ['*.supabase.co'] },
+    trello: { allowed_hosts: ['api.trello.com'] },
+    google: { allowed_hosts: ['*.googleapis.com'] },
+    'example-login': { allowed_hosts: ['login.example.com'] },
+    'my-*': { allowed_hosts: ['api.example.com'] },
+    'api-key': { allowed_hosts: ['api.example.com'] },
+  },
   shared: { 'browserbase-api-key': { allowed_hosts: ['api.browserbase.com'] } },
 }), []);
+
+const https = (host: string) => ({ host, scheme: 'https' as const });
 
 // Save real fetch before any tests can mock it
 const realFetch = globalThis.fetch;
@@ -87,7 +98,7 @@ describe('Vault Handler', () => {
   async function setup(
     secrets: Record<string, string>,
     sharedSecrets: Record<string, string> = {},
-    opts: Pick<MemoryProviderInit, 'writable'> & { noShared?: boolean; missingSecretUrl?: string; policy?: Policy } = {},
+    opts: Pick<MemoryProviderInit, 'writable'> & { noShared?: boolean; missingSecretUrl?: string; policy?: Policy; allowUnbound?: boolean } = {},
   ) {
     tokenStore = new TokenStore();
     const provider = createMemoryProvider({
@@ -102,6 +113,7 @@ describe('Vault Handler', () => {
       ca: mockCa(),
       missingSecretUrl: opts.missingSecretUrl,
       policy: opts.policy ?? TEST_POLICY,
+      allowUnboundSecrets: opts.allowUnbound,
     };
     server = createTestServer(deps);
     port = await listen(server);
@@ -310,7 +322,7 @@ describe('Vault Handler', () => {
 
   it('accepts names at the length limit', async () => {
     const name = 'a'.repeat(128);
-    await setup({ [name]: 'v' });
+    await setup({ [name]: 'v' }, {}, { allowUnbound: true });
     expect((await fetchJSON(port, `/_vault/${name}`)).status).toBe(200);
   });
 
@@ -329,8 +341,98 @@ describe('Vault Handler', () => {
     const { body: b2 } = await fetchJSON(port, '/_vault/trello?field=token');
 
     const url = `https://api.trello.com/1/boards?key=${b1.token}&token=${b2.token}`;
-    const swapped = tokenStore.replaceAll(url);
+    const swapped = tokenStore.replaceAll(url, https('api.trello.com'));
     expect(swapped.output).toBe('https://api.trello.com/1/boards?key=trello-key-123&token=trello-tok-456');
+  });
+
+  // --- Host binding at mint time ---
+
+  describe('host binding', () => {
+    it('refuses to mint a ticket for an unbound secret (403, nothing issued)', async () => {
+      await setup({ 'unlisted-key': 'sk-real' });
+      const { status, body } = await fetchJSON(port, '/_vault/unlisted-key');
+      expect(status).toBe(403);
+      expect(body.error).toContain("'unlisted-key' is not bound to any host");
+      expect(JSON.stringify(body)).not.toContain('sk-real');
+      expect(tokenStore.size).toBe(0);
+    });
+
+    it('mints an unbound ticket only when unbound secrets are allowed', async () => {
+      await setup({ 'unlisted-key': 'sk-real' }, {}, { allowUnbound: true });
+      const { status, body } = await fetchJSON(port, '/_vault/unlisted-key');
+      expect(status).toBe(200);
+      expect(body.allowed_hosts).toBeNull();
+      expect(tokenStore.replaceAll(body.token as string, https('anything.example')).swaps).toEqual([
+        { secretName: 'unlisted-key', ageMs: expect.any(Number), unbound: true },
+      ]);
+    });
+
+    it('includes allowed_hosts in the mint response and snapshots them on the ticket', async () => {
+      await setup({ github: 'ghp_real' });
+      const { status, body } = await fetchJSON(port, '/_vault/github');
+      expect(status).toBe(200);
+      expect(body.allowed_hosts).toEqual(['api.github.com']);
+      expect(tokenStore.replaceAll(`${body.token}`, https('api.github.com')).output).toBe('ghp_real');
+      expect(tokenStore.replaceAll(`${body.token}`, https('attacker.example')).denied).toHaveLength(1);
+    });
+
+    it('binds a secret by its in-band _allowed_hosts alone, as a simple secret', async () => {
+      await setup({ 'runtime-key': JSON.stringify({ value: 'sk-runtime', _allowed_hosts: ['api.runtime.example'] }) });
+      const { status, body } = await fetchJSON(port, '/_vault/runtime-key');
+      expect(status).toBe(200);
+      expect(body.allowed_hosts).toEqual(['api.runtime.example']);
+      expect(tokenStore.resolve(body.token as string)).toBe('sk-runtime');
+    });
+
+    it('intersects in-band hosts with the policy, so a secret cannot widen the operator\'s list', async () => {
+      await setup({ supabase: JSON.stringify({ key: 'k', _allowed_hosts: ['proj.supabase.co', 'attacker.example'] }) });
+      const { body } = await fetchJSON(port, '/_vault/supabase?field=key');
+      expect(body.allowed_hosts).toEqual(['proj.supabase.co']);
+      expect(tokenStore.replaceAll(`${body.token}`, https('attacker.example')).denied).toHaveLength(1);
+    });
+
+    it('refuses an empty intersection with 403 and an invalid _allowed_hosts with 500', async () => {
+      await setup({
+        github: JSON.stringify({ value: 'g', _allowed_hosts: ['attacker.example'] }),
+        'runtime-key': JSON.stringify({ value: 'r', _allowed_hosts: ['*'] }),
+      });
+      const empty = await fetchJSON(port, '/_vault/github');
+      expect(empty.status).toBe(403);
+      expect(empty.body.error).toContain('no host allowed by both');
+      const invalid = await fetchJSON(port, '/_vault/runtime-key');
+      expect(invalid.status).toBe(500);
+      expect(invalid.body.error).toContain('invalid _allowed_hosts');
+      expect(tokenStore.size).toBe(0);
+    });
+
+    it('hides _allowed_hosts from the field list and refuses it as a field', async () => {
+      await setup({ supabase: JSON.stringify({ key: 'k', _allowed_hosts: ['proj.supabase.co'] }) });
+      expect((await fetchJSON(port, '/_vault/supabase')).body.fields).toEqual(['key']);
+      expect((await fetchJSON(port, '/_vault/supabase?field=_allowed_hosts')).status).toBe(400);
+    });
+
+    it('still returns cleartext fields of an unbound secret (they are not tickets)', async () => {
+      await setup({ 'unlisted-db': JSON.stringify({ url: 'https://db.example', key: 'k', _cleartext: ['url'] }) });
+      expect((await fetchJSON(port, '/_vault/unlisted-db?field=url')).body).toEqual({ value: 'https://db.example', cleartext: true });
+      expect((await fetchJSON(port, '/_vault/unlisted-db?field=key')).status).toBe(403);
+    });
+
+    it('binds shared-secret tickets to the policy\'s shared hosts', async () => {
+      await setup({}, { 'browserbase-api-key': 'bb_real' });
+      const { body } = await fetchJSON(port, '/_secret/browserbase-api-key');
+      expect(body.allowed_hosts).toEqual(['api.browserbase.com']);
+      expect(tokenStore.replaceAll(`${body.token}`, https('attacker.example')).denied).toHaveLength(1);
+    });
+
+    it('binds web-login tickets and refuses unbound logins', async () => {
+      const login = JSON.stringify({ username: 'alice', password: 'pw' });
+      await setup({ 'example-login': login, 'other-login': login });
+      const ok = await postJSON(port, '/_vault/mint-tokens', { secretName: 'example-login', sessionId: 's' });
+      expect(ok.body.allowed_hosts).toEqual(['login.example.com']);
+      const refused = await postJSON(port, '/_vault/mint-tokens', { secretName: 'other-login', sessionId: 's' });
+      expect(refused.status).toBe(403);
+      expect(tokenStore.size).toBe(2);
+    });
   });
 
   // --- Shared secrets (/_secret/{name}) ---
@@ -392,7 +494,7 @@ describe('Vault Handler', () => {
       await setup({}, { 'browserbase-api-key': 'bb_live_xyz_real' });
       const { body } = await fetchJSON(port, '/_secret/browserbase-api-key');
       const header = `x-bb-api-key: ${body.token}\r\n`;
-      const swapped = tokenStore.replaceAll(header);
+      const swapped = tokenStore.replaceAll(header, https('api.browserbase.com'));
       expect(swapped.output).toBe('x-bb-api-key: bb_live_xyz_real\r\n');
     });
   });
@@ -448,7 +550,7 @@ describe('Vault Handler', () => {
       const swap = tokenStore.replaceAllForSession(`${body.username_token} ${body.password_token}`, 'sess-1');
       expect(swap.output).toBe('alice@example.com hunter2');
       // ...and not on the HTTP path
-      const httpSwap = tokenStore.replaceAll(`${body.password_token}`);
+      const httpSwap = tokenStore.replaceAll(`${body.password_token}`, https('login.example.com'));
       expect(httpSwap.output).toBe(body.password_token);
     });
 
@@ -609,6 +711,52 @@ describe('Vault Handler', () => {
         expect(fetchBody).toContain('refresh_token=1%2F%2Fold-refresh');
         expect(fetchBody).toContain('client_id=test-client-id');
         expect(fetchBody).toContain('grant_type=refresh_token');
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('refuses to send client_secret to a token_url outside the secret\'s allowed hosts', async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = vi.fn() as unknown as typeof fetch;
+      try {
+        const hijacked = JSON.stringify({ ...JSON.parse(googleSecret), token_url: 'https://attacker.example/token' });
+        await setup({ google: hijacked });
+        const { status, body } = await fetchJSON(port, '/_vault/google/refresh', 'POST');
+        expect(status).toBe(403);
+        expect(body.error).toContain("token_url host 'attacker.example'");
+        expect(globalThis.fetch).not.toHaveBeenCalled();
+        expect(tokenStore.size).toBe(0);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('refuses refresh for an unbound secret before calling the token endpoint', async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = vi.fn() as unknown as typeof fetch;
+      try {
+        await setup({ 'unlisted-oauth': googleSecret });
+        const { status } = await fetchJSON(port, '/_vault/unlisted-oauth/refresh', 'POST');
+        expect(status).toBe(403);
+        expect(globalThis.fetch).not.toHaveBeenCalled();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('gives the refreshed access-token ticket the secret\'s binding', async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ access_token: 'ya29.new-token', expires_in: 3600 }),
+      }) as unknown as typeof fetch;
+      try {
+        await setup({ google: googleSecret });
+        const { body } = await fetchJSON(port, '/_vault/google/refresh', 'POST');
+        expect(body.allowed_hosts).toEqual(['*.googleapis.com']);
+        expect(tokenStore.replaceAll(`${body.token}`, https('www.googleapis.com')).output).toBe('ya29.new-token');
+        expect(tokenStore.replaceAll(`${body.token}`, https('attacker.example')).denied).toHaveLength(1);
       } finally {
         globalThis.fetch = originalFetch;
       }

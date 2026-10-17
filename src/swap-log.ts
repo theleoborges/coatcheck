@@ -1,7 +1,14 @@
 import { TICKET_PATTERN, TICKET_PREFIX, type SwapInfo } from './token-store.js';
 
+export interface SwapOutcome {
+  swaps: SwapInfo[];
+  denied: SwapInfo[];
+}
+
 /**
- * Emit a single structured line per outbound request describing the swap outcome.
+ * Emit structured lines per outbound request describing the swap outcome:
+ * `result=denied` (host mismatch, request not forwarded), `result=hit` (bound
+ * tickets swapped), `result=unbound` (tickets without a host binding swapped).
  * `postSwapText` is the text *after* swaps were applied — any ticket literal (`cct_<hex>`)
  * remaining in it is un-swapped (TTL-expired token, stale tunnel, or a literal
  * the agent typed by mistake). Never logs token values, IDs, or request bodies.
@@ -9,13 +16,22 @@ import { TICKET_PATTERN, TICKET_PREFIX, type SwapInfo } from './token-store.js';
 export function logSwapOutcome(
   scheme: 'http' | 'https',
   hostname: string,
-  swaps: SwapInfo[],
+  outcome: SwapOutcome,
   postSwapText: string,
 ): void {
-  if (swaps.length > 0) {
-    const secrets = swaps.map(s => s.secretName).join(',');
-    const maxAge = Math.max(...swaps.map(s => s.ageMs));
-    console.log(`[swap] scheme=${scheme} host=${hostname} result=hit secrets=${secrets} max_age_ms=${maxAge}`);
+  const { swaps, denied } = outcome;
+  if (denied.length > 0) {
+    console.warn(`[swap] scheme=${scheme} host=${hostname} result=denied secrets=${names(denied)}`);
+    return; // nothing is forwarded, so un-swapped literals don't matter
+  }
+
+  const bound = swaps.filter(s => !s.unbound);
+  const unbound = swaps.filter(s => s.unbound);
+  if (bound.length > 0) {
+    console.log(`[swap] scheme=${scheme} host=${hostname} result=hit secrets=${names(bound)} max_age_ms=${maxAge(bound)}`);
+  }
+  if (unbound.length > 0) {
+    console.warn(`[swap] scheme=${scheme} host=${hostname} result=unbound secrets=${names(unbound)} max_age_ms=${maxAge(unbound)}`);
   }
 
   // Reset regex state — TICKET_PATTERN is a /g RegExp shared across calls.
@@ -27,4 +43,26 @@ export function logSwapOutcome(
       `(TTL expiry, passthrough tunnel, or never-issued token — request reaching upstream with ${TICKET_PREFIX}… intact)`
     );
   }
+}
+
+/** Header that marks a response coatcheck produced instead of forwarding the request. */
+export const DENIED_HEADER = 'X-Coatcheck-Denied';
+
+/** JSON body of the `403` sent when a ticket is used for a host it isn't bound to. */
+export function hostMismatchBody(denied: SwapInfo[], hostname: string): string {
+  const secrets = [...new Set(denied.map(d => d.secretName))];
+  return JSON.stringify({
+    error: `Secret ${secrets.map(s => `'${s}'`).join(', ')} is not allowed for host '${hostname}'`,
+    reason: 'host-mismatch',
+    secrets,
+    host: hostname,
+  });
+}
+
+function names(infos: SwapInfo[]): string {
+  return infos.map(s => s.secretName).join(',');
+}
+
+function maxAge(infos: SwapInfo[]): number {
+  return Math.max(...infos.map(s => s.ageMs));
 }

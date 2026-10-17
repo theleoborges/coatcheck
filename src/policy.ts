@@ -114,7 +114,7 @@ function allowedHosts(entry: Json, where: string, source: string, problems: stri
   }
   const out: HostPattern[] = [];
   list.forEach((item, i) => {
-    const parsed = typeof item === 'string' ? parseHostPattern(item) : 'must be a string';
+    const parsed = parseHostPattern(item);
     if (typeof parsed === 'string') problems.push(`${source}: ${where}.allowed_hosts[${i}] ${JSON.stringify(item)}: ${parsed}`);
     else out.push(parsed);
   });

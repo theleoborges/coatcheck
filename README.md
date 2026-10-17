@@ -26,8 +26,8 @@ It works like a coat check. You hand over the coat and get a ticket. The ticket 
 └──────────────────────┘               └──────────────────────────┘
 ```
 
-1. **Ticket issuance.** The agent calls `GET http://127.0.0.1:3128/_vault/{name}`. coatcheck fetches the secret from its backend and returns `cct_` plus 64 hex characters. Tickets live only in coatcheck's memory, with a 15-minute TTL.
-2. **HTTPS substitution.** The agent container sets `HTTPS_PROXY` to coatcheck and trusts coatcheck's CA. While at least one ticket is active, coatcheck intercepts `CONNECT` tunnels with a per-host certificate it signs itself. It replaces every active ticket it finds in the request line and headers, then re-encrypts to the real host, with normal certificate verification. This works with unmodified tools such as curl, git over HTTPS (with a bearer header), Python `requests`, and Node `fetch`, because they only need proxy support and a trusted CA. Plain-HTTP proxy requests get the same treatment. When no tickets are active, `CONNECT` is a blind TCP tunnel.
+1. **Ticket issuance.** The agent calls `GET http://127.0.0.1:3128/_vault/{name}`. coatcheck fetches the secret from its backend and returns `cct_` plus 64 hex characters. Tickets live only in coatcheck's memory, with a 15-minute TTL. Each ticket is bound to the secret's allowed hosts (see [Policy file](#policy-file)); a secret with no allowed hosts gets no ticket.
+2. **HTTPS substitution.** The agent container sets `HTTPS_PROXY` to coatcheck and trusts coatcheck's CA. While at least one ticket is active, coatcheck intercepts `CONNECT` tunnels with a per-host certificate it signs itself. It replaces every active ticket it finds in the request line and headers, then re-encrypts to the real host, with normal certificate verification. A ticket is only replaced when the `CONNECT` target is one of its allowed hosts; otherwise the request is refused with `403` and never forwarded. This works with unmodified tools such as curl, git over HTTPS (with a bearer header), Python `requests`, and Node `fetch`, because they only need proxy support and a trusted CA. Plain-HTTP proxy requests get the same treatment. When no tickets are active, `CONNECT` is a blind TCP tunnel.
 3. **Browser (CDP) injection.** With the CDP proxy enabled, coatcheck rewrites the `connectUrl` in the browser service's session-create response so it points at a local WebSocket proxy. The agent's Playwright client connects there. On the way out, coatcheck swaps session-scoped tickets inside `Input.insertText`, `Runtime.evaluate`, and `Runtime.callFunctionOn`. On the way back, it redacts any real value the page echoes. Keystroke-by-keystroke entry fails closed (details [below](#browser--cdp-credential-injection)).
 4. **OAuth refresh.** `POST /_vault/{name}/refresh` runs the refresh-token exchange inside coatcheck. It writes the new tokens back to the backend and returns only a ticket for the new access token.
 
@@ -44,7 +44,7 @@ This starts coatcheck on `localhost:3128` and LocalStack. It also seeds two demo
 ```bash
 # 1. Get a ticket
 curl -s localhost:3128/_vault/example-api-key
-# {"token":"cct_3b1e…","expires_in":900}
+# {"token":"cct_3b1e…","expires_in":900,"allowed_hosts":["httpbin.org"]}
 
 # 2. Fetch coatcheck's CA
 curl -s localhost:3128/_ca > /tmp/coatcheck-ca.crt
@@ -54,7 +54,14 @@ curl -s --proxy http://localhost:3128 --cacert /tmp/coatcheck-ca.crt \
   -H "Authorization: Bearer cct_3b1e…" https://httpbin.org/headers
 ```
 
-httpbin echoes the request headers, so step 3 shows the **real** value arriving upstream. That is the point of the demo, and also the main open gap: a ticket sent to any host gets swapped (see [limitations](#status--known-limitations)).
+httpbin echoes the request headers, so step 3 shows the **real** value arriving upstream. The demo policy (`examples/policy.example.json`) binds `example-api-key` to `httpbin.org`, so the same ticket sent anywhere else is refused:
+
+```bash
+curl -s --proxy http://localhost:3128 --cacert /tmp/coatcheck-ca.crt \
+  -H "Authorization: Bearer cct_3b1e…" https://example.org/
+# HTTP 403, X-Coatcheck-Denied: host-mismatch
+# {"error":"Secret 'example-api-key' is not allowed for host 'example.org'",…}
+```
 
 To add your own secret to LocalStack:
 
@@ -84,13 +91,13 @@ The API is served on the proxy port (default `127.0.0.1:3128`). **It has no auth
 | `GET /_health` | `{"status":"ok","tokens_active":N}` | Liveness check. |
 | `GET /_ca` | PEM | coatcheck's root CA certificate, for the agent to trust. |
 | `GET /_vault` | `{"secrets":["github-token",…]}` | Lists secret names. Values are not decrypted. |
-| `GET /_vault/{name}` | `{"token":"cct_…","expires_in":900}` | For a single-value secret. |
+| `GET /_vault/{name}` | `{"token":"cct_…","expires_in":900,"allowed_hosts":[…]}` | For a single-value secret. `403` if the secret has no allowed hosts (see [Policy file](#policy-file)). |
 | `GET /_vault/{name}` | `{"type":"multi","fields":[…]}` | For a multi-value (JSON) secret. Request a specific field with `?field=`. |
-| `GET /_vault/{name}?field={f}` | `{"token":"cct_…","expires_in":900}` | Ticket for one field. If the secret's `_cleartext` array lists the field, returns `{"value":"…","cleartext":true}` instead (for non-sensitive values such as URLs and account IDs). |
+| `GET /_vault/{name}?field={f}` | `{"token":"cct_…","expires_in":900,"allowed_hosts":[…]}` | Ticket for one field; every field shares the secret's allowed hosts. If the secret's `_cleartext` array lists the field, returns `{"value":"…","cleartext":true}` instead (for non-sensitive values such as URLs and account IDs). |
 | `GET /_vault/{name}?check=1` | `{"exists":true}` | Checks whether a secret exists without decrypting it. |
-| `GET /_secret/{name}` | `{"token":"cct_…","expires_in":900}` | Shared key from the backend's shared store. Returns 403 unless `{name}` is listed under `shared` in the policy file (with no policy file, every name gets 403). |
-| `POST /_vault/mint-tokens` | `{"username_token":"cct_…","password_token":"cct_…","expires_in":600}` | Body: `{"secretName":"example-login","sessionId":"<cdp sid>","expires_in"?:N}`. The secret must be a multi-value secret with `username` and `password`. Tickets are bound to one CDP session (see below). Default TTL is 600 s, capped at 1800 s. |
-| `POST /_vault/{name}/refresh` | `{"token":"cct_…","expires_in":900}` | Secret fields: `refresh_token`, `token_url`, `client_id`, `client_secret`. coatcheck posts a `refresh_token` grant, writes `access_token`, `expires_at`, and any rotated `refresh_token` back to the backend, and returns a ticket for the new access token. |
+| `GET /_secret/{name}` | `{"token":"cct_…","expires_in":900,"allowed_hosts":[…]}` | Shared key from the backend's shared store. Returns 403 unless `{name}` is listed under `shared` in the policy file (with no policy file, every name gets 403). The ticket is bound to the hosts listed there. |
+| `POST /_vault/mint-tokens` | `{"username_token":"cct_…","password_token":"cct_…","expires_in":600,"allowed_hosts":[…]}` | Body: `{"secretName":"example-login","sessionId":"<cdp sid>","expires_in"?:N}`. The secret must be a multi-value secret with `username` and `password`. Tickets are bound to one CDP session (see below). Default TTL is 600 s, capped at 1800 s. The login secret must have allowed hosts; they are recorded on the tickets, but the CDP path does not check them against the page yet (roadmap item 15). |
+| `POST /_vault/{name}/refresh` | `{"token":"cct_…","expires_in":900,"allowed_hosts":[…]}` | Secret fields: `refresh_token`, `token_url`, `client_id`, `client_secret`. The `token_url` host must be one of the secret's allowed hosts (`403` otherwise), because `client_secret` is sent there. coatcheck posts a `refresh_token` grant, writes `access_token`, `expires_at`, and any rotated `refresh_token` back to the backend, and returns a ticket for the new access token, bound to the same hosts. |
 
 Secret names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` after URL-decoding; anything else (including `/` or a leading `.`) gets `400` before the backend is consulted. `refresh` returns `501` when the configured backend is read-only.
 
@@ -107,6 +114,7 @@ Errors are JSON `{"error":…}` with status 400, 403, 404, 500, 501, or 502.
 | `COATCHECK_TICKET_TTL_SECONDS` | `900` | Lifetime of tickets from `/_vault` and `/_secret`. |
 | `COATCHECK_SECRET_CACHE_TTL_SECONDS` | `300` | How long backend reads are cached; `0` disables the cache. |
 | `COATCHECK_POLICY_FILE` | (unset) | JSON [policy file](#policy-file): allowed hosts per secret and the shared-secret allowlist. Read once at startup; an invalid file stops startup. |
+| `COATCHECK_ALLOW_UNBOUND_SECRETS` | `0` | Set to `1` to mint tickets for secrets with no allowed hosts instead of refusing them with `403`. Such tickets are swapped on requests to **any** host; coatcheck warns at startup and logs `result=unbound` on every swap. |
 | `COATCHECK_MISSING_SECRET_URL` | (unset) | Returned as `vault_url` in 404s, e.g. a dashboard where users add secrets. Omitted when unset. |
 | `COATCHECK_CA_SUBJECT` | `CN=coatcheck CA, O=coatcheck` | Subject of a newly generated CA. |
 | `COATCHECK_CA_DIR` | (unset) | Where to persist the CA key and cert (`ca.key`, `ca.crt`). If unset, coatcheck generates an in-memory CA on every start. If an existing ECDSA P-256 CA is found there, coatcheck reuses it; any other key type (for example an RSA CA from an older version) fails startup until the files are deleted. Per-host certificates are never written to disk. |
@@ -143,7 +151,16 @@ Earlier variable names (`AGENT_LABEL`, `PROXY_PORT`, `PROXY_BIND_HOST`, `CA_DIR`
 - `allowed_hosts` entries are exact hostnames, or `*.example.com`, which matches any subdomain but not `example.com` itself. Entries are case-insensitive and IDNs are converted to punycode. IP addresses match exactly. HTTPS is implied; write `http://host` to also allow plaintext HTTP. Ports and paths are not allowed. A bare `*` and wildcards over a single label (`*.com`) are rejected.
 - The schema is strict: unknown keys, empty `allowed_hosts` lists and invalid entries all stop startup.
 
-> **`allowed_hosts` is parsed and validated but not enforced yet.** Tickets are still swapped on requests to any host. Enforcement is roadmap item 9; until then, treat the file as the shared-secret allowlist plus a declaration of intent.
+### Allowed hosts
+
+Every ticket is bound to its secret's allowed hosts, taken from two sources:
+
+1. the policy file (`secrets`, or `shared` for `/_secret/*`), owned by the operator;
+2. an `_allowed_hosts` array inside a JSON secret, owned by whoever stores the secret. A JSON secret whose only non-underscore key is `value` is a single-value secret, so `{"value":"ghp_…","_allowed_hosts":["api.github.com"]}` works for simple secrets too. Keys starting with `_` are metadata and never offered as fields.
+
+If both are present, the effective list is their **intersection**: a secret can narrow the operator's list but never widen it. If neither is present, the secret is **unbound** and minting a ticket for it fails with `403` (unless `COATCHECK_ALLOW_UNBOUND_SECRETS=1`). An empty intersection is also `403`, and an invalid `_allowed_hosts` is `500`. Mint responses include the effective `allowed_hosts`.
+
+At swap time the host checked is the `CONNECT` target on HTTPS (never the `Host` header or SNI) and the URL host on plain HTTP. Plain HTTP only matches `http://` entries, so a ticket can't be swapped into a request to a loopback or private listener unless that address is listed with `http://`. On a mismatch the request is not forwarded: the client gets `403` with `X-Coatcheck-Denied: host-mismatch` and a JSON body naming the secret and host, and on HTTPS the tunnel is closed. If one ticket in a request is denied, the whole request is.
 
 ## Trusting the CA in the agent container
 
@@ -194,7 +211,9 @@ coatcheck does a **literal substring replace** of active ticket strings, so the 
 - **Client-side signing**, such as AWS SigV4, HMAC request signatures, or JWT minting. The client computes a signature over the ticket, not the real secret.
 - **Expired tickets.** After 15 minutes the ticket is forwarded literally.
 
-If an upstream returns 401 while you are using a ticket, assume the swap did not happen before you assume the stored credential is wrong. coatcheck logs one line per request with no values: `[swap] … result=hit secrets=…` on success, or `result=miss unswapped_ticket_literals=N` when a `cct_<64 hex>` string reaches the upstream intact.
+If an upstream returns 401 while you are using a ticket, assume the swap did not happen before you assume the stored credential is wrong. coatcheck logs one line per request with no values: `[swap] … result=hit secrets=…` on success, `result=denied secrets=…` when a ticket was sent to a host it isn't bound to (the request was not forwarded), `result=unbound` when an unbound ticket was swapped, or `result=miss unswapped_ticket_literals=N` when a `cct_<64 hex>` string reaches the upstream intact.
+
+On the plain-HTTP path tickets are swapped only in the path, query and headers, never in the host or userinfo, and `Proxy-Authorization` and hop-by-hop headers are not forwarded.
 
 ## Browser / CDP credential injection
 
@@ -229,14 +248,14 @@ Client rules:
 
 coatcheck is **pre-1.0**. The HTTP API, ticket format (`cct_…`), and configuration may change. Known gaps, roughly in priority order:
 
-- **Tickets are not bound to destination hosts.** This is the top priority. Today any active ticket is swapped on a request to *any* host. A prompt-injected agent that sends `Authorization: Bearer cct_…` to an attacker's server delivers the real secret, as the httpbin quickstart shows. coatcheck currently protects against the agent *seeing* or *printing* secrets (logs, transcripts, model context), not against it *sending* them somewhere. Per-secret allowed hosts are planned.
+- **Host binding stops redirection, not misuse.** A ticket only works on its secret's allowed hosts, so an agent can't send it to an attacker's server. It can still use the credential maliciously against an allowed host, and an operator who sets `COATCHECK_ALLOW_UNBOUND_SECRETS=1` gives up the protection for unbound secrets.
 - **Request bodies are not substituted.** Only the request line (URL) and headers are. `Transfer-Encoding: chunked` request bodies on the MITM path are not parsed, which can misframe keep-alive connections.
 - **`HTTPS_PROXY` is advisory.** A process that ignores it bypasses coatcheck, which means no substitution and also no protection. Pair coatcheck with egress enforcement (network policy, firewall, or security group) so the agent can reach the internet only through the proxy.
 - **Interception is all-or-nothing while any ticket is live.** With at least one active ticket, *every* `CONNECT` is MITM'd, not just connections that carry tickets. Clients that pin certificates or don't trust the CA will fail during that window.
 - **The API is unauthenticated.** Any process that can reach the port can list secret names and mint tickets. Keep coatcheck on loopback.
 - **The secret backend is AWS-only**, with fixed path prefixes, pending a provider interface (env/file first, then others).
 - **Browserbase is the only browser adapter.** The `connectUrl` rewrite is tied to `api.browserbase.com`.
-- **CDP v1 limits:** one session at a time, no origin binding (a login ticket fills any page in that session), no 2FA, no `page.type()` support, and no screenshot redaction.
+- **CDP v1 limits:** one session at a time, no origin binding yet (login tickets record their allowed hosts, but a login ticket still fills any page in that session), no 2FA, no `page.type()` support, and no screenshot redaction.
 
 ## How this differs from superfly/tokenizer
 
@@ -247,7 +266,7 @@ coatcheck makes different trade-offs:
 - **Unmodified tools.** coatcheck is a standard `HTTPS_PROXY` with TLS interception, so curl, git, SDKs, and code an LLM writes on the fly work if they honor the proxy variable and trust the CA. No client changes are needed.
 - **Secrets by name from a store.** The agent asks for `github-token` and gets a ticket. It never holds secret material, sealed or otherwise. The cost is a stateful component and a backend dependency.
 - **Browser/CDP injection.** coatcheck fills credentials into remote-browser sessions over CDP, with inbound redaction and keystroke fail-closed. tokenizer does not cover browsers.
-- **Weaker today.** coatcheck lacks host binding and signing processors, both areas where tokenizer is ahead. Host binding is next on the roadmap.
+- **Weaker today.** coatcheck has no signing processors, an area where tokenizer is ahead. Both bind secrets to hosts; coatcheck's binding comes from an operator policy file and the stored secret rather than from the sealed secret.
 
 ## Development
 

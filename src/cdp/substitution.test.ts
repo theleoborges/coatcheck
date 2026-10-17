@@ -9,7 +9,7 @@ describe('CDP substitution', () => {
   afterEach(() => store?.destroy());
 
   function mint(secretName: string, value: string) {
-    return store.issueForSession(secretName, value, SID).id;
+    return store.issue(secretName, value, { sessionId: SID }).id;
   }
 
   // --- Outbound (token → real value) ---
@@ -68,7 +68,7 @@ describe('CDP substitution', () => {
 
     it('does not substitute another session\'s token', () => {
       store = new TokenStore();
-      const otherTok = store.issueForSession('site:password', 'real-secret-42', 'sess-other').id;
+      const otherTok = store.issue('site:password', 'real-secret-42', { sessionId: 'sess-other' }).id;
       const frame = JSON.stringify({ id: 5, method: 'Input.insertText', params: { text: otherTok } });
       const r = substituteOutbound(frame, store, SID);
       expect(r.substitutions).toBe(0);
@@ -123,7 +123,7 @@ describe('CDP substitution', () => {
 
     it('only considers the calling session\'s values', () => {
       store = new TokenStore();
-      store.issueForSession('site:password', 'real-secret-42', 'sess-other');
+      store.issue('site:password', 'real-secret-42', { sessionId: 'sess-other' });
       const frame = JSON.stringify({ id: 9, result: { value: 'real-secret-42' } });
       // SID has no active values, so this is a clean passthrough
       const r = substituteInbound(frame, store, SID);

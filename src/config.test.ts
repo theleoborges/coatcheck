@@ -28,6 +28,7 @@ describe('loadConfig', () => {
       cdp: undefined,
       policy: EMPTY_POLICY,
       policyFile: undefined,
+      allowUnboundSecrets: false,
     });
   });
 
@@ -45,6 +46,7 @@ describe('loadConfig', () => {
       COATCHECK_CDP_ENABLED: '1',
       COATCHECK_CDP_PORT: '9444',
       COATCHECK_CDP_ADVERTISE_HOST: 'coatcheck',
+      COATCHECK_ALLOW_UNBOUND_SECRETS: '1',
     });
     expect(config).toEqual({
       provider: 'aws',
@@ -58,6 +60,7 @@ describe('loadConfig', () => {
       cdp: { port: 9444, advertiseHost: 'coatcheck' },
       policy: EMPTY_POLICY,
       policyFile: undefined,
+      allowUnboundSecrets: true,
     });
   });
 
@@ -88,8 +91,9 @@ describe('loadConfig', () => {
       COATCHECK_SECRET_CACHE_TTL_SECONDS: '-1',
       COATCHECK_CDP_ENABLED: 'yes',
       COATCHECK_CDP_PORT: '84a4',
+      COATCHECK_ALLOW_UNBOUND_SECRETS: 'maybe',
     });
-    expect(found).toHaveLength(5);
+    expect(found).toHaveLength(6);
   });
 
   it('rejects an agent id that could escape a store path', () => {

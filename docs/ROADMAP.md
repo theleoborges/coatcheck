@@ -111,7 +111,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 ## Phase 3: host binding and listener hardening (HIGH, MEDIUM)
 
-9. **Host-bound tickets on HTTP(S).** A secret's effective hosts are the
+9. **[Done]** **Host-bound tickets on HTTP(S).** A secret's effective hosts are the
    intersection of the policy file and an in-band `_allowed_hosts` in its JSON
    value. A JSON secret whose only non-underscore key is `value` counts as a
    simple secret.
@@ -132,6 +132,7 @@ rejected, are in `docs/design/v1-decisions.md`.
    - **Mint responses.** They include `allowed_hosts`.
    - **Tests.** The THREAT_MODEL `attacker.example` exfiltration fails, and so
      does a variant using a loopback listener.
+   - Fix a duplicate type check in `policy.ts`.
 
 10. **MITM policy.** Add `COATCHECK_MITM`:
     - `bound` (the default) MITMs a CONNECT only when the target is a host in

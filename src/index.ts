@@ -43,6 +43,7 @@ const coatcheck = createCoatcheck({
   cdp: config.cdp,
   missingSecretUrl: config.missingSecretUrl,
   policy: config.policy,
+  allowUnboundSecrets: config.allowUnboundSecrets,
 });
 
 const { port } = await coatcheck.listen(config.port, config.bindHost);
@@ -51,6 +52,9 @@ console.log(`Vault API: http://localhost:${port}/_vault`);
 console.log(config.policyFile
   ? `Policy: ${config.policyFile} (${config.policy.secrets.length} secret rule(s), ${config.policy.shared.size} shared secret(s))`
   : 'Policy: none (no shared secrets; set COATCHECK_POLICY_FILE)');
+if (config.allowUnboundSecrets) {
+  console.warn('WARNING: COATCHECK_ALLOW_UNBOUND_SECRETS=1: secrets with no allowed hosts get tickets that swap for ANY host');
+}
 
 let cdpProxyHandle: { close(): Promise<void> } | null = null;
 if (config.cdp) {

@@ -6,7 +6,7 @@ import type { CertAuthority, HostCert } from './ca.js';
 import type { CdpSessionStore } from './cdp-session-store.js';
 import { createConnectUrlRewriter } from './browserbase-rewrite.js';
 import { parseConnectTarget } from './connect-target.js';
-import { logSwapOutcome } from './swap-log.js';
+import { DENIED_HEADER, hostMismatchBody, logSwapOutcome } from './swap-log.js';
 
 export interface MitmDeps {
   tokenStore: TokenStore;
@@ -77,6 +77,7 @@ export function createConnectHandler(deps: MitmDeps) {
     let requestData = Buffer.from(head);
     let upstreamReady = false;
     let pendingWrites: Buffer[] = [];
+    let denied = false;
 
     /**
      * Process buffered client data, extracting complete HTTP requests and
@@ -85,7 +86,7 @@ export function createConnectHandler(deps: MitmDeps) {
      * and token-swapped (not raw-piped).
      */
     function processClientData() {
-      for (;;) {
+      while (!denied) {
         const headerEnd = requestData.indexOf('\r\n\r\n');
         if (headerEnd === -1) return; // need more data
 
@@ -104,9 +105,14 @@ export function createConnectHandler(deps: MitmDeps) {
         const body = requestData.subarray(headerEnd + 4, totalLength);
         requestData = requestData.subarray(totalLength); // remainder for next request
 
-        // Swap tokens in headers
-        const result = tokenStore.replaceAll(headerStr);
-        logSwapOutcome('https', hostname, result.swaps, result.output);
+        // Swap tokens in headers. The binding key is the validated CONNECT
+        // target (upstream TLS proves it is the recipient), never Host or SNI.
+        const result = tokenStore.replaceAll(headerStr, { host: hostname, scheme: 'https' });
+        logSwapOutcome('https', hostname, result, result.output);
+        if (result.denied.length > 0) {
+          denyAndClose(hostMismatchBody(result.denied, hostname));
+          return;
+        }
 
         const outBuf = Buffer.concat([
           Buffer.from(result.output + '\r\n\r\n'),
@@ -121,7 +127,29 @@ export function createConnectHandler(deps: MitmDeps) {
       }
     }
 
+    /**
+     * Answer 403 instead of forwarding, and close the tunnel: requests
+     * pipelined ahead of this one that the upstream hasn't answered are
+     * abandoned (design §3, "Host binding details").
+     */
+    function denyAndClose(body: string) {
+      denied = true;
+      pendingWrites = [];
+      requestData = Buffer.alloc(0);
+      realSocket.unpipe(tlsSocket);
+      realSocket.destroy();
+      tlsSocket.end(
+        'HTTP/1.1 403 Forbidden\r\n' +
+        'Content-Type: application/json\r\n' +
+        `${DENIED_HEADER}: host-mismatch\r\n` +
+        `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+        'Connection: close\r\n\r\n' +
+        body,
+      );
+    }
+
     tlsSocket.on('data', (chunk: Buffer) => {
+      if (denied) return;
       requestData = Buffer.concat([requestData, chunk]);
       processClientData();
     });
@@ -149,6 +177,7 @@ export function createConnectHandler(deps: MitmDeps) {
           (realConnectUrl) => `ws://${cdp.advertiseHost}:${cdp.port}/cdp/${cdpSessionStore.register(realConnectUrl)}`,
         );
         realSocket.on('data', (chunk: Buffer) => {
+          if (denied) return;
           const out = rewriter.push(chunk);
           if (out.length > 0) tlsSocket.write(out);
         });
@@ -163,7 +192,7 @@ export function createConnectHandler(deps: MitmDeps) {
 
     realSocket.on('error', (err) => {
       console.error(`Upstream TLS error for ${hostname}:`, err.message);
-      tlsSocket.destroy();
+      if (!denied) tlsSocket.destroy();
     });
 
     // Tie the two legs' lifetimes together, so a client that goes away does
@@ -171,7 +200,7 @@ export function createConnectHandler(deps: MitmDeps) {
     // upstream's idle timeout.
     tlsSocket.on('end', () => realSocket.end()); // forward the client's half-close
     tlsSocket.on('close', () => realSocket.destroy());
-    realSocket.on('close', () => tlsSocket.destroy());
+    realSocket.on('close', () => { if (!denied) tlsSocket.destroy(); }); // a denial ends tlsSocket itself
   };
 }
 
