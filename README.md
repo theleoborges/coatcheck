@@ -275,7 +275,9 @@ On the plain-HTTP path tickets are swapped only in the path, query, headers and 
 
 ## Browser / CDP credential injection
 
-This lets an agent log into a website through a remote browser without the password entering its context. Set `COATCHECK_CDP_ENABLED=1`. Browserbase is the only supported browser service today.
+This lets an agent log into a website through a remote browser without handling the password itself. Set `COATCHECK_CDP_ENABLED=1`. Browserbase is the only supported browser service today.
+
+> **Known weakness in the current (v1) flow.** Once the agent's `page.fill()` has put the real value into the form, script the agent runs on that page (`page.evaluate`) can read it back in a form the redactor doesn't recognise. The v1 flow therefore protects against the password *accidentally* reaching the agent's context, logs or transcript; it does not protect against an agent that is actively trying to read it. The replacement design, where coatcheck performs the fill and submit itself while the agent is held, is [docs/design/cdp-broker-login.md](docs/design/cdp-broker-login.md) (roadmap item 20).
 
 1. The agent creates a session with `POST https://api.browserbase.com/v1/sessions` **through `HTTPS_PROXY`**, authenticating with a `/_secret/browserbase-api-key` ticket. coatcheck rewrites the response's `connectUrl` from the real `wss://…` URL, which carries Browserbase's signing key, to `ws://{COATCHECK_CDP_ADVERTISE_HOST}:8444/cdp/{sid}`. It also removes `signingKey`, and rewrites (or, for live-view pages, removes) the URLs returned by `GET /v1/sessions/{id}/debug`, so the agent never sees a real CDP URL. A `sid` is valid for 10 minutes until a client connects.
 2. The agent mints session-bound tickets with `POST /_vault/mint-tokens {"secretName":"example-login","sessionId":"{sid}"}`. The sid must be one coatcheck issued and still live: unconnected sids expire after 10 minutes, connected ones when their connection closes. Anything else gets `404`.
@@ -316,7 +318,7 @@ coatcheck is **pre-1.0**. The HTTP API, ticket format (`cct_…`), and configura
 - **Three built-in secret backends** (environment variables, a JSON file, AWS). HashiCorp Vault and Vercel are planned; anything else needs a custom provider module.
 - **Browserbase is the only built-in browser adapter.** Other services need a custom adapter (`BrowserAdapter` in `@coatcheck/core`). With CDP enabled, Browserbase live-view URLs are removed from API responses, because a live view is a raw CDP connection.
 - **Origin binding keys on the main frame, and trusts the page once it matches.** Script the agent runs on an allowed origin (`page.evaluate`) can read the filled value and send it anywhere, in a transformed form the redactor doesn't catch. Logins inside cross-origin iframes aren't handled correctly: a login form in an iframe from another origin (an embedded auth widget) is refused unless the main frame's origin is allowed; on an allowed main frame, a fill whose focus is inside a cross-origin iframe (including one the agent injected) types the real value into that iframe. A navigation started by page script can race a fill.
-- **CDP v1 limits:** one session at a time, no 2FA, no `page.type()` support, and no screenshot redaction.
+- **CDP v1 limits:** agent script on the allowed origin can read a filled value back (see the note in [Browser / CDP credential injection](#browser--cdp-credential-injection); fix in progress), one session at a time, no 2FA, no `page.type()` support, and no screenshot redaction.
 
 ## How this differs from superfly/tokenizer
 

@@ -257,6 +257,37 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 Done: the unused `http-proxy` dependency was removed during extraction.
 
+## Phase 7: browser login, second design
+
+20. **Broker-performed login** (`docs/design/cdp-broker-login.md`). A red-team
+    run against the v1 CDP path (`examples/agents/browser-login/attack-transform.md`)
+    read a filled password back through the agent's own page script in
+    transformed form, which the literal redactor can't catch. coatcheck now
+    performs the fill and submit itself over the CDP connection while the
+    agent's frames are held, on a freshly reloaded document:
+    - `POST /_vault/{name}/login` replaces `POST /_vault/mint-tokens`;
+    - the agent's frames are queued for the window and released afterwards;
+    - the agent's new-document scripts are removed and the page reloaded
+      before filling; request interception on the page refuses the login;
+    - on timeout the filled fields are emptied before the agent resumes;
+    - inbound redaction stays and also matches percent-, entity- and
+      JSON-encoded forms of the values;
+    - removed: outbound `Input.insertText` substitution, session-bound
+      tickets, the keystroke detector, the `fill()`-not-`type()` client rules;
+    - the Browserbase adapter strips browser-extension parameters from
+      session-create requests and `seleniumRemoteUrl` from responses.
+    - Tests: the `attack-transform.md` reads return nothing derived from the
+      password (e2e), plus the cases in the design doc. README,
+      `docs/design/cdp-injection.md`, `docs/THREAT_MODEL.md`, `docs/clients.md`
+      and `examples/agents/browser-login/*` updated.
+
+21. **Network mode for browsers** (after 1.0 unless a self-hosted browser
+    adapter lands first). Route the browser's egress through coatcheck so the
+    DOM only ever holds a ticket and the login POST is swapped by the
+    host-bound `swap_body` path. Needs coatcheck reachable from the browser
+    and the browser to trust its CA. Design sketch at the end of
+    `docs/design/cdp-broker-login.md`.
+
 ## After 1.0
 
 - Single-use tickets, opt-in per secret.
@@ -277,10 +308,13 @@ These are recorded as residual risk in `docs/THREAT_MODEL.md`:
 
 - The `Host` header and SNI are not compared with the CONNECT target, and the
   policy never uses them.
-- Inbound redaction doesn't catch transformed values.
+- Inbound redaction doesn't catch values transformed by agent script.
+  Item 20 removes the agent's opportunity to run script while a real value
+  is in the page; redaction remains a backstop for browser-produced data.
 - Binary and screenshot frames are not inspected.
 - Second routes to the same remote browser exist beyond what adapters rewrite.
-- Script on an allowed origin can exfiltrate the filled value.
+- Script on an allowed origin can exfiltrate the filled value (until item 20;
+  afterwards only the site's own script runs while the value is present).
 - Cross-origin iframe logins (item 15).
 - Under `COATCHECK_MITM=bound`, a keep-alive tunnel opened before a host's
   first ticket existed stays passthrough. This fails closed.
