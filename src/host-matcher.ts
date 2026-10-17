@@ -26,9 +26,14 @@ export interface MatchTarget {
   scheme: 'http' | 'https';
 }
 
-/** Parse one allowed-host entry. Returns the pattern, or an error message. */
-export function parseHostPattern(entry: string): HostPattern | string {
-  if (typeof entry !== 'string' || entry.trim() !== entry || entry === '') {
+/**
+ * Parse one allowed-host entry. Returns the pattern, or an error message.
+ * Takes `unknown` so callers can pass raw JSON (policy file, in-band
+ * `_allowed_hosts`) without their own type check.
+ */
+export function parseHostPattern(entry: unknown): HostPattern | string {
+  if (typeof entry !== 'string') return 'must be a string';
+  if (entry.trim() !== entry || entry === '') {
     return 'must be a non-empty string without surrounding whitespace';
   }
   let rest = entry;
@@ -99,4 +104,45 @@ export function matchesHost(patterns: readonly HostPattern[], target: MatchTarge
     if (p.kind === 'exact') return normalised === p.host;
     return normalised.endsWith(`.${p.host}`);
   });
+}
+
+/** The entry as an operator would write it (`*.example.com`, `http://host`, `[::1]`). */
+export function formatHostPattern(p: HostPattern): string {
+  const host = net.isIPv6(p.host) ? `[${p.host}]` : p.host;
+  return `${p.plaintext ? 'http://' : ''}${p.kind === 'wildcard' ? '*.' : ''}${host}`;
+}
+
+/**
+ * Patterns allowing exactly the targets that both `a` and `b` allow (design §3,
+ * "Host binding details"). Plaintext survives only when both sides allow it.
+ */
+export function intersectHostPatterns(a: readonly HostPattern[], b: readonly HostPattern[]): HostPattern[] {
+  // Keyed by kind + host; `http://x` implies `x`, so duplicates merge by OR-ing plaintext.
+  const out = new Map<string, HostPattern>();
+  for (const x of a) {
+    for (const y of b) {
+      const p = intersectOne(x, y);
+      if (!p) continue;
+      const key = `${p.kind}:${p.host}`;
+      const prev = out.get(key);
+      out.set(key, prev ? { ...p, plaintext: prev.plaintext || p.plaintext } : p);
+    }
+  }
+  return [...out.values()];
+}
+
+function intersectOne(a: HostPattern, b: HostPattern): HostPattern | null {
+  const plaintext = a.plaintext && b.plaintext;
+  if (a.kind === 'exact' && b.kind === 'exact') return a.host === b.host ? { kind: 'exact', host: a.host, plaintext } : null;
+  if (a.kind === 'exact') return covers(b.host, a.host) ? { kind: 'exact', host: a.host, plaintext } : null;
+  if (b.kind === 'exact') return covers(a.host, b.host) ? { kind: 'exact', host: b.host, plaintext } : null;
+  // Both wildcards: the narrower one, when one suffix sits inside the other.
+  if (a.host === b.host || covers(b.host, a.host)) return { kind: 'wildcard', host: a.host, plaintext };
+  if (covers(a.host, b.host)) return { kind: 'wildcard', host: b.host, plaintext };
+  return null;
+}
+
+/** True when `*.suffix` matches `host` (a strict subdomain). */
+function covers(suffix: string, host: string): boolean {
+  return host.endsWith(`.${suffix}`);
 }

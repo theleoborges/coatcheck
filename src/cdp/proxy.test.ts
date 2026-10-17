@@ -70,7 +70,7 @@ describe('CDP proxy', () => {
 
   it('substitutes an outbound token (page.fill) before it reaches upstream', async () => {
     const sid = await setup();
-    const tok = tokenStore.issueForSession('site:password', 'real-secret-42', sid).id;
+    const tok = tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid }).id;
 
     client.send(JSON.stringify({ id: 1, method: 'Input.insertText', params: { text: tok } }));
     await new Promise(r => setTimeout(r, 50));
@@ -81,7 +81,7 @@ describe('CDP proxy', () => {
 
   it('redacts an inbound echo-back of the real value', async () => {
     const sid = await setup();
-    tokenStore.issueForSession('site:password', 'real-secret-42', sid);
+    tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid });
 
     const msgP = once<Buffer>(client, 'message');
     upstream.pushToClient(JSON.stringify({ id: 2, result: { value: 'real-secret-42' } }));
@@ -91,7 +91,7 @@ describe('CDP proxy', () => {
 
   it('drops an inbound frame that carries the real value unparseably', async () => {
     const sid = await setup();
-    tokenStore.issueForSession('site:password', 'real-secret-42', sid);
+    tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid });
 
     const msgP = once<Buffer>(client, 'message');
     upstream.pushToClient('GARBAGE real-secret-42 GARBAGE'); // should be dropped
@@ -102,7 +102,7 @@ describe('CDP proxy', () => {
 
   it('fails closed when page.type() spells a token, and never forwards the completing keystroke', async () => {
     const sid = await setup();
-    const tok = tokenStore.issueForSession('site:password', 'real-secret-42', sid).id;
+    const tok = tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid }).id;
 
     const errP = once<Buffer>(client, 'message');
     for (const ch of tok) {
@@ -122,7 +122,7 @@ describe('CDP proxy', () => {
 
   it('revokes session tokens when the client disconnects', async () => {
     const sid = await setup();
-    tokenStore.issueForSession('site:password', 'real-secret-42', sid);
+    tokenStore.issue('site:password', 'real-secret-42', { sessionId: sid });
     expect(tokenStore.sessionValues(sid)).toHaveLength(1);
 
     client.close();

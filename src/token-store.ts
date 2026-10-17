@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { matchesHost, type HostPattern, type MatchTarget } from './host-matcher.js';
 
 /**
  * Prefix of every ticket id ("coatcheck ticket"). Distinctive so tickets are
@@ -29,6 +30,17 @@ interface TokenEntry {
    * agent-wide behaviour used by the HTTP/platform paths.
    */
   sessionId?: string;
+  /** Hosts this ticket may be swapped for, snapshotted at mint. Undefined = unbound. */
+  allowedHosts?: readonly HostPattern[];
+}
+
+export interface IssueOptions {
+  /** Default: the store's `defaultTtlSeconds`. */
+  ttlSeconds?: number;
+  /** Hosts the ticket may be swapped for. Omit only for an unbound ticket (`COATCHECK_ALLOW_UNBOUND_SECRETS`). */
+  allowedHosts?: readonly HostPattern[];
+  /** Bind to a CDP session: substitutes only on that session's frames, revoked when it closes. */
+  sessionId?: string;
 }
 
 export interface SessionValue {
@@ -44,11 +56,19 @@ export interface IssuedToken {
 export interface SwapInfo {
   secretName: string;
   ageMs: number;
+  /** Set when the ticket carries no host binding (swapped for any host). */
+  unbound?: true;
 }
 
 export interface SwapResult {
   output: string;
   swaps: SwapInfo[];
+  /**
+   * Tickets present in the input whose allowed hosts don't match the target.
+   * When non-empty, nothing is swapped (`output` is the input) and the caller
+   * must not forward the request.
+   */
+  denied: SwapInfo[];
 }
 
 /**
@@ -69,34 +89,12 @@ export class TokenStore {
     this.cleanupTimer.unref();
   }
 
-  /** Issue a new proxy token for a secret */
-  issue(secretName: string, realValue: string, ttlSeconds = this.defaultTtlSeconds): IssuedToken {
-    const id = TICKET_PREFIX + randomBytes(32).toString('hex');
-    const now = Date.now();
-
-    this.tokens.set(id, {
-      id,
-      secretName,
-      realValue,
-      createdAt: now,
-      expiresAt: now + ttlSeconds * 1000,
-    });
-
-    return { id, ttlSeconds };
-  }
-
   /**
-   * Issue a token bound to a CDP session. The token only substitutes on traffic
-   * for that session (replaceAllForSession) and is dropped wholesale when the
-   * session closes (revokeSession). Used by the CDP credential-injection path so
-   * a token minted for one agent's browser session never resolves on another's.
+   * Issue a ticket for a secret. With `sessionId` the ticket only substitutes on
+   * that CDP session's traffic (replaceAllForSession) and never on HTTP(S).
    */
-  issueForSession(
-    secretName: string,
-    realValue: string,
-    sessionId: string,
-    ttlSeconds = this.defaultTtlSeconds,
-  ): IssuedToken {
+  issue(secretName: string, realValue: string, opts: IssueOptions = {}): IssuedToken {
+    const ttlSeconds = opts.ttlSeconds ?? this.defaultTtlSeconds;
     const id = TICKET_PREFIX + randomBytes(32).toString('hex');
     const now = Date.now();
 
@@ -106,7 +104,8 @@ export class TokenStore {
       realValue,
       createdAt: now,
       expiresAt: now + ttlSeconds * 1000,
-      sessionId,
+      sessionId: opts.sessionId,
+      allowedHosts: opts.allowedHosts,
     });
 
     return { id, ttlSeconds };
@@ -124,16 +123,20 @@ export class TokenStore {
   }
 
   /**
-   * Replace all active token IDs in a string with their real values.
-   * This is the core of the proxy — scans outbound data for tokens and swaps them.
+   * Replace all active token IDs in a string with their real values, for a
+   * request going to `target` (the CONNECT target on HTTPS, the URL host on the
+   * forward path). This is the core of the proxy.
    * Returns the rewritten string plus per-secret swap info so the call site can log
    * which secrets were swapped and how old the tokens were at swap time (diagnostic).
+   * If any ticket present is bound to other hosts, nothing is swapped and the
+   * ticket is reported in `denied`: one denied ticket denies the whole request.
    */
-  replaceAll(input: string): SwapResult {
-    if (this.tokens.size === 0) return { output: input, swaps: [] };
+  replaceAll(input: string, target: MatchTarget): SwapResult {
+    if (this.tokens.size === 0) return { output: input, swaps: [], denied: [] };
 
     let result = input;
     const swaps: SwapInfo[] = [];
+    const denied: SwapInfo[] = [];
     const now = Date.now();
 
     for (const [tokenId, entry] of this.tokens) {
@@ -144,13 +147,34 @@ export class TokenStore {
       // Session-scoped tokens (CDP credential injection) must never substitute
       // on the agent-wide HTTP/TLS path — they only resolve inside their WS session.
       if (entry.sessionId !== undefined) continue;
-      if (result.includes(tokenId)) {
-        result = result.replaceAll(tokenId, entry.realValue);
-        swaps.push({ secretName: entry.secretName, ageMs: now - entry.createdAt });
+      if (!input.includes(tokenId)) continue;
+      const info: SwapInfo = { secretName: entry.secretName, ageMs: now - entry.createdAt };
+      if (entry.allowedHosts === undefined) {
+        info.unbound = true;
+      } else if (!matchesHost(entry.allowedHosts, target)) {
+        denied.push(info);
+        continue;
       }
+      result = result.replaceAll(tokenId, entry.realValue);
+      swaps.push(info);
     }
 
-    return { output: result, swaps };
+    if (denied.length > 0) return { output: input, swaps: [], denied };
+    return { output: result, swaps, denied };
+  }
+
+  /**
+   * True when a live HTTP(S) ticket could be swapped for `target`: one bound to
+   * it, or any unbound ticket. Session-bound tickets don't count (they never
+   * swap on HTTP(S)). Drives the `COATCHECK_MITM=bound` decision.
+   */
+  hasLiveTicketFor(target: MatchTarget): boolean {
+    const now = Date.now();
+    for (const entry of this.tokens.values()) {
+      if (now > entry.expiresAt || entry.sessionId !== undefined) continue;
+      if (entry.allowedHosts === undefined || matchesHost(entry.allowedHosts, target)) return true;
+    }
+    return false;
   }
 
   /**
@@ -159,7 +183,7 @@ export class TokenStore {
    * session's credential tokens resolve only on that session's frames.
    */
   replaceAllForSession(input: string, sessionId: string): SwapResult {
-    if (this.tokens.size === 0) return { output: input, swaps: [] };
+    if (this.tokens.size === 0) return { output: input, swaps: [], denied: [] };
 
     let result = input;
     const swaps: SwapInfo[] = [];
@@ -177,7 +201,8 @@ export class TokenStore {
       }
     }
 
-    return { output: result, swaps };
+    // Origin binding on the CDP path is roadmap item 15; nothing is denied here yet.
+    return { output: result, swaps, denied: [] };
   }
 
   /**

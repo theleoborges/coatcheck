@@ -6,8 +6,11 @@ import type { CertAuthority } from './ca.js';
 import type { CdpSessionStore } from './cdp-session-store.js';
 import { handleVaultRequest } from './vault-handler.js';
 import { EMPTY_POLICY, type Policy } from './policy.js';
+import type { HostPattern } from './host-matcher.js';
+import type { MitmMode } from './config.js';
 import { handleForwardRequest } from './forward.js';
 import { createConnectHandler } from './mitm.js';
+import { createApiAuth, isOpenVaultPath, PROXY_AUTH_REQUIRED, sendProxyAuthRequired, sendUnauthorized } from './auth.js';
 
 export const BROWSERBASE_API_HOST = 'api.browserbase.com';
 
@@ -20,6 +23,14 @@ export interface CoatcheckDeps {
   cdp?: { port: number; advertiseHost: string };
   /** Operator policy (`COATCHECK_POLICY_FILE`). Default: empty. */
   policy?: Policy;
+  /** `COATCHECK_ALLOW_UNBOUND_SECRETS`. Default: false (unbound secrets get 403 at mint). */
+  allowUnboundSecrets?: boolean;
+  /** `COATCHECK_MITM`. Default: `bound`. */
+  mitm?: MitmMode;
+  /** `COATCHECK_PASSTHROUGH_HOSTS`. Default: none. */
+  passthroughHosts?: HostPattern[];
+  /** `COATCHECK_API_TOKEN`: required on the vault API and the proxy when set. */
+  apiToken?: string;
   /** `vault_url` hint in 404s (`COATCHECK_MISSING_SECRET_URL`). */
   missingSecretUrl?: string;
   /** Defaults to `api.browserbase.com`. */
@@ -45,12 +56,35 @@ export function createCoatcheck(deps: CoatcheckDeps): Coatcheck {
     ca: deps.ca,
     missingSecretUrl: deps.missingSecretUrl,
     policy: deps.policy ?? EMPTY_POLICY,
+    allowUnboundSecrets: deps.allowUnboundSecrets ?? false,
   };
 
+  const auth = createApiAuth(deps.apiToken);
+
   const server = http.createServer((req, res) => {
-    // Handle vault API requests directly
+    const url = req.url ?? '';
+    // Absolute-form (`GET http://host/…`) is a proxy request; anything else is the vault API.
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) {
+      if (!auth.proxy(req)) {
+        console.warn('[auth] rejected proxy request: missing or invalid Proxy-Authorization');
+        req.resume();
+        sendProxyAuthRequired(res);
+        return;
+      }
+      handleForwardRequest(req, res, deps.tokenStore);
+      return;
+    }
+    if (!isOpenVaultPath(url) && !auth.vault(req)) {
+      console.warn('[auth] rejected API request: missing or invalid Authorization');
+      req.resume();
+      sendUnauthorized(res);
+      return;
+    }
     if (handleVaultRequest(req, res, vaultDeps)) return;
-    handleForwardRequest(req, res, deps.tokenStore);
+    // Origin-form but not a vault route: not a proxy request either.
+    req.resume();
+    res.writeHead(400);
+    res.end('Bad request');
   });
 
   const onConnect = createConnectHandler({
@@ -60,8 +94,18 @@ export function createCoatcheck(deps: CoatcheckDeps): Coatcheck {
     cdp: deps.cdp,
     browserbaseApiHost: deps.browserbaseApiHost ?? BROWSERBASE_API_HOST,
     upstreamCa: deps.upstreamCa,
+    policy: vaultDeps.policy,
+    mitm: deps.mitm ?? 'bound',
+    passthroughHosts: deps.passthroughHosts ?? [],
   });
-  server.on('connect', (req, socket, head) => { void onConnect(req, socket as Socket, head); });
+  server.on('connect', (req, socket, head) => {
+    if (!auth.proxy(req)) {
+      console.warn('[auth] rejected CONNECT: missing or invalid Proxy-Authorization');
+      socket.end(PROXY_AUTH_REQUIRED);
+      return;
+    }
+    void onConnect(req, socket as Socket, head);
+  });
 
   return {
     server,

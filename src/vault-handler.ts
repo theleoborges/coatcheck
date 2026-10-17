@@ -2,7 +2,9 @@ import http from 'node:http';
 import { TokenStore } from './token-store.js';
 import type { CertAuthority } from './ca.js';
 import { isValidSecretName, type SecretProvider } from './secret-provider.js';
-import type { Policy } from './policy.js';
+import { policyHostsFor, type Policy } from './policy.js';
+import { matchesHost, type HostPattern } from './host-matcher.js';
+import { allowedHostsJson, parseSecretValue, resolveBinding, userFields, type Binding, type InBandHosts } from './secret-binding.js';
 
 export interface VaultDeps {
   tokenStore: TokenStore;
@@ -10,8 +12,10 @@ export interface VaultDeps {
   ca: Pick<CertAuthority, 'caCertPem'>;
   /** Where users manage secrets; returned as `vault_url` in 404s when set. */
   missingSecretUrl?: string;
-  /** Operator policy; its `shared` section is the `/_secret/*` allowlist. */
+  /** Operator policy: allowed hosts per secret; its `shared` section is the `/_secret/*` allowlist. */
   policy: Policy;
+  /** `COATCHECK_ALLOW_UNBOUND_SECRETS`: mint unbound tickets instead of refusing with 403. */
+  allowUnboundSecrets?: boolean;
 }
 
 /**
@@ -81,54 +85,42 @@ export function handleVaultRequest(
         res.end(JSON.stringify({ error: `Secret '${secretName}' not found`, ...vaultUrlHint(deps) }));
         return;
       }
-      const value = secret.value;
+      const parsed = parseSecretValue(secret.value);
 
-      // Check if this is a multi-value (JSON) secret
-      let parsed: Record<string, string> | null = null;
-      try {
-        const obj = JSON.parse(value);
-        if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
-          parsed = obj;
-        }
-      } catch {
-        // Not JSON — simple secret
-      }
-
-      if (parsed) {
+      if (parsed.kind === 'multi') {
         // Multi-value secret
         // _cleartext lists fields that are safe to return as raw values (URLs, domains, IDs)
-        const cleartextFields: string[] = Array.isArray(parsed._cleartext) ? parsed._cleartext : [];
-        // User-visible fields exclude the _cleartext metadata key
-        const userFields = Object.keys(parsed).filter(k => k !== '_cleartext');
+        const cleartextFields: unknown[] = Array.isArray(parsed.fields._cleartext) ? parsed.fields._cleartext : [];
+        // User-visible fields exclude `_`-prefixed metadata (_cleartext, _allowed_hosts)
+        const fields = userFields(parsed.fields);
 
         if (!field) {
           // No field requested — return available fields so the agent knows what to ask for
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'multi', fields: userFields }));
+          res.end(JSON.stringify({ type: 'multi', fields }));
           return;
         }
-        if (field === '_cleartext' || parsed[field] === undefined) {
+        if (!fields.includes(field)) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: `Field '${field}' not found. Available: ${userFields.join(', ')}` }));
+          res.end(JSON.stringify({ error: `Field '${field}' not found. Available: ${fields.join(', ')}` }));
           return;
         }
-        const fieldValue = parsed[field];
+        const fieldValue = parsed.fields[field];
         if (cleartextFields.includes(field)) {
           // Non-sensitive field — return raw value (no token) so it can be used directly in URLs
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ value: fieldValue, cleartext: true }));
-        } else {
-          const token = tokenStore.issue(`${secretName}:${field}`, fieldValue);
-          console.log(`[issue] secret=${secretName}:${field} ttl_s=${token.ttlSeconds}`);
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds }));
+          return;
         }
+        // Every field shares the secret's binding.
+        const binding = bindingFor(deps, secretName, parsed.inBand);
+        if (!sendBindingError(res, binding)) return;
+        issueTicket(res, deps, `${secretName}:${field}`, String(fieldValue), binding.allowedHosts);
       } else {
         // Simple secret — field param is ignored
-        const token = tokenStore.issue(secretName, value);
-        console.log(`[issue] secret=${secretName} ttl_s=${token.ttlSeconds}`);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds }));
+        const binding = bindingFor(deps, secretName, parsed.inBand);
+        if (!sendBindingError(res, binding)) return;
+        issueTicket(res, deps, secretName, parsed.value, binding.allowedHosts);
       }
     }).catch(err => {
       console.error('Error fetching secret:', err);
@@ -164,10 +156,11 @@ export function handleVaultRequest(
         res.end(JSON.stringify({ error: `Shared secret '${secretName}' not found` }));
         return;
       }
-      const token = tokenStore.issue(`shared:${secretName}`, secret.value);
-      console.log(`[issue] secret=shared:${secretName} ttl_s=${token.ttlSeconds}`);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds }));
+      // The allowlist entry always carries hosts, so a shared secret is never unbound.
+      const parsed = parseSecretValue(secret.value);
+      const binding = resolveBinding(secretName, deps.policy.shared.get(secretName), parsed.inBand, false);
+      if (!sendBindingError(res, binding)) return;
+      issueTicket(res, deps, `shared:${secretName}`, parsed.kind === 'simple' ? parsed.value : secret.value, binding.allowedHosts);
     }).catch(err => {
       console.error(`Error fetching shared secret '${secretName}':`, err);
       res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -206,6 +199,34 @@ export function handleVaultRequest(
     return true;
   }
 
+  return false;
+}
+
+/** Issue an HTTP(S) ticket and answer with it and its allowed hosts. */
+function issueTicket(
+  res: http.ServerResponse,
+  deps: VaultDeps,
+  label: string,
+  value: string,
+  allowedHosts: readonly HostPattern[] | undefined,
+  via?: string,
+): void {
+  const token = deps.tokenStore.issue(label, value, { allowedHosts });
+  console.log(`[issue] secret=${label} ttl_s=${token.ttlSeconds}${allowedHosts ? '' : ' unbound=1'}${via ? ` via=${via}` : ''}`);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ token: token.id, expires_in: token.ttlSeconds, allowed_hosts: allowedHostsJson(allowedHosts) }));
+}
+
+/** A per-agent secret's binding: its policy rule intersected with its in-band hosts. */
+function bindingFor(deps: VaultDeps, secretName: string, inBand: InBandHosts): Binding {
+  return resolveBinding(secretName, policyHostsFor(deps.policy, secretName), inBand, !!deps.allowUnboundSecrets);
+}
+
+/** Answer a refused binding. Returns true (and sends nothing) when the binding is ok. */
+function sendBindingError(res: http.ServerResponse, binding: Binding): binding is Extract<Binding, { ok: true }> {
+  if (binding.ok) return true;
+  res.writeHead(binding.status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: binding.error }));
   return false;
 }
 
@@ -296,14 +317,8 @@ function handleMintTokens(
       return;
     }
 
-    let parsed: Record<string, unknown> | null = null;
-    try {
-      const obj = JSON.parse(secret.value);
-      if (obj && typeof obj === 'object' && !Array.isArray(obj)) parsed = obj;
-    } catch {
-      // not JSON
-    }
-
+    const secretValue = parseSecretValue(secret.value);
+    const parsed = secretValue.kind === 'multi' ? secretValue.fields : null;
     const username = parsed?.username;
     const password = parsed?.password;
     if (!parsed || typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
@@ -314,14 +329,19 @@ function handleMintTokens(
       return;
     }
 
-    const usernameToken = tokenStore.issueForSession(`${secretName}:username`, username, sessionId, ttl);
-    const passwordToken = tokenStore.issueForSession(`${secretName}:password`, password, sessionId, ttl);
-    console.log(`[mint] secret=${secretName} session=${sessionId} ttl_s=${ttl}`);
+    // Snapshot the login's hosts now; the CDP path enforces them from roadmap item 15.
+    const binding = bindingFor(deps, secretName, secretValue.inBand);
+    if (!sendBindingError(res, binding)) return;
+    const opts = { sessionId, ttlSeconds: ttl, allowedHosts: binding.allowedHosts };
+    const usernameToken = tokenStore.issue(`${secretName}:username`, username, opts);
+    const passwordToken = tokenStore.issue(`${secretName}:password`, password, opts);
+    console.log(`[mint] secret=${secretName} session=${sessionId} ttl_s=${ttl}${binding.allowedHosts ? '' : ' unbound=1'}`);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       username_token: usernameToken.id,
       password_token: passwordToken.id,
       expires_in: ttl,
+      allowed_hosts: allowedHostsJson(binding.allowedHosts),
     }));
   }).catch(err => {
     console.error(`Error minting tokens for '${secretName}':`, err);
@@ -340,7 +360,7 @@ async function handleOAuthRefresh(
   res: http.ServerResponse,
   deps: VaultDeps,
 ): Promise<void> {
-  const { tokenStore, provider } = deps;
+  const { provider } = deps;
   const store = provider.secrets;
 
   // Check before the token exchange: a rotated refresh token we cannot store
@@ -359,14 +379,13 @@ async function handleOAuthRefresh(
   }
   const raw = secret.value;
 
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
+  const secretValue = parseSecretValue(raw);
+  if (secretValue.kind !== 'multi') {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Secret is not a multi-value JSON secret' }));
     return;
   }
+  const parsed = secretValue.fields;
 
   const refreshToken = parsed.refresh_token as string | undefined;
   const tokenUrl = parsed.token_url as string | undefined;
@@ -381,6 +400,29 @@ async function handleOAuthRefresh(
     return;
   }
 
+  // client_secret is sent to token_url, so its host must be one the secret is
+  // bound to; the refreshed access-token ticket inherits the same binding.
+  const binding = bindingFor(deps, secretName, secretValue.inBand);
+  if (!sendBindingError(res, binding)) return;
+  let tokenHost: URL | null = null;
+  try {
+    tokenHost = new URL(tokenUrl);
+  } catch {
+    // handled below
+  }
+  if (!tokenHost || (tokenHost.protocol !== 'https:' && tokenHost.protocol !== 'http:')) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'token_url must be an http(s) URL' }));
+    return;
+  }
+  const scheme = tokenHost.protocol === 'https:' ? 'https' : 'http';
+  if (binding.allowedHosts && !matchesHost(binding.allowedHosts, { host: tokenHost.hostname, scheme })) {
+    console.warn(`[refresh] secret=${secretName} result=denied token_url_host=${tokenHost.hostname}`);
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `token_url host '${tokenHost.hostname}' is not an allowed host of secret '${secretName}'` }));
+    return;
+  }
+
   // Exchange refresh token for new access token
   const body = new URLSearchParams({
     refresh_token: refreshToken,
@@ -391,6 +433,8 @@ async function handleOAuthRefresh(
 
   const tokenRes = await fetch(tokenUrl, {
     method: 'POST',
+    // A 307/308 would re-POST client_secret to a host the check above never saw.
+    redirect: 'error',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
   });
@@ -421,10 +465,7 @@ async function handleOAuthRefresh(
   await store.put(secretName, JSON.stringify(updated));
 
   // Issue a cct_* for the new access token
-  const tok = tokenStore.issue(`${secretName}:access_token`, tokens.access_token);
-  console.log(`[issue] secret=${secretName}:access_token ttl_s=${tok.ttlSeconds} via=oauth_refresh`);
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ token: tok.id, expires_in: tok.ttlSeconds }));
+  issueTicket(res, deps, `${secretName}:access_token`, tokens.access_token, binding.allowedHosts, 'oauth_refresh');
 }
 
 const OAUTH_ERROR_CODE_MAX = 64;

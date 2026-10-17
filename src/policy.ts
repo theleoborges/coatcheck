@@ -86,6 +86,11 @@ export function policyHostsFor(policy: Policy, secretName: string): HostPattern[
   return best?.allowedHosts;
 }
 
+/** Every host pattern the policy names (per-agent rules and shared secrets). */
+export function allPolicyHosts(policy: Policy): HostPattern[] {
+  return [...policy.secrets.flatMap(r => r.allowedHosts), ...[...policy.shared.values()].flat()];
+}
+
 function isObject(v: Json): v is Record<string, Json> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
@@ -114,7 +119,7 @@ function allowedHosts(entry: Json, where: string, source: string, problems: stri
   }
   const out: HostPattern[] = [];
   list.forEach((item, i) => {
-    const parsed = typeof item === 'string' ? parseHostPattern(item) : 'must be a string';
+    const parsed = parseHostPattern(item);
     if (typeof parsed === 'string') problems.push(`${source}: ${where}.allowed_hosts[${i}] ${JSON.stringify(item)}: ${parsed}`);
     else out.push(parsed);
   });

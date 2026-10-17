@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { matchesHost, parseHostPattern, type HostPattern } from './host-matcher.js';
+import { formatHostPattern, intersectHostPatterns, matchesHost, parseHostPattern, type HostPattern } from './host-matcher.js';
 
 function patterns(...entries: string[]): HostPattern[] {
   return entries.map(e => {
@@ -105,5 +105,49 @@ describe('matchesHost', () => {
       expect(matchesHost(p, https(h)), h).toBe(false);
     }
     expect(matchesHost([], https('api.example.com'))).toBe(false);
+  });
+});
+
+describe('formatHostPattern', () => {
+  it('round-trips entries as an operator writes them', () => {
+    for (const e of ['api.github.com', '*.googleapis.com', 'http://internal.example.com', 'http://*.svc.example.com', '10.0.0.5', '[2001:db8::1]']) {
+      expect(formatHostPattern(patterns(e)[0])).toBe(e);
+    }
+  });
+});
+
+describe('intersectHostPatterns', () => {
+  const both = (a: string[], b: string[]) => intersectHostPatterns(patterns(...a), patterns(...b)).map(formatHostPattern).sort();
+
+  it('keeps exact hosts present on both sides, or covered by the other side\'s wildcard', () => {
+    expect(both(['api.github.com'], ['api.github.com'])).toEqual(['api.github.com']);
+    expect(both(['api.github.com'], ['uploads.github.com'])).toEqual([]);
+    expect(both(['*.googleapis.com'], ['oauth2.googleapis.com', 'api.github.com'])).toEqual(['oauth2.googleapis.com']);
+    expect(both(['googleapis.com'], ['*.googleapis.com'])).toEqual([]); // wildcards never cover the apex
+  });
+
+  it('takes the narrower of two nested wildcards', () => {
+    expect(both(['*.example.com'], ['*.eu.example.com'])).toEqual(['*.eu.example.com']);
+    expect(both(['*.eu.example.com'], ['*.example.com'])).toEqual(['*.eu.example.com']);
+    expect(both(['*.example.com'], ['*.example.com'])).toEqual(['*.example.com']);
+    expect(both(['*.example.com'], ['*.example.org'])).toEqual([]);
+  });
+
+  it('allows plaintext only when both sides do', () => {
+    expect(both(['http://svc.example.com'], ['svc.example.com'])).toEqual(['svc.example.com']);
+    expect(both(['http://svc.example.com'], ['http://*.example.com'])).toEqual(['http://svc.example.com']);
+    expect(both(['svc.example.com', 'http://svc.example.com'], ['http://svc.example.com'])).toEqual(['http://svc.example.com']);
+  });
+
+  it('matches exactly the targets both sides match', () => {
+    const a = patterns('*.example.com', 'api.other.com', 'http://10.0.0.5');
+    const b = patterns('*.eu.example.com', 'www.example.com', '10.0.0.5', 'api.other.com');
+    const both = intersectHostPatterns(a, b);
+    for (const host of ['x.eu.example.com', 'www.example.com', 'eu.example.com', 'example.com', 'api.other.com', '10.0.0.5', 'evil.example']) {
+      for (const scheme of ['http', 'https'] as const) {
+        const t = { host, scheme };
+        expect(matchesHost(both, t), `${scheme}://${host}`).toBe(matchesHost(a, t) && matchesHost(b, t));
+      }
+    }
   });
 });

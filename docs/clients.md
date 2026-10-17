@@ -12,6 +12,22 @@ export HTTPS_PROXY=http://127.0.0.1:3128
 export NO_PROXY=localhost,127.0.0.1,169.254.169.254,169.254.170.2
 ```
 
+If coatcheck runs with `COATCHECK_API_TOKEN` (required whenever it listens on
+anything but loopback), put the token in the proxy URL and send it as a bearer
+token to the API:
+
+```bash
+export HTTPS_PROXY=http://coatcheck:$COATCHECK_API_TOKEN@coatcheck:3128   # user name is ignored
+export HTTP_PROXY=$HTTPS_PROXY
+AUTH=(-H "Authorization: Bearer $COATCHECK_API_TOKEN")                    # for /_vault and /_secret
+```
+
+Clients send proxy credentials from the URL as `Proxy-Authorization: Basic`;
+coatcheck also accepts `Proxy-Authorization: Bearer <token>`. Missing or wrong
+credentials get `407` from the proxy and `401` from the API. `/_health` and
+`/_ca` never need the token. The examples below omit `"${AUTH[@]}"` for
+brevity; add it when the token is set.
+
 ## 1. Trust the coatcheck CA
 
 coatcheck terminates TLS with its own CA. Fetch the CA certificate from
@@ -51,8 +67,13 @@ persists across restarts. If it is regenerated, clients must re-fetch it.
 | `POST /_vault/{name}/refresh` | refreshes an OAuth secret server-side, returns a ticket for the new `access_token` |
 | `POST /_vault/mint-tokens` | session-bound login tickets for browser injection (section 6) |
 
+Ticket responses also carry `allowed_hosts`: the only hosts the ticket will be
+swapped for. Sending it anywhere else gets `403` with
+`X-Coatcheck-Denied: host-mismatch`, and the request is not forwarded.
+
 Errors: 404 when the secret is missing, 400 for an unknown field, 403 for a
-shared secret outside the allowlist.
+shared secret outside the allowlist or a secret with no allowed hosts, 401
+without the API token when one is configured.
 
 ```bash
 TOK=$(curl -sf http://127.0.0.1:3128/_vault/example-api-key | jq -er .token)
@@ -248,15 +269,16 @@ credential helper, `GIT_ASKPASS`, `.netrc`. All end in Basic auth.
 set -euo pipefail
 NAME=$1; shift
 BASE=${COATCHECK_URL:-http://127.0.0.1:3128}
+AUTH=(); [[ -n ${COATCHECK_API_TOKEN:-} ]] && AUTH=(-H "Authorization: Bearer $COATCHECK_API_TOKEN")
 QS=""; CHECK=0
 while [[ $# -gt 0 ]]; do
   case $1 in --field) QS="?field=$2"; shift 2;; --check) CHECK=1; shift;; *) shift;; esac
 done
 if [[ $CHECK == 1 ]]; then
-  [[ $(curl -sf "$BASE/_vault/$NAME?check=1" | jq -r .exists) == true ]] && echo EXISTS || { echo NOT_FOUND; exit 2; }
+  [[ $(curl -sf "${AUTH[@]}" "$BASE/_vault/$NAME?check=1" | jq -r .exists) == true ]] && echo EXISTS || { echo NOT_FOUND; exit 2; }
   exit 0
 fi
-RESP=$(curl -s -w '\n%{http_code}' "$BASE/_vault/$NAME$QS")
+RESP=$(curl -s "${AUTH[@]}" -w '\n%{http_code}' "$BASE/_vault/$NAME$QS")
 CODE=${RESP##*$'\n'}; BODY=${RESP%$'\n'*}
 [[ $CODE -ge 400 ]] && { echo "$(jq -r '.error // "not found"' <<<"$BODY")" >&2; exit 2; }
 case $(jq -r '.type // (if .cleartext then "clear" else "tok" end)' <<<"$BODY") in

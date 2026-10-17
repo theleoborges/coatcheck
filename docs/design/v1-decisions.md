@@ -142,6 +142,46 @@ by the agent is deferred, and if it is ever added it may only narrow.
 - **No policy file means no shared secrets.** `/_secret/*` returns `403` for
   every name.
 
+### Host binding details (recorded while implementing roadmap item 9)
+
+- **Intersection is computed, not deferred.** The effective list is the
+  pairwise intersection of the two pattern lists: exact ∩ exact is the host
+  when equal, exact ∩ wildcard is the exact host when the wildcard covers it,
+  and wildcard ∩ wildcard is the narrower wildcard when one suffix contains the
+  other. An entry allows plaintext only when both sides do. Rationale: one
+  concrete list can be snapshotted on the ticket and shown in the mint
+  response.
+- **An empty intersection is refused at mint time** (`403`, naming the
+  secret). The ticket could never be used, so this is the same reasoning as
+  deny-at-mint for unbound secrets.
+- **Underscore keys are metadata.** In a JSON secret, every key starting with
+  `_` (`_cleartext`, `_allowed_hosts`, and any future one) is hidden from the
+  field list and can't be requested as a field. This follows from the
+  "only non-underscore key is `value`" rule.
+- **`_allowed_hosts` must be a non-empty array of valid entries.** Anything
+  else (not an array, empty, a non-string, an invalid entry) fails minting
+  with `500`, as an invalid in-band entry does.
+- **Every minting route applies the binding:** `/_vault/{name}` (all fields of
+  a multi-value secret share the secret's hosts), `/_secret/{name}` (policy
+  `shared` hosts ∩ in-band), `/_vault/{name}/refresh`, and
+  `/_vault/mint-tokens`. Session-bound CDP tickets snapshot the login secret's
+  hosts now; enforcing them against the page origin is roadmap item 15.
+  Cleartext fields aren't tickets and are returned whether or not the secret
+  is bound.
+- **Unbound tickets in the token store.** A ticket issued without
+  `allowedHosts` is unbound and substitutes for any host. The vault API only
+  issues one when `COATCHECK_ALLOW_UNBOUND_SECRETS=1`; the mint response then
+  carries `"allowed_hosts": null`.
+- **Forward path swaps only in the path and query.** Swapping into the URL's
+  host or userinfo would change the host being dialled after the check (and
+  leak the value in a DNS query), so tickets there are left as literals. Only
+  `http:` absolute-form URLs are forwarded; anything else gets `400`.
+- **A denied MITM request closes the tunnel.** coatcheck answers `403` with
+  `Connection: close` and drops the upstream connection. Requests pipelined
+  ahead of it that the upstream hasn't answered yet are abandoned. Rationale:
+  the parser can't interleave a synthetic response with in-flight upstream
+  responses safely, and denial is an attack signal, not a normal outcome.
+
 ### Default: deny, at mint time
 
 - `/_vault/{name}` for an unbound secret returns `403` with an error naming the
@@ -277,6 +317,41 @@ When listing secrets, it ignores variables whose names don't map back. The
 provider's README and the core README both document this. The `file` provider
 uses core's name rules, because JSON keys need no mapping.
 
+### API token details (recorded while implementing roadmap item 11)
+
+- **Proxy credentials use Basic as well as Bearer.** `Proxy-Authorization:
+  Basic base64(user:TOKEN)` is accepted with any user name, and so is
+  `Bearer TOKEN`. Rationale: unmodified tools only send proxy credentials
+  taken from the proxy URL (`HTTPS_PROXY=http://coatcheck:$TOKEN@host:3128`),
+  and they send them as Basic. Bearer covers clients that set the header
+  themselves.
+- **The vault API takes `Authorization: Bearer TOKEN` only.** It is called
+  directly, not through a proxy, so the client always controls the header.
+- **`/_health` and `/_ca` stay open.** Orchestrator health checks (the
+  Dockerfile `HEALTHCHECK`, ECS, Kubernetes probes) can't easily carry a
+  secret, and the CA certificate is public by nature. Neither reveals a
+  secret; `/_health` reveals only the ticket count.
+- **Rejections:** `401` with `WWW-Authenticate: Bearer realm="coatcheck"` on
+  the vault API; `407` with `Proxy-Authenticate: Basic realm="coatcheck"` on
+  forward requests and `CONNECT`, which are refused before any upstream dial.
+  Comparison is constant-time over SHA-256 digests. The token is never
+  logged.
+- **When a token is set it is enforced on every bind host**, loopback
+  included. Without one, the listeners are open, which `loadConfig` allows
+  only on loopback (`127.0.0.0/8`, `::1`, `localhost`). Any other bind host,
+  including `0.0.0.0`, `::` and hostnames, needs a token.
+- **The token must be at least 32 characters with no whitespace.** A short
+  token on a network listener is guessable, and whitespace can't survive the
+  header and URL forms. Suggested: `openssl rand -hex 32`.
+- **The CDP listener stays authenticated by its sid.** The sid is a 96-bit
+  capability that only reaches the agent inside an intercepted, authenticated
+  browser-service response, and Playwright's `connectOverCDP` URL is the only
+  thing every client can carry. Revisit if a CDP adapter without that flow
+  appears.
+- The demo `docker-compose.example.yml` binds `0.0.0.0`, so it requires
+  `COATCHECK_API_TOKEN` from the environment instead of hard-coding one: a
+  published demo token would be no authentication at all.
+
 Policy file:
 
 ```json
@@ -308,6 +383,26 @@ Policy file:
   - `always` is opt-in, for when the host list isn't known in advance or for a
     future egress allowlist.
   - `COATCHECK_PASSTHROUGH_HOSTS` overrides both modes.
+- **Details recorded while implementing roadmap item 10:**
+  - *Unbound tickets match every host.* With `COATCHECK_ALLOW_UNBOUND_SECRETS=1`
+    a live unbound ticket can be swapped anywhere, so while one is live every
+    CONNECT is MITM'd. Otherwise the opt-out would silently stop working on
+    hosts outside the policy.
+  - *Session-bound (CDP) tickets don't count.* They never swap on HTTP(S).
+  - *An adapter host counts only when CDP is enabled*, because that is the
+    only time its responses are rewritten. Its API key ticket is normally
+    covered by the policy's `shared` hosts anyway.
+  - *`COATCHECK_PASSTHROUGH_HOSTS` uses the allowed-host syntax* (exact, `*.`
+    wildcard, IP) without `http://`, which means nothing for a CONNECT.
+    Invalid entries fail startup.
+  - *Upgrade handling.* After forwarding a request that carries an `Upgrade`
+    header, coatcheck stops parsing the client stream and holds further
+    bytes until the upstream's next response head. `101` turns both
+    directions into a raw pipe (no swapping in frames); anything else resumes
+    request parsing. An upgrade request pipelined behind other unanswered
+    requests isn't supported (clients open a fresh connection for upgrades).
+  - Each CONNECT logs `mode=mitm|passthrough` with a `reason`
+    (`policy`, `ticket`, `adapter`, `always`, `passthrough-list`, `not-bound`).
 - **The MITM TLS server advertises ALPN `http/1.1` only.** The request parser is
   HTTP/1.1, so h2-capable clients have to negotiate HTTP/1.1, not fail or
   stall. A test asserts the negotiated protocol.

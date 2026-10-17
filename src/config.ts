@@ -7,6 +7,11 @@
 
 import { isValidSecretName } from './secret-provider.js';
 import { EMPTY_POLICY, parsePolicy, type Policy } from './policy.js';
+import net from 'node:net';
+import { parseHostPattern, type HostPattern } from './host-matcher.js';
+
+/** `COATCHECK_MITM`: `bound` MITMs only hosts a ticket could be swapped for; `always` MITMs every CONNECT. */
+export type MitmMode = 'bound' | 'always';
 
 export type Env = Readonly<Record<string, string | undefined>>;
 
@@ -28,6 +33,23 @@ export interface Config {
   /** From `COATCHECK_POLICY_FILE`; empty (no shared secrets, nothing bound) when unset. */
   policy: Policy;
   policyFile?: string;
+  /** `COATCHECK_ALLOW_UNBOUND_SECRETS`: mint tickets for secrets with no allowed hosts (they swap for any host). */
+  allowUnboundSecrets: boolean;
+  mitm: MitmMode;
+  /** `COATCHECK_PASSTHROUGH_HOSTS`: never MITM'd, in either mode (cert-pinned clients). */
+  passthroughHosts: HostPattern[];
+  /** `COATCHECK_API_TOKEN`: vault API bearer token and proxy credential. Required off loopback. */
+  apiToken?: string;
+}
+
+/** Minimum `COATCHECK_API_TOKEN` length (e.g. `openssl rand -hex 32` gives 64). */
+export const MIN_API_TOKEN_LENGTH = 32;
+
+/** True for binds only reachable from the same host: 127.0.0.0/8, ::1, localhost. */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h === '::1') return true;
+  return net.isIPv4(h) && h.startsWith('127.');
 }
 
 /** Reads the policy file. Injected so `loadConfig` stays pure. */
@@ -138,12 +160,33 @@ export function loadConfig(env: Env, readFile?: ReadFile): Config {
     if (text !== undefined) policy = parsePolicy(text, r.problems, `COATCHECK_POLICY_FILE '${policyFile}'`);
   }
 
+  const mitmRaw = r.string('COATCHECK_MITM') ?? 'bound';
+  if (mitmRaw !== 'bound' && mitmRaw !== 'always') {
+    r.problems.push(`COATCHECK_MITM must be 'bound' or 'always' (got '${mitmRaw}')`);
+  }
+  const passthroughHosts: HostPattern[] = [];
+  for (const entry of (r.string('COATCHECK_PASSTHROUGH_HOSTS') ?? '').split(',').map(e => e.trim()).filter(Boolean)) {
+    const p = entry.toLowerCase().startsWith('http://') ? 'must not have a scheme' : parseHostPattern(entry);
+    if (typeof p === 'string') r.problems.push(`COATCHECK_PASSTHROUGH_HOSTS entry '${entry}': ${p}`);
+    else passthroughHosts.push(p);
+  }
+
+  const bindHost = r.string('COATCHECK_BIND_HOST') ?? '127.0.0.1';
+  const apiToken = r.string('COATCHECK_API_TOKEN');
+  if (apiToken !== undefined && (apiToken.length < MIN_API_TOKEN_LENGTH || /\s/.test(apiToken))) {
+    // Never echo the token itself.
+    r.problems.push(`COATCHECK_API_TOKEN must be at least ${MIN_API_TOKEN_LENGTH} characters with no whitespace (e.g. openssl rand -hex 32)`);
+  }
+  if (apiToken === undefined && !isLoopbackHost(bindHost)) {
+    r.problems.push(`COATCHECK_API_TOKEN is required when COATCHECK_BIND_HOST is not loopback (got '${bindHost}'): anything that can reach the port could mint tickets`);
+  }
+
   const cdpEnabled = r.bool('COATCHECK_CDP_ENABLED', false);
   const cdpPort = r.int('COATCHECK_CDP_PORT', 8444, 1, 65535);
   const config: Config = {
     provider: provider ?? '',
     agentId,
-    bindHost: r.string('COATCHECK_BIND_HOST') ?? '127.0.0.1',
+    bindHost,
     port: r.int('COATCHECK_PORT', 3128, 0, 65535),
     ticketTtlSeconds: r.int('COATCHECK_TICKET_TTL_SECONDS', 900, 1, 86_400),
     secretCacheTtlSeconds: r.int('COATCHECK_SECRET_CACHE_TTL_SECONDS', 300, 0, 86_400),
@@ -157,6 +200,10 @@ export function loadConfig(env: Env, readFile?: ReadFile): Config {
       : undefined,
     policy,
     policyFile,
+    allowUnboundSecrets: r.bool('COATCHECK_ALLOW_UNBOUND_SECRETS', false),
+    mitm: mitmRaw === 'always' ? 'always' : 'bound',
+    passthroughHosts,
+    apiToken,
   };
 
   if (r.problems.length > 0) throw new ConfigError(r.problems);

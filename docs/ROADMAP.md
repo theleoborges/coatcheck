@@ -111,7 +111,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 ## Phase 3: host binding and listener hardening (HIGH, MEDIUM)
 
-9. **Host-bound tickets on HTTP(S).** A secret's effective hosts are the
+9. **[Done]** **Host-bound tickets on HTTP(S).** A secret's effective hosts are the
    intersection of the policy file and an in-band `_allowed_hosts` in its JSON
    value. A JSON secret whose only non-underscore key is `value` counts as a
    simple secret.
@@ -132,8 +132,9 @@ rejected, are in `docs/design/v1-decisions.md`.
    - **Mint responses.** They include `allowed_hosts`.
    - **Tests.** The THREAT_MODEL `attacker.example` exfiltration fails, and so
      does a variant using a loopback listener.
+   - Fix a duplicate type check in `policy.ts`.
 
-10. **MITM policy.** Add `COATCHECK_MITM`:
+10. **[Done]** **MITM policy.** Add `COATCHECK_MITM`:
     - `bound` (the default) MITMs a CONNECT only when the target is a host in
       the policy file, on a live ticket, or on an adapter. Everything else is
       a raw tunnel.
@@ -147,7 +148,7 @@ rejected, are in `docs/design/v1-decisions.md`.
     - after `101 Switching Protocols` the connection becomes a raw pipe, so
       WebSockets work through the MITM.
 
-11. **Authenticate the listeners.** `COATCHECK_API_TOKEN` is checked as a
+11. **[Done]** **Authenticate the listeners.** `COATCHECK_API_TOKEN` is checked as a
     bearer token on the vault API and as `Proxy-Authorization` on the proxy.
     Startup is refused on a non-loopback bind without it.
 

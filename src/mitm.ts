@@ -6,7 +6,10 @@ import type { CertAuthority, HostCert } from './ca.js';
 import type { CdpSessionStore } from './cdp-session-store.js';
 import { createConnectUrlRewriter } from './browserbase-rewrite.js';
 import { parseConnectTarget } from './connect-target.js';
-import { logSwapOutcome } from './swap-log.js';
+import { matchesHost, type HostPattern } from './host-matcher.js';
+import { allPolicyHosts, type Policy } from './policy.js';
+import type { MitmMode } from './config.js';
+import { DENIED_HEADER, hostMismatchBody, logSwapOutcome } from './swap-log.js';
 
 export interface MitmDeps {
   tokenStore: TokenStore;
@@ -18,11 +21,32 @@ export interface MitmDeps {
   browserbaseApiHost: string;
   /** Extra trust anchors for upstream TLS (tests). Default: Node's root store. */
   upstreamCa?: string;
+  /** Operator policy: in `bound` mode its hosts are MITM'd. */
+  policy: Policy;
+  mitm: MitmMode;
+  /** Never MITM'd, in either mode. */
+  passthroughHosts: readonly HostPattern[];
 }
 
-/** Handle a `CONNECT host:port` request: MITM when tickets are live, raw tunnel otherwise. */
+/**
+ * Handle a `CONNECT host:port` request. `bound` mode MITMs only targets a ticket
+ * could be swapped for (policy hosts, live tickets, adapter hosts); `always`
+ * MITMs everything. Passthrough hosts are always a raw tunnel.
+ */
 export function createConnectHandler(deps: MitmDeps) {
-  const { tokenStore, ca, cdpSessionStore, cdp, browserbaseApiHost, upstreamCa } = deps;
+  const { tokenStore, ca, cdpSessionStore, cdp, browserbaseApiHost, upstreamCa, mitm, passthroughHosts } = deps;
+  const policyHosts = allPolicyHosts(deps.policy);
+
+  /** Why this target is MITM'd, or null (with the reason) for a raw tunnel. */
+  function decide(hostname: string): { mitm: boolean; reason: string } {
+    const target = { host: hostname, scheme: 'https' as const };
+    if (matchesHost(passthroughHosts, target)) return { mitm: false, reason: 'passthrough-list' };
+    if (mitm === 'always') return { mitm: true, reason: 'always' };
+    if (matchesHost(policyHosts, target)) return { mitm: true, reason: 'policy' };
+    if (cdp && hostname === browserbaseApiHost) return { mitm: true, reason: 'adapter' };
+    if (tokenStore.hasLiveTicketFor(target)) return { mitm: true, reason: 'ticket' };
+    return { mitm: false, reason: 'not-bound' };
+  }
 
   return async (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer): Promise<void> => {
     // Strict DNS-name / IP-literal validation: the hostname reaches certificate
@@ -40,13 +64,14 @@ export function createConnectHandler(deps: MitmDeps) {
       console.error(`Client socket error (CONNECT ${hostname}):`, err.message);
     });
 
-    // Check if we have any active tokens — if not, just tunnel directly (no MITM needed)
-    if (tokenStore.size === 0) {
-      console.log(`[connect] host=${hostname}:${port} mode=passthrough store_size=0`);
+    // Decrypting a host no ticket can be swapped for gains nothing and risks
+    // breaking clients, so those get a raw tunnel (design §5).
+    const decision = decide(hostname);
+    console.log(`[connect] host=${hostname}:${port} mode=${decision.mitm ? 'mitm' : 'passthrough'} reason=${decision.reason}`);
+    if (!decision.mitm) {
       tunnelDirect(hostname, port, clientSocket, head);
       return;
     }
-    console.log(`[connect] host=${hostname}:${port} mode=mitm store_size=${tokenStore.size}`);
 
     // Mint the leaf cert before acknowledging the CONNECT: the client sends its
     // ClientHello as soon as it sees the 200.
@@ -62,10 +87,13 @@ export function createConnectHandler(deps: MitmDeps) {
     // MITM: terminate TLS from client, inspect/modify, re-encrypt to server
     clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
 
+    // The request parser below is HTTP/1.1 only, so h2-capable clients must
+    // negotiate http/1.1 rather than fail or stall.
     const tlsSocket = new tls.TLSSocket(clientSocket, {
       isServer: true,
       key: serverCert.key,
       cert: serverCert.cert,
+      ALPNProtocols: ['http/1.1'],
     });
 
     tlsSocket.on('error', (err) => {
@@ -77,6 +105,18 @@ export function createConnectHandler(deps: MitmDeps) {
     let requestData = Buffer.from(head);
     let upstreamReady = false;
     let pendingWrites: Buffer[] = [];
+    let denied = false;
+    // Upgrade (e.g. WebSocket): after forwarding a request with an Upgrade
+    // header, hold client bytes until the upstream's response head; a 101
+    // turns the tunnel into a raw pipe (design §5).
+    let awaitingUpgrade = false;
+    let rawPipe = false;
+    let responseHead = Buffer.alloc(0);
+
+    function sendUpstream(buf: Buffer) {
+      if (upstreamReady) realSocket.write(buf);
+      else pendingWrites.push(buf);
+    }
 
     /**
      * Process buffered client data, extracting complete HTTP requests and
@@ -85,7 +125,7 @@ export function createConnectHandler(deps: MitmDeps) {
      * and token-swapped (not raw-piped).
      */
     function processClientData() {
-      for (;;) {
+      while (!denied && !awaitingUpgrade && !rawPipe) {
         const headerEnd = requestData.indexOf('\r\n\r\n');
         if (headerEnd === -1) return; // need more data
 
@@ -104,24 +144,76 @@ export function createConnectHandler(deps: MitmDeps) {
         const body = requestData.subarray(headerEnd + 4, totalLength);
         requestData = requestData.subarray(totalLength); // remainder for next request
 
-        // Swap tokens in headers
-        const result = tokenStore.replaceAll(headerStr);
-        logSwapOutcome('https', hostname, result.swaps, result.output);
+        // Swap tokens in headers. The binding key is the validated CONNECT
+        // target (upstream TLS proves it is the recipient), never Host or SNI.
+        const result = tokenStore.replaceAll(headerStr, { host: hostname, scheme: 'https' });
+        logSwapOutcome('https', hostname, result, result.output);
+        if (result.denied.length > 0) {
+          denyAndClose(hostMismatchBody(result.denied, hostname));
+          return;
+        }
 
         const outBuf = Buffer.concat([
           Buffer.from(result.output + '\r\n\r\n'),
           body,
         ]);
 
-        if (upstreamReady) {
-          realSocket.write(outBuf);
-        } else {
-          pendingWrites.push(outBuf);
-        }
+        sendUpstream(outBuf);
+        if (/^upgrade:/im.test(headerStr)) awaitingUpgrade = true;
       }
     }
 
+    /** Watch upstream bytes for the response head that answers an upgrade request. */
+    function sniffUpgradeResponse(chunk: Buffer) {
+      if (!awaitingUpgrade) return;
+      responseHead = Buffer.concat([responseHead, chunk]);
+      for (;;) {
+        const end = responseHead.indexOf('\r\n\r\n');
+        if (end === -1) return;
+        const status = /^HTTP\/1\.[01] (\d{3})/.exec(responseHead.subarray(0, end).toString())?.[1];
+        responseHead = responseHead.subarray(end + 4);
+        // Interim responses (100 Continue) precede the real answer.
+        if (status && status.startsWith('1') && status !== '101') continue;
+        responseHead = Buffer.alloc(0);
+        awaitingUpgrade = false;
+        if (status === '101') {
+          rawPipe = true;
+          if (requestData.length > 0) sendUpstream(requestData);
+          requestData = Buffer.alloc(0);
+        } else {
+          processClientData();
+        }
+        return;
+      }
+    }
+
+    /**
+     * Answer 403 instead of forwarding, and close the tunnel: requests
+     * pipelined ahead of this one that the upstream hasn't answered are
+     * abandoned (design §3, "Host binding details").
+     */
+    function denyAndClose(body: string) {
+      denied = true;
+      pendingWrites = [];
+      requestData = Buffer.alloc(0);
+      realSocket.unpipe(tlsSocket);
+      realSocket.destroy();
+      tlsSocket.end(
+        'HTTP/1.1 403 Forbidden\r\n' +
+        'Content-Type: application/json\r\n' +
+        `${DENIED_HEADER}: host-mismatch\r\n` +
+        `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+        'Connection: close\r\n\r\n' +
+        body,
+      );
+    }
+
     tlsSocket.on('data', (chunk: Buffer) => {
+      if (denied) return;
+      if (rawPipe) {
+        sendUpstream(chunk);
+        return;
+      }
       requestData = Buffer.concat([requestData, chunk]);
       processClientData();
     });
@@ -132,6 +224,7 @@ export function createConnectHandler(deps: MitmDeps) {
       host: hostname,
       port,
       servername: net.isIP(hostname) ? undefined : hostname,
+      ALPNProtocols: ['http/1.1'],
       ...(upstreamCa ? { ca: upstreamCa } : {}),
     }, () => {
       upstreamReady = true;
@@ -141,6 +234,9 @@ export function createConnectHandler(deps: MitmDeps) {
       }
       pendingWrites = [];
 
+      // Registered before the pipe/rewriter so a 101 flips rawPipe before they see the chunk.
+      realSocket.on('data', sniffUpgradeResponse);
+
       // Responses flow back to the client. For the Browserbase REST host (when the
       // CDP proxy is on) we rewrite the session `connectUrl` to point at the local
       // CDP proxy; every other host pipes through unmodified.
@@ -149,6 +245,11 @@ export function createConnectHandler(deps: MitmDeps) {
           (realConnectUrl) => `ws://${cdp.advertiseHost}:${cdp.port}/cdp/${cdpSessionStore.register(realConnectUrl)}`,
         );
         realSocket.on('data', (chunk: Buffer) => {
+          if (denied) return;
+          if (rawPipe) {
+            tlsSocket.write(chunk);
+            return;
+          }
           const out = rewriter.push(chunk);
           if (out.length > 0) tlsSocket.write(out);
         });
@@ -163,7 +264,7 @@ export function createConnectHandler(deps: MitmDeps) {
 
     realSocket.on('error', (err) => {
       console.error(`Upstream TLS error for ${hostname}:`, err.message);
-      tlsSocket.destroy();
+      if (!denied) tlsSocket.destroy();
     });
 
     // Tie the two legs' lifetimes together, so a client that goes away does
@@ -171,7 +272,7 @@ export function createConnectHandler(deps: MitmDeps) {
     // upstream's idle timeout.
     tlsSocket.on('end', () => realSocket.end()); // forward the client's half-close
     tlsSocket.on('close', () => realSocket.destroy());
-    realSocket.on('close', () => tlsSocket.destroy());
+    realSocket.on('close', () => { if (!denied) tlsSocket.destroy(); }); // a denial ends tlsSocket itself
   };
 }
 

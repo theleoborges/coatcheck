@@ -1,13 +1,16 @@
 # Local demo: coatcheck backed by LocalStack (SSM + Secrets Manager).
 #
+#   export COATCHECK_API_TOKEN=$(openssl rand -hex 32)
 #   docker compose -f docker-compose.example.yml up --build
-#   curl -s localhost:3128/_vault/example-api-key        # -> {"token":"cct_...", ...}
+#   curl -s -H "Authorization: Bearer $COATCHECK_API_TOKEN" \
+#     localhost:3128/_vault/example-api-key              # -> {"token":"cct_...", ...}
 #   curl -s localhost:3128/_ca > /tmp/coatcheck-ca.crt
-#   curl -s --proxy http://localhost:3128 --cacert /tmp/coatcheck-ca.crt \
+#   curl -s --proxy http://coatcheck:$COATCHECK_API_TOKEN@localhost:3128 \
+#     --cacert /tmp/coatcheck-ca.crt \
 #     -H "Authorization: Bearer cct_..." https://httpbin.org/headers
 #
-# httpbin echoes the real value back — exactly the exfiltration path that
-# host-bound tickets will close (see docs/THREAT_MODEL.md). Demo only.
+# httpbin echoes the real value back: the demo policy binds example-api-key to
+# httpbin.org. The same ticket sent to any other host gets 403. Demo only.
 services:
   coatcheck:
     build:
@@ -23,6 +26,9 @@ services:
       # Published ports need a non-loopback bind. In production run as a
       # sidecar and keep the default 127.0.0.1.
       - COATCHECK_BIND_HOST=0.0.0.0
+      # Required off loopback. Not hard-coded: a token published in this file
+      # would authenticate nothing.
+      - COATCHECK_API_TOKEN=${COATCHECK_API_TOKEN:?set COATCHECK_API_TOKEN, e.g. export COATCHECK_API_TOKEN=$$(openssl rand -hex 32)}
       - COATCHECK_CDP_ENABLED=${COATCHECK_CDP_ENABLED:-0}
       - COATCHECK_CDP_ADVERTISE_HOST=${COATCHECK_CDP_ADVERTISE_HOST:-127.0.0.1}
       # No COATCHECK_AWS_ROLE_ARN: STS AssumeRole is skipped, static creds are used.
