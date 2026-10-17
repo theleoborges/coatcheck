@@ -284,6 +284,12 @@ session remains the client's job.
 
 ## Known gaps
 
+> The first and fourth gaps below were confirmed against a real Browserbase
+> session (`examples/agents/browser-login/attack-transform.md`) and are what
+> `cdp-broker-login.md` (roadmap item 20) replaces this flow to close. Until
+> then, this flow protects against accidental exposure of the password, not
+> against an agent that is trying to read it.
+
 - **Script on an allowed origin can read the filled value.** Origin binding
   (roadmap item 15) stops a fill on another site and closes direct
   exfiltration through `Runtime.*` expressions, but once the real value is in

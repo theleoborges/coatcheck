@@ -267,7 +267,10 @@ inspected.
 
 See `docs/design/cdp-injection.md` for gaps specific to the CDP path:
 script on an allowed origin can read the filled value, cross-origin iframe
-logins, transform-blind redaction, uninspected binary frames.
+logins, transform-blind redaction, uninspected binary frames. **The first
+and third together mean the v1 flow does not hold against an adversarial
+agent** (confirmed by `examples/agents/browser-login/attack-transform.md`);
+`docs/design/cdp-broker-login.md` (roadmap item 20) is the replacement.
 
 Fixed by roadmap item 15: session-bound login tickets substituted on any
 page, and inside `Runtime.evaluate` / `Runtime.callFunctionOn`, so an agent
