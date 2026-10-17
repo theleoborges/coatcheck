@@ -40,6 +40,9 @@ const STATUS_TEXT = { 400: 'Bad Request', 403: 'Forbidden', 431: 'Request Header
 /** A header section that hasn't ended within this many bytes gets 431. */
 export const MAX_HEAD_BYTES = 64 * 1024;
 
+/** Client bytes held before the upstream connects; past this the client is paused. */
+const MAX_PENDING_BYTES = 1024 * 1024;
+
 /** The body of the request being read, after its head. */
 type BodyState =
   /** Forwarded as it arrives. */
@@ -50,9 +53,8 @@ type BodyState =
       remaining: number;
       decoder?: ChunkedDecoder;
       head: RequestHead;
-      /** The swapped head, without the final CRLFCRLF. */
-      headOut: string;
-      headOutcome: SwapOutcome & { postSwapText: string };
+      /** The head's swap outcome; `output` is the swapped head, without the final CRLFCRLF. */
+      headOutcome: SwapOutcome & { output: string };
       raw: Buffer[];
       rawBytes: number;
       data: Buffer[];
@@ -159,9 +161,26 @@ export function createConnectHandler(deps: MitmDeps) {
     let rawPipe = false;
     let responseHead = Buffer.alloc(0);
 
+    // Backpressure: stop reading from the client while the upstream can't take
+    // more, so a streamed upload to a slow upstream (or bytes held while an
+    // upgrade is pending) can't grow coatcheck's memory without bound.
+    let pendingBytes = 0;
+    let upstreamFull = false;
+    function updateFlow() {
+      const hold = upstreamFull
+        || (!upstreamReady && pendingBytes > MAX_PENDING_BYTES)
+        || (awaitingUpgrade && requestData.length > MAX_HEAD_BYTES);
+      if (hold && !tlsSocket.isPaused()) tlsSocket.pause();
+      else if (!hold && tlsSocket.isPaused()) tlsSocket.resume();
+    }
+
     function sendUpstream(buf: Buffer) {
-      if (upstreamReady) realSocket.write(buf);
-      else pendingWrites.push(buf);
+      if (upstreamReady) {
+        if (!realSocket.write(buf)) upstreamFull = true;
+      } else {
+        pendingWrites.push(buf);
+        pendingBytes += buf.length;
+      }
     }
 
     // The body of the request being read (null between requests), and whether
@@ -211,23 +230,23 @@ export function createConnectHandler(deps: MitmDeps) {
 
         const swapped = swapHead(head);
         if (swapped.denied.length > 0 || swapped.invalid.length > 0) {
-          logSwapOutcome('https', hostname, swapped, swapped.postSwapText);
+          logSwapOutcome('https', hostname, swapped, swapped.output);
           denyForSwaps(swapped.denied, swapped.invalid);
           return;
         }
 
         const remaining = framing.kind === 'length' ? framing.length : 0;
         const decoder = framing.kind === 'chunked' ? new ChunkedDecoder() : undefined;
-        if (framing.kind !== 'none' && (decoder || remaining > 0) && tokenStore.hasLiveBodyTicketFor(swapTarget)) {
+        const hasBody = decoder !== undefined || remaining > 0;
+        if (hasBody && tokenStore.hasLiveBodyTicketFor(swapTarget)) {
           body = {
-            mode: 'buffer', remaining, decoder, head, headOut: swapped.output,
-            headOutcome: swapped, raw: [], rawBytes: 0, data: [],
+            mode: 'buffer', remaining, decoder, head, headOutcome: swapped, raw: [], rawBytes: 0, data: [],
           };
           continue;
         }
-        logSwapOutcome('https', hostname, swapped, swapped.postSwapText);
+        logSwapOutcome('https', hostname, swapped, swapped.output);
         sendUpstream(Buffer.from(swapped.output + '\r\n\r\n'));
-        if (decoder || remaining > 0) body = { mode: 'stream', remaining, decoder };
+        if (hasBody) body = { mode: 'stream', remaining, decoder };
         else finishRequest();
       }
     }
@@ -243,7 +262,6 @@ export function createConnectHandler(deps: MitmDeps) {
       const output = head.fieldLines.length > 0 ? `${line.output}\r\n${fields.output}` : line.output;
       return {
         output,
-        postSwapText: output,
         swaps: [...line.swaps, ...fields.swaps],
         denied: [...line.denied, ...fields.denied],
         invalid: [...(line.invalid ?? []), ...(fields.invalid ?? [])],
@@ -278,9 +296,9 @@ export function createConnectHandler(deps: MitmDeps) {
         state.rawBytes += consumed.length;
         if (state.rawBytes > maxSwapBodyBytes) {
           // Too large to hold: forward what we have and stream the rest unscanned.
-          logSwapOutcome('https', hostname, state.headOutcome, state.headOutcome.postSwapText);
+          logSwapOutcome('https', hostname, state.headOutcome, state.headOutcome.output);
           logBodyUnscanned('https', hostname, maxSwapBodyBytes);
-          sendUpstream(Buffer.concat([Buffer.from(state.headOut + '\r\n\r\n'), ...state.raw]));
+          sendUpstream(Buffer.concat([Buffer.from(state.headOutcome.output + '\r\n\r\n'), ...state.raw]));
           body = { mode: 'stream', remaining: state.remaining, decoder: state.decoder };
           if (complete) finishRequest();
           return complete;
@@ -307,13 +325,13 @@ export function createConnectHandler(deps: MitmDeps) {
         swaps: [...outcome.swaps, ...(bodySwap?.result.swaps ?? [])],
         denied: deniedSwaps,
         skipped: bodySwap?.result.skipped,
-      }, bodySwap ? `${outcome.postSwapText}\n${bodySwap.result.output}` : outcome.postSwapText);
+      }, bodySwap ? `${outcome.output}\n${bodySwap.result.output}` : outcome.output);
       if (deniedSwaps.length > 0) {
         denyForSwaps(deniedSwaps, []);
         return;
       }
 
-      let head = state.headOut;
+      let head = outcome.output;
       let outBody: Buffer = Buffer.concat(state.raw);
       if (bodySwap && bodySwap.result.swaps.length > 0) {
         const swapped = bodySwap.body;
@@ -372,6 +390,7 @@ export function createConnectHandler(deps: MitmDeps) {
         } else {
           processClientData();
         }
+        updateFlow();
         return;
       }
     }
@@ -402,10 +421,12 @@ export function createConnectHandler(deps: MitmDeps) {
       if (denied) return;
       if (rawPipe) {
         sendUpstream(chunk);
+        updateFlow();
         return;
       }
       requestData = Buffer.concat([requestData, chunk]);
       processClientData();
+      updateFlow();
     });
 
     // Connect to the real server once (reused for keep-alive).
@@ -420,9 +441,15 @@ export function createConnectHandler(deps: MitmDeps) {
       upstreamReady = true;
       // Flush any requests that were parsed before the upstream connected
       for (const buf of pendingWrites) {
-        realSocket.write(buf);
+        if (!realSocket.write(buf)) upstreamFull = true;
       }
       pendingWrites = [];
+      pendingBytes = 0;
+      realSocket.on('drain', () => {
+        upstreamFull = false;
+        updateFlow();
+      });
+      updateFlow();
 
       // Registered before the pipe/rewriter so a 101 flips rawPipe before they see the chunk.
       realSocket.on('data', sniffUpgradeResponse);
@@ -484,4 +511,10 @@ function tunnelDirect(hostname: string, port: number, clientSocket: net.Socket, 
     console.error(`Client socket error for ${hostname}:${port}:`, err.message);
     serverSocket.destroy();
   });
+
+  // pipe() forwards end, not destroy: tie the legs together so neither
+  // outlives the other (e.g. close() destroying open tunnels). A leg pipe has
+  // already ended is left to flush.
+  clientSocket.on('close', () => { if (!serverSocket.writableEnded) serverSocket.destroy(); });
+  serverSocket.on('close', () => { if (!clientSocket.writableEnded) clientSocket.destroy(); });
 }

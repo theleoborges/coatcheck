@@ -975,6 +975,47 @@ describe('coatcheck server: swap-path hardening', () => {
     expect(upstream.received[1].body).toBe('a=real-key');
   });
 
+  /** A TLS upstream that accepts connections but never reads from them. */
+  async function startStalledUpstream() {
+    const leaf = await upstreamCa.getCertForHost('127.0.0.1');
+    const sockets: tls.TLSSocket[] = [];
+    const server = tls.createServer({ key: leaf.key, cert: leaf.cert }, sock => {
+      sockets.push(sock);
+      sock.on('error', () => {});
+      sock.pause();
+    });
+    await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+    cleanups.push(() => new Promise<void>(r => { sockets.forEach(s => s.destroy()); server.close(() => r()); }));
+    return (server.address() as AddressInfo).port;
+  }
+
+  /** Write `total` bytes without waiting; resolve with what the client still holds after the proxy had time to read. */
+  async function unflushedAfter(t: tls.TLSSocket, total: number): Promise<number> {
+    const chunk = Buffer.alloc(64 * 1024, 0x78);
+    for (let sent = 0; sent < total; sent += chunk.length) t.write(chunk);
+    await new Promise(r => setTimeout(r, 1500));
+    return t.writableLength;
+  }
+
+  // Sizes: well past socket buffers, and small enough that without flow
+  // control coatcheck reads it all within the wait.
+  it.each([
+    ['a streamed upload to an upstream that stops reading', 48 * 1024 * 1024, (len: number) =>
+      `POST /up HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${len}\r\n\r\n`],
+    ['bytes sent while an upgrade is pending', 8 * 1024 * 1024, () =>
+      'GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'],
+  ])('applies backpressure to %s instead of buffering it (memory exhaustion)', async (_name, total, head) => {
+    captureLogs();
+    const upstreamPort = await startStalledUpstream();
+    const { port } = await startProxy({ mitm: 'always' });
+    const { socket } = await connect(port, `127.0.0.1:${upstreamPort}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(head(total));
+    // Without flow control coatcheck reads all of it into memory and the
+    // client's buffer drains; with it, most of it stays with the client.
+    expect(await unflushedAfter(t, total)).toBeGreaterThan(total / 2);
+  }, 20_000);
+
   it('applies swap_body from a shared secret\'s policy entry', async () => {
     captureLogs();
     const policy = parsePolicy(JSON.stringify({

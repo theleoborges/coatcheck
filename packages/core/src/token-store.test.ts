@@ -72,6 +72,14 @@ describe('TokenStore', () => {
     expect(result.swaps.map(s => s.secretName).sort()).toEqual(['api-key', 'token']);
   });
 
+  it('substitutes in one pass: a value holding another ticket literal is not swapped again', () => {
+    store = new TokenStore();
+    const t2 = store.issue('token', 'usr-real-token');
+    const t1 = store.issue('api-key', `prefix-${t2.id}`);
+    const result = store.replaceAll(`a=${t1.id}&b=${t2.id}`, ANY_HOST);
+    expect(result.output).toBe(`a=prefix-${t2.id}&b=usr-real-token`);
+  });
+
   it('replaces tokens in headers', () => {
     store = new TokenStore();
     const token = store.issue('notion-key', 'secret_abc123');

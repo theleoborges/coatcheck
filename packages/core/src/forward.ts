@@ -105,6 +105,9 @@ export function handleForwardRequest(
         if (!res.headersSent) res.writeHead(502);
         res.end('Proxy error');
       });
+      // A client that goes away mid-body must not leave the upstream request
+      // waiting for the rest of a streamed body.
+      req.on('error', () => proxyReq.destroy());
       return proxyReq;
     } catch (err) {
       // http.request throws synchronously on invalid header values Node
@@ -118,6 +121,7 @@ export function handleForwardRequest(
     }
   };
 
+  req.on('error', () => res.destroy());
   const hasBody = req.headers['content-length'] !== undefined || req.headers['transfer-encoding'] !== undefined;
   if (!hasBody || !tokenStore.hasLiveBodyTicketFor(target)) {
     logSwapOutcome('http', hostname, { swaps, denied }, postSwapText);
@@ -170,7 +174,6 @@ export function handleForwardRequest(
   };
   req.on('data', onData);
   req.on('end', onEnd);
-  req.on('error', () => res.destroy());
 }
 
 function firstHeader(value: string | string[] | undefined): string | undefined {

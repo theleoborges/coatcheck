@@ -249,7 +249,11 @@ rejected, are in `docs/design/v1-decisions.md`.
     - The token store finds tickets with one pattern scan instead of one
       substring search per live ticket.
     - The policy keeps a shared secret's hosts and `swap_body` in one rule,
-      and the MITM parses each request head once.
+      and the MITM parses each request head once (bare CR/LF in a line is
+      malformed).
+    - The MITM tunnel applies backpressure: it stops reading from the client
+      while the upstream can't take more, or while an upgrade is pending.
+      `close()` destroys open tunnels.
 
 Done: the unused `http-proxy` dependency was removed during extraction.
 

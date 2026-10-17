@@ -89,11 +89,14 @@ export interface SwapResult {
 /** Adapts a real value to where it lands; null = it can't be represented there. */
 export type ValueEncoder = (value: string) => string | null;
 
-/** Replace every occurrence of each ticket id; a replacer function so `$&` etc. in values stay literal. */
+/**
+ * Replace every ticket id in one pass, so a real value that happens to contain
+ * another ticket literal is never substituted again. A replacer function keeps
+ * `$&` etc. in values literal.
+ */
 function substitute(input: string, replacements: ReadonlyMap<string, string>): string {
-  let result = input;
-  for (const [id, value] of replacements) result = result.replaceAll(id, () => value);
-  return result;
+  if (replacements.size === 0) return input;
+  return input.replace(TICKET_PATTERN, id => replacements.get(id) ?? id);
 }
 
 /**
@@ -217,12 +220,7 @@ export class TokenStore {
    * swap on HTTP(S)). Drives the `COATCHECK_MITM=bound` decision.
    */
   hasLiveTicketFor(target: MatchTarget): boolean {
-    const now = Date.now();
-    for (const entry of this.tokens.values()) {
-      if (now > entry.expiresAt || entry.sessionId !== undefined) continue;
-      if (entry.allowedHosts === undefined || matchesHost(entry.allowedHosts, target)) return true;
-    }
-    return false;
+    return this.hasLiveHttpTicket(target, false);
   }
 
   /**
@@ -230,9 +228,14 @@ export class TokenStore {
    * `target`: decides whether a request body is buffered or streamed.
    */
   hasLiveBodyTicketFor(target: MatchTarget): boolean {
+    return this.hasLiveHttpTicket(target, true);
+  }
+
+  private hasLiveHttpTicket(target: MatchTarget, swapBodyOnly: boolean): boolean {
     const now = Date.now();
     for (const entry of this.tokens.values()) {
-      if (!entry.swapBody || now > entry.expiresAt || entry.sessionId !== undefined) continue;
+      if (swapBodyOnly && !entry.swapBody) continue;
+      if (now > entry.expiresAt || entry.sessionId !== undefined) continue;
       if (entry.allowedHosts === undefined || matchesHost(entry.allowedHosts, target)) return true;
     }
     return false;

@@ -27,9 +27,11 @@ export interface RequestHead {
 export function parseRequestHead(head: string): RequestHead {
   const [requestLine, ...fieldLines] = head.split('\r\n');
   const fields: Array<[string, string]> = [];
-  let malformed = false;
-  for (const line of fieldLines) {
-    if (!HEADER_LINE.test(line)) {
+  // A bare CR or LF is a line break to some servers but not to this parser:
+  // a hidden `Content-Length` after one would desync the framing.
+  let malformed = /[\r\n]/.test(requestLine);
+  for (const line of malformed ? [] : fieldLines) {
+    if (!HEADER_LINE.test(line) || /[\r\n]/.test(line)) {
       malformed = true;
       break;
     }

@@ -309,7 +309,26 @@ by the agent is deferred, and if it is ever added it may only narrow.
 - **Shared rules carry their own `swap_body`.** `Policy.shared` maps a name to
   `{ allowedHosts, swapBody? }`, like a per-agent `PolicyRule`.
 - **The MITM parses each request head once** (`parseRequestHead`): framing,
-  `Content-Type`, `Content-Encoding` and `Upgrade` come from one parse.
+  `Content-Type`, `Content-Encoding` and `Upgrade` come from one parse. A
+  bare CR or LF inside the request line or a header line is malformed
+  (`400 bad-framing`): some servers treat it as a line break, so a
+  `Content-Length` hidden behind one would desync the framing.
+- **Substitution is one pass** over the input (`TICKET_PATTERN`), so a real
+  value that contains another ticket's literal is never substituted again.
+- **Flow control on the MITM tunnel.** Streaming moved bodies out of
+  coatcheck's buffers and into the upstream socket's write queue, which a
+  slow or stalled upstream lets grow without bound. coatcheck now pauses
+  reading from the client while the upstream socket is full (until
+  `drain`), while more than 1 MiB is held before the upstream connects, and
+  while more than 64 KiB arrives during a pending upgrade. TCP backpressure
+  then reaches the client. Attack tests use an upstream that never reads.
+- **`close()` destroys open tunnels.** CONNECT sockets leave the HTTP
+  server's connection tracking, and a tunnel paused for backpressure doesn't
+  see the client's EOF, so shutdown destroys them explicitly.
+  - Residual: there is no idle timeout on tunnels. A client that disconnects
+    while its tunnel is paused against an upstream that never reads again
+    holds both sockets until the upstream closes. The same is true of
+    passthrough tunnels today.
 
 ### Default: deny, at mint time
 
@@ -584,8 +603,9 @@ Policy file:
   are rare, and swapping them would need the header binding rules for a
   second header section.
 - **Bodies are buffered whole**, as `Content-Length` bodies already were.
-  Rejected: streaming chunks through, because body swapping (item 17) needs
-  the whole body anyway and the agent can only exhaust its own sidecar.
+  Superseded by item 19 (§3, "Bodies stream unless a swap is possible"):
+  only a body a `swap_body` ticket could apply to is buffered, up to
+  `COATCHECK_MAX_SWAP_BODY_BYTES`.
 
 ## 6. Browser adapters
 

@@ -24,8 +24,14 @@ describe('requestFraming', () => {
     ['Transfer-Encoding\t: chunked'],
     ['X-A: 1', ' continued'],
     ['no colon here'],
+    ['X-A: 1\nContent-Length: 5'],
+    ['X-A: 1\rContent-Length: 5'],
   ])('refuses ambiguous framing: %j', (...lines) => {
     expect(requestFraming(head(...lines)).kind).toBe('invalid');
+  });
+
+  it('refuses a bare LF in the request line (a hidden header line)', () => {
+    expect(requestFraming('POST / HTTP/1.1\nContent-Length: 5\r\nHost: h').kind).toBe('invalid');
   });
 });
 

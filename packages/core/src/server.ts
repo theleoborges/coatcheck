@@ -106,7 +106,12 @@ export function createCoatcheck(deps: CoatcheckDeps): Coatcheck {
     passthroughHosts: deps.passthroughHosts ?? [],
     maxSwapBodyBytes,
   });
+  // CONNECT sockets leave the HTTP server's connection tracking, so close()
+  // destroys them itself (a tunnel paused for backpressure may never see EOF).
+  const tunnels = new Set<Socket>();
   server.on('connect', (req, socket, head) => {
+    tunnels.add(socket as Socket);
+    socket.once('close', () => tunnels.delete(socket as Socket));
     if (!auth.proxy(req)) {
       console.warn('[auth] rejected CONNECT: missing or invalid Proxy-Authorization');
       socket.end(PROXY_AUTH_REQUIRED);
@@ -127,6 +132,7 @@ export function createCoatcheck(deps: CoatcheckDeps): Coatcheck {
     close: () => new Promise(resolve => {
       server.close(() => resolve());
       server.closeAllConnections();
+      for (const socket of tunnels) socket.destroy();
     }),
   };
 }
