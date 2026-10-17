@@ -53,7 +53,7 @@ rejected, are in `docs/design/v1-decisions.md`.
    `handleOAuthRefresh` logs the status and a parsed, truncated `error` code,
    and nothing else.
 
-6. **`SecretProvider` interface (in-tree).** Introduce:
+6. **[Done]** **`SecretProvider` interface (in-tree).** Introduce:
 
    ```ts
    interface Secret { value: string; allowedHosts?: string[] }

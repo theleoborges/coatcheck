@@ -12,6 +12,7 @@ import { TokenStore } from './token-store.js';
 import { CertAuthority } from './ca.js';
 import { CdpSessionStore } from './cdp-session-store.js';
 import { createCoatcheck, type Coatcheck, type CoatcheckDeps } from './server.js';
+import { createMemoryProvider } from './providers/memory.js';
 
 interface Echo { url: string; headers: http.IncomingHttpHeaders }
 
@@ -33,7 +34,7 @@ async function startProxy(overrides: Partial<CoatcheckDeps> = {}) {
   const cdpSessionStore = new CdpSessionStore();
   const coatcheck: Coatcheck = createCoatcheck({
     tokenStore,
-    secretFetcher: {} as CoatcheckDeps['secretFetcher'],
+    provider: createMemoryProvider(),
     ca: proxyCa,
     cdpSessionStore,
     upstreamCa: upstreamCa.caCertPem,

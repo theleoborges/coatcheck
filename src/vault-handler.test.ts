@@ -2,24 +2,15 @@ import http from 'node:http';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { oauthErrorCode, handleVaultRequest, VaultDeps } from './vault-handler.js';
 import { TokenStore } from './token-store.js';
+import { createMemoryProvider, type MemoryProviderInit } from './providers/memory.js';
 
 // Save real fetch before any tests can mock it
 const realFetch = globalThis.fetch;
 
 // --- Helpers ---
 
-function mockSecretFetcher(secrets: Record<string, string>, fleetSecrets: Record<string, string> = {}) {
-  return {
-    get: vi.fn(async (name: string) => secrets[name] ?? null),
-    exists: vi.fn(async (name: string) => name in secrets),
-    listSecrets: vi.fn(async () => Object.keys(secrets)),
-    put: vi.fn(async (name: string, value: string) => { secrets[name] = value; }),
-    fetchFleetSecret: vi.fn(async (name: string) => fleetSecrets[name] ?? null),
-  };
-}
-
 function mockCa() {
-  return { caCertPem: '-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n', getCertForHost: vi.fn() };
+  return { caCertPem: '-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n' };
 }
 
 /** Spin up a tiny HTTP server that delegates to handleVaultRequest */
@@ -46,6 +37,17 @@ async function fetchJSON(port: number, path: string, method = 'GET'): Promise<{ 
   const res = await realFetch(`http://127.0.0.1:${port}${path}`, { method });
   const body = await res.json();
   return { status: res.status, body: body as Record<string, unknown> };
+}
+
+/** GET with the path sent verbatim (fetch would normalise `%2E%2E` segments away). */
+function rawGetJSON(port: number, path: string): Promise<{ status: number; body: Record<string, unknown> }> {
+  return new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port, path }, res => {
+      let raw = '';
+      res.on('data', d => { raw += d; });
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, body: JSON.parse(raw) as Record<string, unknown> }));
+    }).on('error', reject);
+  });
 }
 
 async function postJSON(port: number, path: string, body: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
@@ -76,13 +78,19 @@ describe('Vault Handler', () => {
     server?.close();
   });
 
-  async function setup(secrets: Record<string, string>, fleetSecrets: Record<string, string> = {}) {
+  async function setup(
+    secrets: Record<string, string>,
+    sharedSecrets: Record<string, string> = {},
+    opts: Pick<MemoryProviderInit, 'writable'> & { noShared?: boolean } = {},
+  ) {
     tokenStore = new TokenStore();
-    const deps: VaultDeps = {
-      tokenStore,
-      secretFetcher: mockSecretFetcher(secrets, fleetSecrets) as unknown as VaultDeps['secretFetcher'],
-      ca: mockCa() as unknown as VaultDeps['ca'],
-    };
+    const provider = createMemoryProvider({
+      secrets,
+      shared: opts.noShared ? undefined : sharedSecrets,
+      writable: opts.writable,
+    });
+    if (provider.secrets.put) vi.spyOn(provider.secrets, 'put');
+    const deps: VaultDeps = { tokenStore, provider, ca: mockCa() };
     server = createTestServer(deps);
     port = await listen(server);
     return deps;
@@ -253,10 +261,38 @@ describe('Vault Handler', () => {
   });
 
   it('URL-decodes secret names', async () => {
-    await setup({ 'my integration': 'secret-val' });
-    const { status, body } = await fetchJSON(port, '/_vault/my%20integration');
+    await setup({ 'my-integration': 'secret-val' });
+    const { status, body } = await fetchJSON(port, '/_vault/my%2Dintegration');
     expect(status).toBe(200);
     expect(body.token).toMatch(/^cct_/);
+  });
+
+  it('rejects invalid secret names with 400 before reaching the provider', async () => {
+    const deps = await setup({ 'my integration': 'secret-val' });
+    const get = vi.spyOn(deps.provider.secrets, 'get');
+    const exists = vi.spyOn(deps.provider.secrets, 'exists');
+    for (const path of [
+      '/_vault/my%20integration',
+      '/_vault/..%2F..%2Fetc%2Fpasswd',
+      '/_vault/%2E%2E',
+      '/_vault/.hidden',
+      '/_vault/a%2Fb?check=1',
+      `/_vault/${'a'.repeat(129)}`,
+      '/_vault/%E0%A4%A',
+    ]) {
+      const { status, body } = await rawGetJSON(port, path);
+      expect(status, path).toBe(400);
+      expect(String(body.error), path).toContain('Invalid secret name');
+    }
+    expect(get).not.toHaveBeenCalled();
+    expect(exists).not.toHaveBeenCalled();
+    expect(tokenStore.size).toBe(0);
+  });
+
+  it('accepts names at the length limit', async () => {
+    const name = 'a'.repeat(128);
+    await setup({ [name]: 'v' });
+    expect((await fetchJSON(port, `/_vault/${name}`)).status).toBe(200);
   });
 
   it('returns false for non-vault paths', async () => {
@@ -278,10 +314,10 @@ describe('Vault Handler', () => {
     expect(swapped.output).toBe('https://api.trello.com/1/boards?key=trello-key-123&token=trello-tok-456');
   });
 
-  // --- Fleet secrets (/_secret/{name}) ---
+  // --- Shared secrets (/_secret/{name}) ---
 
   describe('/_secret/{name}', () => {
-    it('issues token for allowlisted fleet secret', async () => {
+    it('issues token for allowlisted shared secret', async () => {
       await setup({}, { 'browserbase-api-key': 'bb_live_real_key_xyz' });
       const { status, body } = await fetchJSON(port, '/_secret/browserbase-api-key');
       expect(status).toBe(200);
@@ -294,24 +330,67 @@ describe('Vault Handler', () => {
       await setup({}, { 'internal-admin-key': 'sk-master-xxx' });
       const { status, body } = await fetchJSON(port, '/_secret/internal-admin-key');
       expect(status).toBe(403);
-      expect(body.error).toContain('not in the fleet allowlist');
+      expect(body.error).toContain('not in the shared-secret allowlist');
       // No token issued — even though the upstream secret exists, the proxy refuses to mint
       expect(tokenStore.size).toBe(0);
     });
 
-    it('returns 404 when secret is not in Secrets Manager', async () => {
+    it('rejects invalid shared-secret names with 400', async () => {
+      await setup({}, { 'browserbase-api-key': 'k' });
+      expect((await fetchJSON(port, '/_secret/..%2Fbrowserbase-api-key')).status).toBe(400);
+    });
+
+    it('returns 404 when the provider has no shared store', async () => {
+      await setup({}, {}, { noShared: true });
+      const { status, body } = await fetchJSON(port, '/_secret/browserbase-api-key');
+      expect(status).toBe(404);
+      expect(body.error).toContain('has no shared secrets');
+    });
+
+    it('returns 404 when secret is not in the shared store', async () => {
       await setup({}, {});
       const { status, body } = await fetchJSON(port, '/_secret/browserbase-api-key');
       expect(status).toBe(404);
       expect(body.error).toContain('not found');
     });
 
-    it('issued fleet-secret tokens are swappable in headers', async () => {
+    it('issued shared-secret tokens are swappable in headers', async () => {
       await setup({}, { 'browserbase-api-key': 'bb_live_xyz_real' });
       const { body } = await fetchJSON(port, '/_secret/browserbase-api-key');
       const header = `x-bb-api-key: ${body.token}\r\n`;
       const swapped = tokenStore.replaceAll(header);
       expect(swapped.output).toBe('x-bb-api-key: bb_live_xyz_real\r\n');
+    });
+  });
+
+  // --- Provider capabilities and name validation on POST routes ---
+
+  describe('provider capabilities', () => {
+    it('rejects mint-tokens with an invalid secret name', async () => {
+      await setup({});
+      const { status, body } = await postJSON(port, '/_vault/mint-tokens', { secretName: '../example-login', sessionId: 'abc' });
+      expect(status).toBe(400);
+      expect(body.error).toContain('Invalid secret name');
+    });
+
+    it('rejects refresh with an invalid secret name', async () => {
+      await setup({});
+      const { status } = await fetchJSON(port, '/_vault/..%2Fgoogle/refresh', 'POST');
+      expect(status).toBe(400);
+    });
+
+    it('returns 501 for refresh on a read-only provider without calling the token endpoint', async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = vi.fn() as unknown as typeof fetch;
+      try {
+        await setup({ google: JSON.stringify({ refresh_token: 'r', token_url: 'https://oauth2.example.test/token', client_id: 'c', client_secret: 's' }) }, {}, { writable: false });
+        const { status, body } = await fetchJSON(port, '/_vault/google/refresh', 'POST');
+        expect(status).toBe(501);
+        expect(body.error).toContain('read-only');
+        expect(globalThis.fetch).not.toHaveBeenCalled();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
     });
   });
 
@@ -480,7 +559,7 @@ describe('Vault Handler', () => {
         expect(tokenStore.resolve(body.token as string)).toBe('ya29.new-token');
 
         // Vault should have been updated
-        const putMock = deps.secretFetcher.put as ReturnType<typeof vi.fn>;
+        const putMock = vi.mocked(deps.provider.secrets.put!);
         expect(putMock).toHaveBeenCalledOnce();
         const [name, value] = putMock.mock.calls[0];
         expect(name).toBe('google');
@@ -520,7 +599,7 @@ describe('Vault Handler', () => {
         expect(status).toBe(200);
 
         // Vault should have the rotated refresh token
-        const putMock = deps.secretFetcher.put as ReturnType<typeof vi.fn>;
+        const putMock = vi.mocked(deps.provider.secrets.put!);
         const updated = JSON.parse(putMock.mock.calls[0][1]);
         expect(updated.refresh_token).toBe('1//new-refresh');
       } finally {

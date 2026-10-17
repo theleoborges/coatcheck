@@ -1,5 +1,5 @@
 import { TokenStore } from './token-store.js';
-import { SecretFetcher } from './secret-fetcher.js';
+import { createAwsProvider } from './providers/aws.js';
 import { CertAuthority } from './ca.js';
 import { CdpSessionStore } from './cdp-session-store.js';
 import { startCdpProxy } from './cdp/proxy.js';
@@ -28,14 +28,14 @@ if (!AGENT_LABEL) {
 }
 
 const tokenStore = new TokenStore();
-const secretFetcher = new SecretFetcher(AGENT_LABEL);
+const provider = createAwsProvider({ label: AGENT_LABEL, roleArn: process.env.PROXY_ROLE_ARN });
 // CA_DIR unset: ephemeral in-memory CA. Set: the CA key + cert persist there.
 const ca = await CertAuthority.create({ dir: process.env.CA_DIR });
 const cdpSessionStore = new CdpSessionStore();
 
 const coatcheck = createCoatcheck({
   tokenStore,
-  secretFetcher,
+  provider,
   ca,
   cdpSessionStore,
   cdp: CDP_PROXY_ENABLED ? { port: CDP_PROXY_PORT, advertiseHost: CDP_PROXY_ADVERTISE_HOST } : undefined,

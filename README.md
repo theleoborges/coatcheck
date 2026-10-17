@@ -92,7 +92,9 @@ The API is served on the proxy port (default `127.0.0.1:3128`). **It has no auth
 | `POST /_vault/mint-tokens` | `{"username_token":"cct_…","password_token":"cct_…","expires_in":600}` | Body: `{"secretName":"example-login","sessionId":"<cdp sid>","expires_in"?:N}`. The secret must be a multi-value secret with `username` and `password`. Tickets are bound to one CDP session (see below). Default TTL is 600 s, capped at 1800 s. |
 | `POST /_vault/{name}/refresh` | `{"token":"cct_…","expires_in":900}` | Secret fields: `refresh_token`, `token_url`, `client_id`, `client_secret`. coatcheck posts a `refresh_token` grant, writes `access_token`, `expires_at`, and any rotated `refresh_token` back to the backend, and returns a ticket for the new access token. |
 
-Errors are JSON `{"error":…}` with status 400, 403, 404, 500, or 502.
+Secret names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` after URL-decoding; anything else (including `/` or a leading `.`) gets `400` before the backend is consulted. `refresh` returns `501` when the configured backend is read-only.
+
+Errors are JSON `{"error":…}` with status 400, 403, 404, 500, 501, or 502.
 
 ## Configuration
 

@@ -1,7 +1,7 @@
 import http from 'node:http';
 import type { AddressInfo, Socket } from 'node:net';
 import type { TokenStore } from './token-store.js';
-import type { SecretFetcher } from './secret-fetcher.js';
+import type { SecretProvider } from './secret-provider.js';
 import type { CertAuthority } from './ca.js';
 import type { CdpSessionStore } from './cdp-session-store.js';
 import { handleVaultRequest } from './vault-handler.js';
@@ -12,7 +12,7 @@ export const BROWSERBASE_API_HOST = 'api.browserbase.com';
 
 export interface CoatcheckDeps {
   tokenStore: TokenStore;
-  secretFetcher: SecretFetcher;
+  provider: SecretProvider;
   ca: CertAuthority;
   cdpSessionStore: CdpSessionStore;
   /** Set when CDP injection is enabled: where rewritten connectUrls point. */
@@ -34,7 +34,7 @@ export interface Coatcheck {
  * CONNECT (MITM or passthrough). No side effects until `listen`.
  */
 export function createCoatcheck(deps: CoatcheckDeps): Coatcheck {
-  const vaultDeps = { tokenStore: deps.tokenStore, secretFetcher: deps.secretFetcher, ca: deps.ca };
+  const vaultDeps = { tokenStore: deps.tokenStore, provider: deps.provider, ca: deps.ca };
 
   const server = http.createServer((req, res) => {
     // Handle vault API requests directly

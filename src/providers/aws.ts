@@ -9,14 +9,10 @@ import {
   SecretsManagerClient,
   GetSecretValueCommand,
 } from '@aws-sdk/client-secrets-manager';
+import { withCache, type Secret, type SecretProvider, type SecretStore } from '../secret-provider.js';
 
 const SECRET_CACHE_TTL_MS = 300_000; // 5 minutes
 const CREDENTIALS_REFRESH_MS = 2_700_000; // 45 minutes (STS session is 1h by default)
-
-interface CachedSecret {
-  value: string;
-  fetchedAt: number;
-}
 
 interface AssumedCredentials {
   accessKeyId: string;
@@ -25,24 +21,35 @@ interface AssumedCredentials {
   assumedAt: number;
 }
 
+export interface AwsProviderOptions {
+  label: string;
+  region?: string;
+  roleArn?: string;
+}
+
 /**
- * Fetches user vault secrets from SSM Parameter Store.
- * When a proxy role ARN is provided, assumes that role via STS first.
- * Caches values in memory with a short TTL to reduce SSM API calls.
+ * The error code of an AWS SDK error. Depending on the service and the
+ * `@aws-sdk/core` version it is on `name` or on `Code`, so check both.
  */
-export class SecretFetcher {
-  private label: string;
-  private basePath: string;
-  private cache = new Map<string, CachedSecret>();
-  private proxyRoleArn: string | undefined;
-  private region: string;
+export function awsErrorCode(err: unknown): string {
+  const name = err instanceof Error ? err.name : '';
+  const code = (err as { Code?: unknown } | null)?.Code;
+  return [name, typeof code === 'string' ? code : ''].find(c => c && c !== 'Error') ?? '';
+}
+
+/**
+ * AWS secret backend: per-agent secrets in SSM Parameter Store, shared secrets
+ * in Secrets Manager. When a role ARN is configured, it is assumed via STS
+ * before any read or write.
+ */
+class AwsBackend {
+  private readonly basePath: string;
+  private readonly region: string;
   private assumedCreds: AssumedCredentials | null = null;
 
-  constructor(label: string, region?: string, proxyRoleArn?: string) {
-    this.label = label;
-    this.basePath = `/liv/agents/${label}/user-secrets/`;
-    this.region = region ?? process.env.AWS_REGION ?? 'ap-southeast-2';
-    this.proxyRoleArn = proxyRoleArn ?? process.env.PROXY_ROLE_ARN;
+  constructor(private readonly opts: AwsProviderOptions) {
+    this.basePath = `/liv/agents/${opts.label}/user-secrets/`;
+    this.region = opts.region ?? process.env.AWS_REGION ?? 'ap-southeast-2';
   }
 
   /** SSM client options — includes endpoint override for LocalStack in dev */
@@ -54,9 +61,9 @@ export class SecretFetcher {
     return opts;
   }
 
-  /** Resolve AWS client options, assuming the proxy role if configured */
+  /** Resolve AWS client options, assuming the broker role if configured */
   private async getAwsClientOptions(): Promise<Record<string, unknown>> {
-    if (!this.proxyRoleArn) {
+    if (!this.opts.roleArn) {
       // No role to assume — use default credentials (task role or env creds)
       return this.ssmBaseOptions;
     }
@@ -65,8 +72,8 @@ export class SecretFetcher {
     if (!this.assumedCreds || Date.now() - this.assumedCreds.assumedAt > CREDENTIALS_REFRESH_MS) {
       const sts = new STSClient({ region: this.region });
       const result = await sts.send(new AssumeRoleCommand({
-        RoleArn: this.proxyRoleArn,
-        RoleSessionName: `secret-proxy-${this.label}`,
+        RoleArn: this.opts.roleArn,
+        RoleSessionName: `secret-proxy-${this.opts.label}`,
         DurationSeconds: 3600,
       }));
 
@@ -80,7 +87,7 @@ export class SecretFetcher {
         sessionToken: result.Credentials.SessionToken,
         assumedAt: Date.now(),
       };
-      console.log(`Assumed proxy role: ${this.proxyRoleArn}`);
+      console.log(`Assumed broker role: ${this.opts.roleArn}`);
     }
 
     return {
@@ -101,52 +108,32 @@ export class SecretFetcher {
     return new SecretsManagerClient(await this.getAwsClientOptions());
   }
 
-  /**
-   * Fetch a fleet-wide secret from AWS Secrets Manager at `liv/{name}`.
-   * Used for shared API keys (e.g. Browserbase) — distinct from per-user vault entries
-   * which live in SSM Parameter Store at /liv/agents/{label}/user-secrets/.
-   */
-  async fetchFleetSecret(name: string): Promise<string | null> {
+  /** Shared secret from Secrets Manager at `liv/{name}`, or null if absent. */
+  async getShared(name: string): Promise<Secret | null> {
     const sm = await this.getSecretsManagerClient();
     try {
       const result = await sm.send(new GetSecretValueCommand({
         SecretId: `liv/${name}`,
       }));
-      return result.SecretString ?? null;
+      return result.SecretString === undefined ? null : { value: result.SecretString };
     } catch (err: unknown) {
-      // SecretsManager error name varies by SDK version (err.name vs err.Code).
-      const errName = (err instanceof Error ? err.name : '') || (err as { Code?: string })?.Code || '';
-      if (errName === 'ResourceNotFoundException') {
-        return null;
-      }
+      if (awsErrorCode(err) === 'ResourceNotFoundException') return null;
       throw err;
     }
   }
 
-  /** Get a secret value by name, or null if not found */
-  async get(name: string): Promise<string | null> {
-    // Check cache first
-    const cached = this.cache.get(name);
-    if (cached && Date.now() - cached.fetchedAt < SECRET_CACHE_TTL_MS) {
-      return cached.value;
-    }
-
+  /** Per-agent secret from SSM, or null if absent. */
+  async get(name: string): Promise<Secret | null> {
     const ssm = await this.getSSMClient();
     try {
       const result = await ssm.send(new GetParameterCommand({
         Name: this.basePath + name,
         WithDecryption: true,
       }));
-
-      const value = result.Parameter?.Value ?? null;
-      if (value !== null) {
-        this.cache.set(name, { value, fetchedAt: Date.now() });
-      }
-      return value;
+      const value = result.Parameter?.Value;
+      return value === undefined ? null : { value };
     } catch (err: unknown) {
-      if (err instanceof Error && err.name === 'ParameterNotFound') {
-        return null;
-      }
+      if (awsErrorCode(err) === 'ParameterNotFound') return null;
       throw err;
     }
   }
@@ -161,14 +148,12 @@ export class SecretFetcher {
       }));
       return true;
     } catch (err: unknown) {
-      if (err instanceof Error && err.name === 'ParameterNotFound') {
-        return false;
-      }
+      if (awsErrorCode(err) === 'ParameterNotFound') return false;
       throw err;
     }
   }
 
-  /** Update a secret value in the vault (overwrite) and invalidate cache */
+  /** Overwrite a secret value */
   async put(name: string, value: string): Promise<void> {
     const ssm = await this.getSSMClient();
     await ssm.send(new PutParameterCommand({
@@ -177,12 +162,10 @@ export class SecretFetcher {
       Type: 'SecureString',
       Overwrite: true,
     }));
-    // Invalidate cache so next get() reads the fresh value
-    this.cache.delete(name);
   }
 
-  /** List all secret names in the user's vault */
-  async listSecrets(): Promise<string[]> {
+  /** List all secret names in the agent's store */
+  async list(): Promise<string[]> {
     const ssm = await this.getSSMClient();
     const names: string[] = [];
     let nextToken: string | undefined;
@@ -208,4 +191,19 @@ export class SecretFetcher {
 
     return names;
   }
+}
+
+export function createAwsProvider(opts: AwsProviderOptions): SecretProvider {
+  const backend = new AwsBackend(opts);
+  const secrets: SecretStore = {
+    get: name => backend.get(name),
+    exists: name => backend.exists(name),
+    list: () => backend.list(),
+    put: (name, value) => backend.put(name, value),
+  };
+  return {
+    name: 'aws',
+    secrets: withCache(secrets, SECRET_CACHE_TTL_MS),
+    shared: { get: name => backend.getShared(name) },
+  };
 }

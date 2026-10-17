@@ -1,6 +1,6 @@
 #!/bin/sh
 # Seeds demo secrets into LocalStack. Runs from /etc/localstack/init/ready.d.
-# Path scheme matches the current AWS backend (src/secret-fetcher.ts); it will
+# Path scheme matches the current AWS provider (src/providers/aws.ts); it will
 # become configurable once the SecretProvider interface lands (docs/ROADMAP.md).
 set -e
 LABEL="${AGENT_LABEL:-demo}"

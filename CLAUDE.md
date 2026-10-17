@@ -28,7 +28,9 @@ Repo is **private** until we're ready to publish. Target license Apache-2.0.
 | `src/connect-target.ts` | Strict `CONNECT` target parser (RFC 1123 DNS name or IP literal, port 1–65535); invalid → 400 |
 | `src/token-store.ts` | In-memory tickets, TTL 900s default, optional CDP session binding, `replaceAll` / `replaceAllForSession` |
 | `src/vault-handler.ts` | `/_health`, `/_ca`, `/_vault*`, `/_secret/*`, `mint-tokens`, OAuth `refresh`; multi-field JSON secrets + `_cleartext` |
-| `src/secret-fetcher.ts` | **The only AWS-coupled file**: SSM (user vault get/exists/put/list), Secrets Manager (shared secrets), STS AssumeRole. Will move behind a `SecretProvider` interface |
+| `src/secret-provider.ts` | `SecretProvider` / `SecretStore` / `Secret` interfaces, `withCache`, secret-name validation (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, enforced in `vault-handler.ts` before any provider call) |
+| `src/providers/aws.ts` | **The only AWS-coupled file**: SSM (per-agent secrets: get/exists/put/list), Secrets Manager (shared secrets), STS AssumeRole; `awsErrorCode` checks `err.name` and `err.Code` |
+| `src/providers/memory.ts` | In-memory provider for tests and embedding |
 | `src/browserbase-rewrite.ts` | Rewrites `connectUrl` in `api.browserbase.com` responses to the local CDP proxy (first "browser adapter") |
 | `src/cdp-session-store.ts` | sid → real connect URL, 10 min TTL |
 | `src/cdp/proxy.ts` | WS proxy on 8444, `MAX_CONCURRENT=1`, teardown revokes session tickets |

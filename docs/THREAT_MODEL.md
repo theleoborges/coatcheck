@@ -43,10 +43,10 @@ go around it to the secret store. Three properties are required.
 
 ### Worked example: AWS (ECS/Fargate)
 
-As shipped, `src/secret-fetcher.ts` reads per-agent secrets from SSM Parameter
+As shipped, the AWS provider (`src/providers/aws.ts`) reads per-agent secrets from SSM Parameter
 Store under a per-agent prefix and shared secrets from Secrets Manager, and
 optionally assumes a role named by `PROXY_ROLE_ARN` via STS before doing so
-(`src/secret-fetcher.ts:58-94`).
+(`src/providers/aws.ts`).
 
 - Agent task role: explicit `Deny` on `ssm:GetParameter*` for
   `…/user-secrets/*` and no `secretsmanager:GetSecretValue` on shared secrets.
@@ -119,7 +119,8 @@ ticket into a request to any destination.
 | Tickets expire | 900 s default (`src/token-store.ts:4`); session-bound tickets 600 s default, 1800 s max (`src/vault-handler.ts:222-223`) |
 | `curl -v` on the agent side shows only the ticket | Substitution happens after TLS termination, on coatcheck's upstream leg |
 | Session-bound (browser) tickets never resolve on HTTPS | `src/token-store.ts:133` |
-| Shared secrets are allowlisted | `/_secret/{name}` refuses names outside a hard-coded allowlist (`src/vault-handler.ts:18-20`, `:150-154`) |
+| Shared secrets are allowlisted | `/_secret/{name}` refuses names outside a hard-coded allowlist (`src/vault-handler.ts`) |
+| Secret names are validated before any provider call | `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (no `/`, no leading `.`), checked after URL-decoding on every route that takes a name; invalid names get `400` (`isValidSecretName`, `src/secret-provider.ts`; `src/vault-handler.ts`) |
 | Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`src/mitm.ts`) |
 | CONNECT targets cannot reach a shell or the filesystem | Targets are parsed strictly (RFC 1123 DNS name or IP literal, port 1–65535; otherwise `400`) (`src/connect-target.ts`). Certificates are generated in-process with WebCrypto; leaf keys stay in memory (LRU, 1000 entries) and only the CA is written to disk, when `CA_DIR` is set (`src/ca.ts`). |
 | Logs carry no values | Swap logs record secret names, host, and ticket age only (`src/swap-log.ts`) |
@@ -193,13 +194,6 @@ mildly protective. Related: `Transfer-Encoding: chunked` request bodies are not
 parsed (`mitm.ts`), so a chunked body can misalign the request parser
 on a keep-alive tunnel. The MITM also assumes HTTP/1.1 request/response:
 WebSocket upgrades or other protocols tunneled through a MITM'd CONNECT stall.
-
-### LOW: secret names are passed through to the store unvalidated
-
-`/_vault/{name}` decodes the path segment and appends it to the store prefix
-(`vault-handler.ts:62-64`, `secret-fetcher.ts:127-139`). With SSM the name is
-literal and IAM bounds it, so `..` has no effect. A filesystem- or
-path-based provider would need to reject `/` and `..`.
 
 ### Browser injection
 
