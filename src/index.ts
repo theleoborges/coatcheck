@@ -4,7 +4,7 @@ import tls from 'node:tls';
 import { URL } from 'node:url';
 import { TokenStore, TOKEN_LITERAL_PATTERN, type SwapInfo } from './token-store.js';
 import { SecretFetcher } from './secret-fetcher.js';
-import { CertAuthority } from './ca.js';
+import { CertAuthority, type HostCert } from './ca.js';
 import { handleVaultRequest } from './vault-handler.js';
 import { CdpSessionStore } from './cdp-session-store.js';
 import { startCdpProxy } from './cdp/proxy.js';
@@ -33,7 +33,8 @@ if (!AGENT_LABEL) {
 
 const tokenStore = new TokenStore();
 const secretFetcher = new SecretFetcher(AGENT_LABEL);
-const ca = new CertAuthority();
+// CA_DIR unset: ephemeral in-memory CA. Set: the CA key + cert persist there.
+const ca = await CertAuthority.create({ dir: process.env.CA_DIR });
 const cdpSessionStore = new CdpSessionStore();
 const vaultDeps = { tokenStore, secretFetcher, ca };
 
@@ -78,7 +79,7 @@ const server = http.createServer((req, res) => {
 });
 
 // HTTPS CONNECT tunneling with MITM for token swapping
-server.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
+server.on('connect', async (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
   // Strict DNS-name / IP-literal validation: the hostname reaches certificate
   // generation and the upstream dial, so reject anything else up front.
   const target = parseConnectTarget(req.url);
@@ -102,10 +103,19 @@ server.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head:
   }
   console.log(`[connect] host=${hostname}:${port} mode=mitm store_size=${tokenStore.size}`);
 
+  // Mint the leaf cert before acknowledging the CONNECT: the client sends its
+  // ClientHello as soon as it sees the 200.
+  let serverCert: HostCert;
+  try {
+    serverCert = await ca.getCertForHost(hostname);
+  } catch (err) {
+    console.error(`Certificate generation failed for ${hostname}:`, (err as Error).message);
+    clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    return;
+  }
+
   // MITM: terminate TLS from client, inspect/modify, re-encrypt to server
   clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-
-  const serverCert = ca.getCertForHost(hostname);
 
   const tlsSocket = new tls.TLSSocket(clientSocket, {
     isServer: true,
@@ -173,7 +183,8 @@ server.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head:
   });
 
   // Connect to the real server once (reused for keep-alive)
-  realSocket = tls.connect({ host: hostname, port, servername: hostname }, () => {
+  // SNI must not be an IP literal (RFC 6066); certificate checks still use `host`.
+  realSocket = tls.connect({ host: hostname, port, servername: net.isIP(hostname) ? undefined : hostname }, () => {
     upstreamReady = true;
     // Flush any requests that were parsed before the upstream connected
     for (const buf of pendingWrites) {

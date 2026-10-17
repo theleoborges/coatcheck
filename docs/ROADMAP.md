@@ -21,7 +21,7 @@ rejected, are in `docs/design/v1-decisions.md`.
    Anything else gets `400`. Tests cover `$(…)`, backticks, `;`, `|`, `/`,
    `..`, and empty or over-long labels.
 
-2. **In-process certificate generation.** Replace the `openssl` shell-outs in
+2. **[Done]** **In-process certificate generation.** Replace the `openssl` shell-outs in
    `src/ca.ts` with `@peculiar/x509` on Node WebCrypto, ECDSA P-256.
    - Leaf certs stay in memory (LRU, cap 1000), and IP targets get an IP SAN.
    - Only the CA key and cert are ever written to disk, and only when a CA

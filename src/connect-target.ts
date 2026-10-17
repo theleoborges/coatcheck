@@ -44,10 +44,18 @@ export function parseConnectTarget(target: string | undefined): ConnectTarget | 
   if (net.isIPv4(host)) return { hostname: host, port };
 
   const hostname = host.toLowerCase().replace(/\.$/, '');
-  if (hostname.length === 0 || hostname.length > MAX_HOSTNAME_LENGTH) return null;
-  if (!hostname.split('.').every(label => DNS_LABEL.test(label))) return null;
+  return isValidDnsName(hostname) ? { hostname, port } : null;
+}
+
+/** True for an RFC 1123 DNS name or an IP literal (IPv6 without brackets). */
+export function isValidHostname(hostname: string): boolean {
+  return net.isIP(hostname) !== 0 || isValidDnsName(hostname);
+}
+
+function isValidDnsName(hostname: string): boolean {
+  if (hostname.length === 0 || hostname.length > MAX_HOSTNAME_LENGTH) return false;
+  if (!hostname.split('.').every(label => DNS_LABEL.test(label))) return false;
   // A dotted string of digits that is not a valid IPv4 literal (e.g. 999.1.1.1)
   // would otherwise pass as a DNS name.
-  if (/^[0-9.]+$/.test(hostname)) return null;
-  return { hostname, port };
+  return !/^[0-9.]+$/.test(hostname);
 }

@@ -101,7 +101,7 @@ Errors are JSON `{"error":…}` with status 400, 403, 404, 500, or 502.
 | `AGENT_LABEL` | (required) | Identifies the agent. Scopes the SSM path. coatcheck exits if it is unset. |
 | `PROXY_PORT` | `3128` | Port for the proxy and the HTTP API. |
 | `PROXY_BIND_HOST` | `127.0.0.1` | Bind address for the proxy and the CDP proxy. Use `0.0.0.0` only for local docker-compose. |
-| `CA_DIR` | `/tmp/proxy-ca` | CA key, CA cert, and generated host certs. If an existing `ca.key`/`ca.crt` is found there, coatcheck reuses it. Otherwise it generates a new CA on every start. |
+| `CA_DIR` | (unset) | Where to persist the CA key and cert (`ca.key`, `ca.crt`). If unset, coatcheck generates an in-memory CA on every start. If an existing ECDSA P-256 CA is found there, coatcheck reuses it; any other key type (for example an RSA CA from an older version) fails startup until the files are deleted. Per-host certificates are never written to disk. |
 | `CDP_PROXY_ENABLED` | off | Set to `1` to run the CDP proxy and rewrite browser-service `connectUrl`s. |
 | `CDP_PROXY_PORT` | `8444` | CDP WebSocket proxy port. |
 | `CDP_PROXY_ADVERTISE_HOST` | `127.0.0.1` | Host written into the rewritten `connectUrl`. Override it when the Playwright client is in a different container. |
@@ -109,7 +109,7 @@ Errors are JSON `{"error":…}` with status 400, 403, 404, 500, or 502.
 | `AWS_ENDPOINT_URL` | (unset) | Endpoint override for SSM and Secrets Manager, e.g. LocalStack. |
 | `PROXY_ROLE_ARN` | (unset) | IAM role to assume before reading secrets. If unset, the default AWS credential chain is used. |
 
-Standard AWS SDK credential variables apply. The runtime image needs `openssl` on `PATH`, because coatcheck shells out to it for CA and per-host certificate generation.
+Standard AWS SDK credential variables apply. Certificates are generated in-process (ECDSA P-256); coatcheck needs no `openssl` binary.
 
 ## Trusting the CA in the agent container
 
@@ -139,7 +139,7 @@ export HTTP_PROXY=http://127.0.0.1:3128
 export NO_PROXY=localhost,127.0.0.1,169.254.169.254,169.254.170.2   # plus internal services
 ```
 
-If `CA_DIR` is not on persistent storage, each coatcheck restart generates a new CA, and the agent has to fetch `/_ca` again.
+Unless `CA_DIR` is set and on persistent storage, each coatcheck restart generates a new CA, and the agent has to fetch `/_ca` again.
 
 ## Using tickets
 

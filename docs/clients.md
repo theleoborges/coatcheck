@@ -36,8 +36,8 @@ export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ```
 
-The CA is generated on first start and reused if `CA_DIR` persists across
-restarts. If it is regenerated, clients must re-fetch it.
+The CA is generated in memory on every start unless `CA_DIR` is set and
+persists across restarts. If it is regenerated, clients must re-fetch it.
 
 ## 2. Get a ticket
 

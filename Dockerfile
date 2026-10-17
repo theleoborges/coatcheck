@@ -7,10 +7,8 @@ COPY src/ ./src/
 RUN npm run build
 
 FROM node:22-slim
-# openssl is used to mint per-host leaf certificates (see src/ca.ts)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      openssl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# No system packages: certificates are generated in-process (src/ca.ts) and
+# Node verifies upstream TLS against its bundled root store.
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
