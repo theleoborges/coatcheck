@@ -19,3 +19,8 @@ export { CertAuthority, type CertAuthorityOptions } from './ca.js';
 export { CdpSessionStore } from './cdp-session-store.js';
 export { startCdpProxy, type CdpProxyOptions, type CdpProxyHandle } from './cdp/proxy.js';
 export { parsePolicy, EMPTY_POLICY, type Policy } from './policy.js';
+export {
+  browserbaseAdapter, createBrowserbaseAdapter, BUILTIN_BROWSER_ADAPTERS, BROWSERBASE_API_HOST,
+  type BrowserAdapter,
+} from './browser-adapters.js';
+export { createJsonResponseRewriter, type JsonResponseRewriter, type JsonTransform } from './json-response-rewriter.js';

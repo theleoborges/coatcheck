@@ -10,9 +10,10 @@ import type { HostPattern } from './host-matcher.js';
 import type { MitmMode } from './config.js';
 import { handleForwardRequest } from './forward.js';
 import { createConnectHandler } from './mitm.js';
+import { createBrowserbaseAdapter, type BrowserAdapter } from './browser-adapters.js';
 import { createApiAuth, isOpenVaultPath, PROXY_AUTH_REQUIRED, sendProxyAuthRequired, sendUnauthorized } from './auth.js';
 
-export const BROWSERBASE_API_HOST = 'api.browserbase.com';
+export { BROWSERBASE_API_HOST } from './browser-adapters.js';
 
 export interface CoatcheckDeps {
   tokenStore: TokenStore;
@@ -33,7 +34,9 @@ export interface CoatcheckDeps {
   apiToken?: string;
   /** `vault_url` hint in 404s (`COATCHECK_MISSING_SECRET_URL`). */
   missingSecretUrl?: string;
-  /** Defaults to `api.browserbase.com`. */
+  /** Browser adapters for CDP URL rewriting. Default: Browserbase (at `browserbaseApiHost`). */
+  browserAdapters?: BrowserAdapter[];
+  /** API host of the default Browserbase adapter (tests). Ignored when `browserAdapters` is set. */
   browserbaseApiHost?: string;
   /** Extra trust anchors for upstream TLS (tests). */
   upstreamCa?: string;
@@ -92,7 +95,7 @@ export function createCoatcheck(deps: CoatcheckDeps): Coatcheck {
     ca: deps.ca,
     cdpSessionStore: deps.cdpSessionStore,
     cdp: deps.cdp,
-    browserbaseApiHost: deps.browserbaseApiHost ?? BROWSERBASE_API_HOST,
+    browserAdapters: deps.browserAdapters ?? [createBrowserbaseAdapter(deps.browserbaseApiHost)],
     upstreamCa: deps.upstreamCa,
     policy: vaultDeps.policy,
     mitm: deps.mitm ?? 'bound',

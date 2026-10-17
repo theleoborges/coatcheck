@@ -173,7 +173,7 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 ## Phase 5: browser injection
 
-13. **Browser adapters.**
+13. **[Done]** **Browser adapters.**
     - Extract the HTTP framing from `src/browserbase-rewrite.ts` into a generic
       `createJsonResponseRewriter`.
     - Add the adapter interface `{ name, hosts, rewriteJson(body, register) }`

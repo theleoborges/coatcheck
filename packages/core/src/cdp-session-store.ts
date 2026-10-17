@@ -6,12 +6,14 @@ const CLEANUP_INTERVAL_MS = 30_000;
 interface CdpSession {
   sid: string;
   realConnectUrl: string;
+  /** The browser adapter that registered it, for logs. */
+  adapterName: string;
   createdAt: number;
   expiresAt: number;
 }
 
 /**
- * Maps short session ids to the real Browserbase CDP connectUrl.
+ * Maps short session ids to the real remote-browser CDP URL.
  *
  * When the agent creates a Browserbase session, the proxy rewrites the
  * response's `connectUrl` to `ws://127.0.0.1:{CDP_PROXY_PORT}/cdp/{sid}` and
@@ -29,12 +31,13 @@ export class CdpSessionStore {
   }
 
   /** Register a real connectUrl, returning the opaque sid to hand the agent. */
-  register(realConnectUrl: string, ttlSeconds = DEFAULT_TTL_SECONDS): string {
+  register(realConnectUrl: string, adapterName = 'unknown', ttlSeconds = DEFAULT_TTL_SECONDS): string {
     const sid = randomBytes(12).toString('hex');
     const now = Date.now();
     this.sessions.set(sid, {
       sid,
       realConnectUrl,
+      adapterName,
       createdAt: now,
       expiresAt: now + ttlSeconds * 1000,
     });
@@ -50,6 +53,11 @@ export class CdpSessionStore {
       return null;
     }
     return entry.realConnectUrl;
+  }
+
+  /** The adapter that registered a live sid, or null if unknown/expired. */
+  adapterName(sid: string): string | null {
+    return this.get(sid) === null ? null : this.sessions.get(sid)!.adapterName;
   }
 
   /** Drop a session mapping. Called when its WS connection closes. */

@@ -22,7 +22,7 @@ npm workspaces (`packages/*`), TypeScript project references (`tsc -b`). Core ne
 | File | Role |
 |---|---|
 | `cli.ts` | The `coatcheck` bin: reads `process.env`, `loadConfig` + `loadProvider`, calls `startCoatcheck`, startup log lines, SIGTERM |
-| `start.ts` | `startCoatcheck({config, provider})` (library API): builds `TokenStore`, CA, `CdpSessionStore`, `withCache`, listens on 3128, starts the CDP proxy; `close()` |
+| `start.ts` | `startCoatcheck({config, provider, adapters?})` (library API; `adapters` replaces the `COATCHECK_BROWSER_ADAPTERS` built-ins): builds `TokenStore`, CA, `CdpSessionStore`, `withCache`, listens on 3128, starts the CDP proxy; `close()` |
 | `index.ts` | Public exports of `@coatcheck/core` |
 | `load-provider.ts` | `loadProvider(name, ctx, importModule?)`: `aws`/`env`/`file` → `@coatcheck/provider-aws`, `@coatcheck/provider-env`, `@coatcheck/provider-env/file`; anything else is a module specifier; default export must be a `CreateProvider`; missing package → `ConfigError` naming it |
 | `config.ts` | Pure `loadConfig(env)` → typed `Config`; every `COATCHECK_*` core setting (incl. `COATCHECK_MITM`, `COATCHECK_PASSTHROUGH_HOSTS`, `COATCHECK_ALLOW_UNBOUND_SECRETS`); legacy names fail with "renamed to X"; non-loopback bind without `COATCHECK_API_TOKEN` fails; `ConfigError` lists all problems; `EnvReader` / `interpolateAgentId` are reused by providers |
@@ -31,7 +31,7 @@ npm workspaces (`packages/*`), TypeScript project references (`tsc -b`). Core ne
 | `secret-binding.ts` | Mint-time binding: `parseSecretValue` (simple / multi, `{value,_allowed_hosts}` is simple, `_`-keys are metadata), `resolveBinding` (policy ∩ in-band; unbound → 403 unless `COATCHECK_ALLOW_UNBOUND_SECRETS`) |
 | `server.ts` | `createCoatcheck(deps)`: side-effect-free factory for the proxy + vault API server (tests start it on port 0); routes absolute-form → forward, else vault API; applies the API token |
 | `auth.ts` | `COATCHECK_API_TOKEN` checks: vault `Authorization: Bearer`, proxy `Proxy-Authorization` (Basic password or Bearer), constant-time; `/_health` + `/_ca` open; 401/407 responses |
-| `mitm.ts` | `CONNECT` → MITM or passthrough per `COATCHECK_MITM` (`bound`: policy hosts, live-ticket hosts, adapter host; `always`) with `COATCHECK_PASSTHROUGH_HOSTS` overriding; ALPN `http/1.1` only; raw pipe after `101`; header/URL token swap on keep-alive requests, keyed on the CONNECT target; host mismatch → 403 + close tunnel; `connectUrl` rewrite wiring |
+| `mitm.ts` | `CONNECT` → MITM or passthrough per `COATCHECK_MITM` (`bound`: policy hosts, live-ticket hosts, adapter hosts; `always`) with `COATCHECK_PASSTHROUGH_HOSTS` overriding; ALPN `http/1.1` only; raw pipe after `101`; header/URL token swap on keep-alive requests, keyed on the CONNECT target; host mismatch → 403 + close tunnel; adapter response-rewrite wiring |
 | `forward.ts` | Plain-HTTP forward proxy: path/query/header swap keyed on the URL host (plaintext needs `http://` entries); strips `proxy-authorization` + hop-by-hop; mismatch → 403 |
 | `swap-log.ts` | Structured swap-outcome lines per request (`hit`/`unbound`/`denied`/`miss`; names, counts, ages; never values); `hostMismatchBody` |
 | `ca.ts` | In-process ECDSA P-256 root CA + per-host leaf certs (`@peculiar/x509` on WebCrypto); leafs in an in-memory LRU; only the CA persists, and only when `COATCHECK_CA_DIR` is set |
@@ -40,8 +40,10 @@ npm workspaces (`packages/*`), TypeScript project references (`tsc -b`). Core ne
 | `vault-handler.ts` | `/_health`, `/_ca`, `/_vault*`, `/_secret/*`, `mint-tokens`, OAuth `refresh`; multi-field JSON secrets + `_cleartext`; `InvalidSecretNameError` from a provider → 400 |
 | `secret-provider.ts` | `SecretProvider` / `SecretStore` / `Secret` / `CreateProvider` interfaces, `withCache`, `InvalidSecretNameError`, secret-name validation (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, enforced in `vault-handler.ts` before any provider call) |
 | `memory-provider.ts` | In-memory provider for tests and embedding (not selectable via `COATCHECK_PROVIDER`) |
-| `browserbase-rewrite.ts` | Rewrites `connectUrl` in `api.browserbase.com` responses to the local CDP proxy (first "browser adapter") |
-| `cdp-session-store.ts` | sid → real connect URL, 10 min TTL |
+| `json-response-rewriter.ts` | `createJsonResponseRewriter(transform)`: vendor-neutral HTTP/1.1 response framing (Content-Length, chunked → Content-Length) around a JSON transform |
+| `browser-adapters.ts` | `BrowserAdapter {name, hosts, rewriteJson(body, register)}`; Browserbase adapter: rewrites every `ws(s)://…browserbase.com` value (parsed hostname) + any `ws(s)` `connectUrl`, deletes `signingKey` and live-view URLs; `COATCHECK_BROWSER_ADAPTERS` built-ins |
+| `browserbase-rewrite.ts` | Retained `createConnectUrlRewriter` wrapper (key-based `connectUrl` rewrite) over `createJsonResponseRewriter` |
+| `cdp-session-store.ts` | sid → real CDP URL + adapter name (`register(url, adapterName)`), 10 min TTL |
 | `cdp/proxy.ts` | WS proxy on 8444, `MAX_CONCURRENT=1`, teardown revokes session tickets |
 | `cdp/substitution.ts` | Outbound swap in `Input.insertText`, `Runtime.evaluate`, `Runtime.callFunctionOn`; inbound echo-back redaction/drop |
 | `cdp/keystroke-detector.ts` | Fails closed on `page.type()` (keystroke-by-keystroke ticket entry) |

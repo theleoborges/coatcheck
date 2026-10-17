@@ -9,6 +9,7 @@ import { isValidSecretName } from './secret-provider.js';
 import { EMPTY_POLICY, parsePolicy, type Policy } from './policy.js';
 import net from 'node:net';
 import { parseHostPattern, type HostPattern } from './host-matcher.js';
+import { BUILTIN_BROWSER_ADAPTERS } from './browser-adapters.js';
 
 /** `COATCHECK_MITM`: `bound` MITMs only hosts a ticket could be swapped for; `always` MITMs every CONNECT. */
 export type MitmMode = 'bound' | 'always';
@@ -30,6 +31,8 @@ export interface Config {
   missingSecretUrl?: string;
   /** Set when CDP injection is enabled. */
   cdp?: { port: number; advertiseHost: string };
+  /** `COATCHECK_BROWSER_ADAPTERS`: built-in adapter names (custom adapters go through `startCoatcheck`). */
+  browserAdapters: string[];
   /** From `COATCHECK_POLICY_FILE`; empty (no shared secrets, nothing bound) when unset. */
   policy: Policy;
   policyFile?: string;
@@ -179,6 +182,14 @@ export function loadConfig(env: Env, readFile?: ReadFile): Config {
     r.problems.push(`COATCHECK_API_TOKEN is required when COATCHECK_BIND_HOST is not loopback (got '${bindHost}'): anything that can reach the port could mint tickets`);
   }
 
+  const browserAdapters = (r.string('COATCHECK_BROWSER_ADAPTERS') ?? 'browserbase').split(',').map(e => e.trim()).filter(Boolean);
+  const builtinAdapters = Object.keys(BUILTIN_BROWSER_ADAPTERS);
+  for (const name of browserAdapters) {
+    if (!builtinAdapters.includes(name)) {
+      r.problems.push(`COATCHECK_BROWSER_ADAPTERS: unknown adapter '${name}' (built-ins: ${builtinAdapters.join(', ')}; custom adapters go through startCoatcheck)`);
+    }
+  }
+
   const cdpEnabled = r.bool('COATCHECK_CDP_ENABLED', false);
   const cdpPort = r.int('COATCHECK_CDP_PORT', 8444, 1, 65535);
   const config: Config = {
@@ -196,6 +207,7 @@ export function loadConfig(env: Env, readFile?: ReadFile): Config {
     cdp: cdpEnabled
       ? { port: cdpPort, advertiseHost: r.string('COATCHECK_CDP_ADVERTISE_HOST') ?? '127.0.0.1' }
       : undefined,
+    browserAdapters,
     policy,
     policyFile,
     allowUnboundSecrets: r.bool('COATCHECK_ALLOW_UNBOUND_SECRETS', false),

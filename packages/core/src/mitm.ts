@@ -4,9 +4,10 @@ import tls from 'node:tls';
 import type { TokenStore } from './token-store.js';
 import type { CertAuthority, HostCert } from './ca.js';
 import type { CdpSessionStore } from './cdp-session-store.js';
-import { createConnectUrlRewriter } from './browserbase-rewrite.js';
+import { createJsonResponseRewriter } from './json-response-rewriter.js';
+import type { BrowserAdapter } from './browser-adapters.js';
 import { parseConnectTarget } from './connect-target.js';
-import { matchesHost, type HostPattern } from './host-matcher.js';
+import { matchesHost, parseHostPattern, type HostPattern } from './host-matcher.js';
 import { allPolicyHosts, type Policy } from './policy.js';
 import type { MitmMode } from './config.js';
 import { DENIED_HEADER, hostMismatchBody, logSwapOutcome } from './swap-log.js';
@@ -17,8 +18,8 @@ export interface MitmDeps {
   cdpSessionStore: CdpSessionStore;
   /** Set when CDP injection is enabled: where rewritten connectUrls point. */
   cdp?: { port: number; advertiseHost: string };
-  /** REST host whose responses carry the browser `connectUrl`. */
-  browserbaseApiHost: string;
+  /** Browser adapters: their REST hosts' responses get CDP URLs rewritten (when `cdp` is set). */
+  browserAdapters: readonly BrowserAdapter[];
   /** Extra trust anchors for upstream TLS (tests). Default: Node's root store. */
   upstreamCa?: string;
   /** Operator policy: in `bound` mode its hosts are MITM'd. */
@@ -34,8 +35,24 @@ export interface MitmDeps {
  * MITMs everything. Passthrough hosts are always a raw tunnel.
  */
 export function createConnectHandler(deps: MitmDeps) {
-  const { tokenStore, ca, cdpSessionStore, cdp, browserbaseApiHost, upstreamCa, mitm, passthroughHosts } = deps;
+  const { tokenStore, ca, cdpSessionStore, cdp, upstreamCa, mitm, passthroughHosts } = deps;
   const policyHosts = allPolicyHosts(deps.policy);
+  // Parsed once: a bad adapter host pattern fails here, at startup.
+  const adapters = deps.browserAdapters.map(adapter => ({
+    adapter,
+    hosts: adapter.hosts.map(h => {
+      const p = parseHostPattern(h);
+      if (typeof p === 'string') throw new Error(`browser adapter '${adapter.name}' host '${h}': ${p}`);
+      return p;
+    }),
+  }));
+
+  /** The adapter whose REST hosts include `hostname`, when CDP injection is on. */
+  function adapterFor(hostname: string): BrowserAdapter | undefined {
+    if (!cdp) return undefined;
+    const target = { host: hostname, scheme: 'https' as const };
+    return adapters.find(a => matchesHost(a.hosts, target))?.adapter;
+  }
 
   /** Why this target is MITM'd, or null (with the reason) for a raw tunnel. */
   function decide(hostname: string): { mitm: boolean; reason: string } {
@@ -43,7 +60,7 @@ export function createConnectHandler(deps: MitmDeps) {
     if (matchesHost(passthroughHosts, target)) return { mitm: false, reason: 'passthrough-list' };
     if (mitm === 'always') return { mitm: true, reason: 'always' };
     if (matchesHost(policyHosts, target)) return { mitm: true, reason: 'policy' };
-    if (cdp && hostname === browserbaseApiHost) return { mitm: true, reason: 'adapter' };
+    if (adapterFor(hostname)) return { mitm: true, reason: 'adapter' };
     if (tokenStore.hasLiveTicketFor(target)) return { mitm: true, reason: 'ticket' };
     return { mitm: false, reason: 'not-bound' };
   }
@@ -237,13 +254,14 @@ export function createConnectHandler(deps: MitmDeps) {
       // Registered before the pipe/rewriter so a 101 flips rawPipe before they see the chunk.
       realSocket.on('data', sniffUpgradeResponse);
 
-      // Responses flow back to the client. For the Browserbase REST host (when the
-      // CDP proxy is on) we rewrite the session `connectUrl` to point at the local
-      // CDP proxy; every other host pipes through unmodified.
-      if (cdp && hostname === browserbaseApiHost) {
-        const rewriter = createConnectUrlRewriter(
-          (realConnectUrl) => `ws://${cdp.advertiseHost}:${cdp.port}/cdp/${cdpSessionStore.register(realConnectUrl)}`,
-        );
+      // Responses flow back to the client. For a browser adapter's REST host (when
+      // the CDP proxy is on) the adapter rewrites CDP URLs to the local CDP proxy;
+      // every other host pipes through unmodified.
+      const adapter = adapterFor(hostname);
+      if (cdp && adapter) {
+        const register = (realUrl: string) =>
+          `ws://${cdp.advertiseHost}:${cdp.port}/cdp/${cdpSessionStore.register(realUrl, adapter.name)}`;
+        const rewriter = createJsonResponseRewriter(body => adapter.rewriteJson(body, register));
         realSocket.on('data', (chunk: Buffer) => {
           if (denied) return;
           if (rawPipe) {

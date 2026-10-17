@@ -474,6 +474,40 @@ export interface BrowserAdapter {
   the current API when implementing.
 - `CdpSessionStore.register(url, adapterName)` records the adapter name for
   logging.
+
+### Adapter details (recorded while implementing roadmap item 13)
+
+- **Field names checked against the Browserbase API reference
+  (2026-10).** Session create returns `connectUrl` (WebSocket),
+  `seleniumRemoteUrl` (HTTP) and `signingKey` ("used to authenticate HTTP
+  connections to the session"). `GET /v1/sessions/{id}/debug` returns
+  `debuggerUrl`, `debuggerFullscreenUrl`, `wsUrl` and `pages[]` with
+  `debuggerUrl` and `debuggerFullscreenUrl`. The reference gives types
+  (`uri`) but no example values, so the adapter can't assume the debugger
+  URLs are WebSocket URLs.
+- **Rewritten:** every string value that parses as a `ws:`/`wss:` URL whose
+  host is `browserbase.com` or a subdomain of it, whatever its key; plus the
+  value of any `connectUrl` key that is a `ws:`/`wss:` URL on any host. The
+  host check uses the parsed hostname, not a regex over the raw string, so
+  `evilbrowserbase.com` doesn't match. `connectUrl` stays key-based as well
+  because it is the CDP endpoint by definition; a vendor domain change must
+  not turn into a bypass.
+- **Removed:** `signingKey`, and any string value that can't be rewritten
+  but would hand the agent a direct route to the browser: an `http(s)` URL
+  whose query embeds a Browserbase WebSocket target (the hosted DevTools
+  viewer shape, `…inspector.html?wss=connect.browserbase.com/…`), and any
+  non-WebSocket `debuggerUrl` / `debuggerFullscreenUrl`. Rationale: a live
+  view in the agent's hands is raw CDP, which is the bypass this item closes.
+  Cost: Browserbase live view is unavailable through coatcheck while CDP is
+  enabled. `seleniumRemoteUrl` is left: without `signingKey` it can't
+  authenticate.
+- **Library adapters replace the env list.** `startCoatcheck({ adapters })`
+  uses exactly the adapters given; when omitted, `COATCHECK_BROWSER_ADAPTERS`
+  (comma-separated built-in names, default `browserbase`; unknown names fail
+  startup) picks built-ins. Rationale: one source of truth per process,
+  and a library user can include `browserbaseAdapter` explicitly.
+- Adapter `hosts` use the `allowed_hosts` syntax (exact or `*.suffix`) and
+  are parsed when the server is built, so a bad pattern fails startup.
 - Existing CDP tests keep passing. `cdp/proxy.test.ts` registers sids directly,
   and `browserbase-rewrite.test.ts` keeps working through a retained
   `createConnectUrlRewriter` wrapper. The tests that intentionally change

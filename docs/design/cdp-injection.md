@@ -2,7 +2,7 @@
 
 Status: **implemented (v1)**, behind `COATCHECK_CDP_ENABLED=1`.
 Code: `packages/core/src/cdp/proxy.ts`, `packages/core/src/cdp/substitution.ts`, `packages/core/src/cdp/keystroke-detector.ts`,
-`packages/core/src/cdp-session-store.ts`, `packages/core/src/browserbase-rewrite.ts`, wiring in `packages/core/src/mitm.ts` and `packages/core/src/start.ts`,
+`packages/core/src/cdp-session-store.ts`, `packages/core/src/browser-adapters.ts`, `packages/core/src/json-response-rewriter.ts`, wiring in `packages/core/src/mitm.ts` and `packages/core/src/start.ts`,
 mint endpoint in `packages/core/src/vault-handler.ts`.
 
 ## Problem
@@ -65,27 +65,42 @@ default `127.0.0.1`), port `COATCHECK_CDP_PORT` (default 8444)
 `startCoatcheck` rejects and the `coatcheck` bin exits (`packages/core/src/start.ts`, `cli.ts`), so a deployment that gates the agent
 on broker health also gates it on the CDP listener.
 
-### Step 1: connectUrl rewrite
+### Step 1: connectUrl rewrite (browser adapters)
 
 A remote-browser session is created over the vendor's REST API. The response
-carries a `connectUrl` (a `wss://` URL with a signing key embedded). If the
-agent received that URL it could connect directly and bypass substitution.
+carries a `connectUrl` (a `wss://` URL with a signing key embedded), and other
+endpoints (Browserbase's `GET /v1/sessions/{id}/debug`) return more CDP and
+live-view URLs. If the agent received any of them it could connect directly
+and bypass substitution and redaction.
 
-When the CDP proxy is enabled and the CONNECT target is the vendor API host,
-coatcheck replaces the plain response pipe with a streaming rewriter
-(`packages/core/src/mitm.ts`). `createConnectUrlRewriter` (`packages/core/src/browserbase-rewrite.ts`)
-is a small HTTP/1.1 response parser:
+When the CDP proxy is enabled and the CONNECT target is one of a browser
+adapter's REST hosts, coatcheck replaces the plain response pipe with a
+streaming rewriter (`packages/core/src/mitm.ts`).
+`createJsonResponseRewriter` (`packages/core/src/json-response-rewriter.ts`) is
+a small, vendor-neutral HTTP/1.1 response parser:
 
 - Frames each response by `Content-Length`, or decodes `Transfer-Encoding:
-  chunked` and re-emits it with a `Content-Length` (`:72-78`, `:112-133`).
-- If the body parses as JSON, every `connectUrl` string value at any depth is
-  replaced (`replaceConnectUrls`, `:136-150`) and `Content-Length` recomputed.
+  chunked` and re-emits it with a `Content-Length`.
+- If the body parses as JSON, hands it to the adapter's `rewriteJson` and, if
+  that changed anything, re-serialises it and recomputes `Content-Length`.
 - Non-JSON bodies pass through unchanged. A response with neither framing
-  header switches the connection to raw passthrough for the rest of its life
-  (`:80-86`).
+  header switches the connection to raw passthrough for the rest of its life.
 
-The replacement is produced by `CdpSessionStore.register(realConnectUrl)`
-(`packages/core/src/cdp-session-store.ts:32`), which stores the real URL under a random
+The Browserbase adapter (`packages/core/src/browser-adapters.ts`):
+
+- rewrites every string that parses as a `ws:`/`wss:` URL on `browserbase.com`
+  or a subdomain (parsed hostname, so `evilbrowserbase.com` doesn't match),
+  whatever its key: `connectUrl`, `wsUrl`, and WebSocket `debuggerUrl`s,
+  including `pages[]`; plus any `ws(s)` `connectUrl` on any host;
+- deletes `signingKey`;
+- deletes values it can't point at the local proxy but that would be a direct
+  route to the browser: http(s) viewer URLs whose query embeds a Browserbase
+  WebSocket target (`…inspector.html?wss=connect.browserbase.com/…`) and any
+  non-WebSocket `debuggerUrl`/`debuggerFullscreenUrl`. Browserbase live view
+  is therefore unavailable through coatcheck while CDP is enabled.
+
+Each replacement is produced by `CdpSessionStore.register(realUrl, adapterName)`
+(`packages/core/src/cdp-session-store.ts`), which stores the real URL under a random
 24-hex-char `sid` (12 random bytes) with a 10-minute TTL, and returns
 `ws://{COATCHECK_CDP_ADVERTISE_HOST}:{COATCHECK_CDP_PORT}/cdp/{sid}`. The signing key
 in the real URL never reaches the agent.
@@ -278,44 +293,44 @@ session remains the client's job.
   never substitute until their TTL expires. It also means the caller, not
   coatcheck, decides which session a credential binds to.
 - **Other routes to the same browser bypass the proxy.** Inbound redaction
-  only covers traffic that flows through this listener. Any second CDP
-  connection to the same remote browser (for example a vendor debug or
-  live-view URL obtained from a REST endpoint whose response field is not named
-  `connectUrl`) sees unredacted frames.
+  only covers traffic that flows through this listener. Since roadmap item 13
+  the Browserbase adapter rewrites every Browserbase WebSocket URL in API
+  responses and removes `signingKey` and live-view URLs, but a route it can't
+  see still works: a URL the vendor encodes in a shape the adapter doesn't
+  recognise, a vendor endpoint on a host that isn't an adapter host, or a
+  browser reached through `COATCHECK_PASSTHROUGH_HOSTS` or with CDP disabled.
 - **Authenticated-action abuse.** Once logged in, the agent can do anything the
   user can do on that site. Out of scope for a credential broker.
 - **Vendor trust.** The remote browser vendor sees the real credential.
 
 ## Browser adapters
 
-The vendor-specific pieces are small:
-
-- the REST host whose responses are rewritten (`BROWSERBASE_API_HOST`,
-  `packages/core/src/server.ts`), and
-- the response rewriter that finds and replaces the CDP URL
-  (`packages/core/src/browserbase-rewrite.ts`, keyed on the JSON field `connectUrl`).
-
-Browserbase is the first such **browser adapter**. Everything else (the CDP
-proxy, substitution, redaction, keystroke detection, session store) is
-vendor-neutral CDP. The plan is to make an adapter an explicit plugin:
+The vendor-specific pieces are a host list and a JSON transform
+(`packages/core/src/browser-adapters.ts`):
 
 ```ts
 interface BrowserAdapter {
-  /** REST host(s) whose responses carry CDP connect URLs. */
+  name: string;
+  /** REST hosts whose responses are rewritten (exact or `*.suffix`). */
   hosts: string[];
-  /** Streaming response rewriter; calls rewriteUrl(real) → local proxy URL. */
-  createResponseRewriter(rewriteUrl: (realUrl: string) => string): { push(chunk: Buffer): Buffer };
+  /** Mutate parsed JSON in place; register(realWsUrl) returns the local ws URL. Return true if changed. */
+  rewriteJson(body: unknown, register: (realUrl: string) => string): boolean;
 }
 ```
 
-A self-hosted Chrome, another vendor, or a local `--remote-debugging-port`
-browser then becomes a new adapter rather than a fork. See `docs/ROADMAP.md`.
+Everything else (HTTP framing, the CDP proxy, substitution, redaction,
+keystroke detection, session store) is vendor-neutral. Built-ins are chosen
+with `COATCHECK_BROWSER_ADAPTERS` (default `browserbase`); custom adapters go
+through `startCoatcheck({ config, provider, adapters })`, which then uses
+exactly the adapters given. A local `--remote-debugging-port` browser needs a
+rewrite hook on the plain-HTTP forward path and is out of v1.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `COATCHECK_CDP_ENABLED` | `0` | `1` enables the listener and `connectUrl` rewrite. |
+| `COATCHECK_CDP_ENABLED` | `0` | `1` enables the listener and the adapters' URL rewrite. |
+| `COATCHECK_BROWSER_ADAPTERS` | `browserbase` | Comma-separated built-in adapters. |
 | `COATCHECK_CDP_PORT` | `8444` | Listener port. |
 | `COATCHECK_CDP_ADVERTISE_HOST` | `127.0.0.1` | Host written into rewritten URLs. Override when the client is in a different network namespace (e.g. separate containers in local dev). |
 | `COATCHECK_BIND_HOST` | `127.0.0.1` | Bind address for both listeners. |

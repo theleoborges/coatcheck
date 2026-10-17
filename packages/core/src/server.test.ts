@@ -236,6 +236,88 @@ describe('coatcheck server: CONNECT', () => {
     expect(res.body).not.toContain('signingKey');
   });
 
+  // Attack (roadmap item 13): with a valid API-key ticket the agent calls the
+  // debug endpoint and receives raw CDP URLs, bypassing the CDP proxy's
+  // substitution and redaction. Every route to the browser must be rewritten
+  // or removed.
+  it('rewrites or removes every raw CDP route in a debug-endpoint response', async () => {
+    const debug = {
+      debuggerFullscreenUrl: 'https://www.browserbase.com/devtools-fullscreen/inspector.html?wss=connect.browserbase.com/debug/s1/devtools/page/P1',
+      debuggerUrl: 'https://www.browserbase.com/devtools/inspector.html?wss=connect.browserbase.com/debug/s1/devtools/page/P1',
+      wsUrl: 'wss://connect.browserbase.com/debug/s1/devtools/browser/B1',
+      pages: [{
+        id: 'P1', url: 'https://example.com/login', faviconUrl: 'https://example.com/favicon.ico', title: 'Login',
+        debuggerUrl: 'wss://connect.usw2.browserbase.com/debug/s1/devtools/page/P1',
+        debuggerFullscreenUrl: 'https://www.browserbase.com/devtools-fullscreen/inspector.html?wss=connect.browserbase.com/debug/s1/devtools/page/P1',
+      }],
+    };
+    const upstream = await startHttpsUpstream(JSON.stringify(debug));
+    const { tokenStore, cdpSessionStore, port } = await startProxy({
+      cdp: { port: 8444, advertiseHost: '127.0.0.1' },
+      browserbaseApiHost: '127.0.0.1',
+    });
+    const tok = tokenStore.issue('browser-api-key', 'real-key').id;
+
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(`GET /v1/sessions/s1/debug HTTP/1.1\r\nHost: 127.0.0.1\r\nX-BB-API-Key: ${tok}\r\n\r\n`);
+    const [res] = await readResponses(t, 1);
+
+    expect(res.body).not.toContain('browserbase.com');
+    const body = JSON.parse(res.body) as { wsUrl: string; pages: Array<Record<string, string>> };
+    const local = /^ws:\/\/127\.0\.0\.1:8444\/cdp\/([a-f0-9]+)$/;
+    expect(cdpSessionStore.get(local.exec(body.wsUrl)![1])).toBe(debug.wsUrl);
+    expect(cdpSessionStore.get(local.exec(body.pages[0].debuggerUrl)![1])).toBe(debug.pages[0].debuggerUrl);
+    expect(cdpSessionStore.adapterName(local.exec(body.wsUrl)![1])).toBe('browserbase');
+    expect(body).not.toHaveProperty('debuggerUrl');
+    expect(body).not.toHaveProperty('debuggerFullscreenUrl');
+    expect(body.pages[0]).not.toHaveProperty('debuggerFullscreenUrl');
+    expect(body.pages[0]).toMatchObject({ id: 'P1', url: 'https://example.com/login', title: 'Login' });
+  });
+
+  it('strips signingKey from a session-create response', async () => {
+    const upstream = await startHttpsUpstream(JSON.stringify({
+      id: 's1', connectUrl: 'wss://connect.browserbase.com?signingKey=SK', seleniumRemoteUrl: 'http://connect.browserbase.com/webdriver', signingKey: 'SK',
+    }));
+    const { port } = await startProxy({ cdp: { port: 8444, advertiseHost: '127.0.0.1' }, browserbaseApiHost: '127.0.0.1' });
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write('POST /v1/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n');
+    const [res] = await readResponses(t, 1);
+    expect(res.body).not.toContain('SK');
+    expect(JSON.parse(res.body)).not.toHaveProperty('signingKey');
+  });
+
+  it('uses custom adapters from the library API, matched by wildcard host', async () => {
+    const upstream = await startHttpsUpstream(JSON.stringify({ browser: { cdp: 'wss://cdp.vendor.test/x' }, other: 'wss://cdp.vendor.test/y' }));
+    const { cdpSessionStore, port } = await startProxy({
+      cdp: { port: 8444, advertiseHost: '127.0.0.1' },
+      browserAdapters: [{
+        name: 'vendor',
+        hosts: ['127.0.0.1'],
+        rewriteJson(body, register) {
+          const b = body as { browser: { cdp: string } };
+          b.browser.cdp = register(b.browser.cdp);
+          return true;
+        },
+      }],
+    });
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write('GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+    const [res] = await readResponses(t, 1);
+    const body = JSON.parse(res.body) as { browser: { cdp: string }; other: string };
+    const sid = /\/cdp\/([a-f0-9]+)$/.exec(body.browser.cdp)![1];
+    expect(cdpSessionStore.get(sid)).toBe('wss://cdp.vendor.test/x');
+    expect(cdpSessionStore.adapterName(sid)).toBe('vendor');
+    expect(body.other).toBe('wss://cdp.vendor.test/y');
+  });
+
+  it('refuses to start with an invalid adapter host pattern', async () => {
+    await expect(startProxy({ cdp: { port: 8444, advertiseHost: '127.0.0.1' }, browserAdapters: [{ name: 'bad', hosts: ['*'], rewriteJson: () => false }] }))
+      .rejects.toThrow(/browser adapter 'bad' host '\*'/);
+  });
+
   it('leaves the connectUrl alone when CDP is disabled', async () => {
     const real = JSON.stringify({ connectUrl: 'wss://connect.example.test/s1' });
     const upstream = await startHttpsUpstream(real);

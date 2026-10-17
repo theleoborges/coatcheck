@@ -26,6 +26,7 @@ describe('loadConfig', () => {
       ca: { dir: undefined, subject: 'CN=coatcheck CA, O=coatcheck' },
       missingSecretUrl: undefined,
       cdp: undefined,
+      browserAdapters: ['browserbase'],
       policy: EMPTY_POLICY,
       policyFile: undefined,
       allowUnboundSecrets: false,
@@ -48,6 +49,7 @@ describe('loadConfig', () => {
       COATCHECK_CDP_ENABLED: '1',
       COATCHECK_CDP_PORT: '9444',
       COATCHECK_CDP_ADVERTISE_HOST: 'coatcheck',
+      COATCHECK_BROWSER_ADAPTERS: ' browserbase ,',
       COATCHECK_ALLOW_UNBOUND_SECRETS: '1',
       COATCHECK_MITM: 'always',
       COATCHECK_PASSTHROUGH_HOSTS: 'pinned.example.com, *.Pinned.example.org',
@@ -63,6 +65,7 @@ describe('loadConfig', () => {
       ca: { dir: '/var/lib/coatcheck/ca', subject: 'CN=Example CA' },
       missingSecretUrl: 'https://dashboard.example.com/secrets',
       cdp: { port: 9444, advertiseHost: 'coatcheck' },
+      browserAdapters: ['browserbase'],
       policy: EMPTY_POLICY,
       policyFile: undefined,
       allowUnboundSecrets: true,
@@ -73,6 +76,10 @@ describe('loadConfig', () => {
       ],
       apiToken: 'a'.repeat(64),
     });
+  });
+
+  it('rejects unknown browser adapters', () => {
+    expect(problems({ ...base, COATCHECK_BROWSER_ADAPTERS: 'browserbase,steel' })).toEqual([expect.stringContaining("unknown adapter 'steel'")]);
   });
 
   it('treats empty values as unset', () => {

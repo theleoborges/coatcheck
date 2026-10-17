@@ -5,11 +5,14 @@ import { startCdpProxy, type CdpProxyHandle } from './cdp/proxy.js';
 import { createCoatcheck, type Coatcheck } from './server.js';
 import type { Config } from './config.js';
 import { withProviderCache, type SecretProvider } from './secret-provider.js';
+import { builtinBrowserAdapters, type BrowserAdapter } from './browser-adapters.js';
 
 export interface StartOptions {
   config: Config;
   /** Uncached; `startCoatcheck` wraps it in `withCache` per `config.secretCacheTtlSeconds`. */
   provider: SecretProvider;
+  /** Browser adapters to use instead of the built-ins named by `config.browserAdapters`. */
+  adapters?: BrowserAdapter[];
 }
 
 export interface RunningCoatcheck {
@@ -43,6 +46,7 @@ export async function startCoatcheck(opts: StartOptions): Promise<RunningCoatche
     ca,
     cdpSessionStore,
     cdp: config.cdp,
+    browserAdapters: opts.adapters ?? builtinBrowserAdapters(config.browserAdapters),
     missingSecretUrl: config.missingSecretUrl,
     policy: config.policy,
     allowUnboundSecrets: config.allowUnboundSecrets,
