@@ -32,6 +32,7 @@ describe('loadConfig', () => {
       allowUnboundSecrets: false,
       mitm: 'bound',
       passthroughHosts: [],
+      maxSwapBodyBytes: 1024 * 1024,
     });
   });
 
@@ -54,6 +55,7 @@ describe('loadConfig', () => {
       COATCHECK_MITM: 'always',
       COATCHECK_PASSTHROUGH_HOSTS: 'pinned.example.com, *.Pinned.example.org',
       COATCHECK_API_TOKEN: 'a'.repeat(64),
+      COATCHECK_MAX_SWAP_BODY_BYTES: '4096',
     });
     expect(config).toEqual({
       provider: 'aws',
@@ -75,7 +77,13 @@ describe('loadConfig', () => {
         { kind: 'wildcard', host: 'pinned.example.org', plaintext: false },
       ],
       apiToken: 'a'.repeat(64),
+      maxSwapBodyBytes: 4096,
     });
+  });
+
+  it('bounds COATCHECK_MAX_SWAP_BODY_BYTES', () => {
+    expect(problems({ ...base, COATCHECK_MAX_SWAP_BODY_BYTES: '100' })).toEqual([expect.stringContaining('COATCHECK_MAX_SWAP_BODY_BYTES must be an integer from 1024')]);
+    expect(problems({ ...base, COATCHECK_MAX_SWAP_BODY_BYTES: String(65 * 1024 * 1024) })).toHaveLength(1);
   });
 
   it('rejects unknown browser adapters', () => {

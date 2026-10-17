@@ -201,6 +201,35 @@ describe('TokenStore', () => {
     expect(store.replaceAll(`x ${t.id} y`, ANY_HOST).output).toBe("x a$&b$'c$`d$$e y");
   });
 
+  it('finds tickets by pattern: only live ids present in the input are considered', () => {
+    store = new TokenStore();
+    for (let i = 0; i < 500; i++) store.issue(`n${i}`, `v${i}`);
+    const t = store.issue('k', 'real');
+    const r = store.replaceAll(`a ${t.id} b ${t.id} ${TICKET_PREFIX}${'0'.repeat(64)}`, ANY_HOST);
+    expect(r.output).toBe(`a real b real ${TICKET_PREFIX}${'0'.repeat(64)}`);
+    expect(r.swaps.map(s => s.secretName)).toEqual(['k']);
+  });
+
+  it('reports values an encoder refuses as invalid and swaps nothing', () => {
+    store = new TokenStore();
+    const good = store.issue('good', 'ok');
+    const bad = store.issue('bad', 'x\r\ny');
+    const r = store.replaceAll(`${good.id} ${bad.id}`, ANY_HOST, v => (v.includes('\r') ? null : v));
+    expect(r.output).toBe(`${good.id} ${bad.id}`);
+    expect(r.swaps).toEqual([]);
+    expect(r.invalid?.map(s => s.secretName)).toEqual(['bad']);
+  });
+
+  it('knows when a body ticket could be swapped for a target', () => {
+    store = new TokenStore();
+    store.issue('plain', 'x', { allowedHosts: hosts('api.example.com') });
+    expect(store.hasLiveBodyTicketFor(ANY_HOST)).toBe(false);
+    store.issue('elsewhere', 'x', { allowedHosts: hosts('other.example.com'), swapBody: true });
+    expect(store.hasLiveBodyTicketFor(ANY_HOST)).toBe(false);
+    store.issue('body', 'x', { allowedHosts: hosts('api.example.com'), swapBody: true });
+    expect(store.hasLiveBodyTicketFor(ANY_HOST)).toBe(true);
+  });
+
   describe('body swapping', () => {
     it('swaps only opted-in tickets, encoding the value, and reports the rest as skipped', () => {
       store = new TokenStore();

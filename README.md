@@ -153,6 +153,7 @@ Errors are JSON `{"error":…}` with status 400, 401, 403, 404, 500, 501, or 502
 | `COATCHECK_POLICY_FILE` | (unset) | JSON [policy file](#policy-file): allowed hosts per secret and the shared-secret allowlist. Read once at startup; an invalid file stops startup. |
 | `COATCHECK_MITM` | `bound` | `bound`: intercept a `CONNECT` only when the target is a host in the policy file, an allowed host of a live ticket (any host while an unbound ticket is live), or the browser adapter's API host with CDP enabled; tunnel everything else untouched. `always`: intercept every `CONNECT`. |
 | `COATCHECK_PASSTHROUGH_HOSTS` | (empty) | Comma-separated hosts that are never intercepted, in either mode, for clients that pin certificates. Same syntax as `allowed_hosts` (exact, `*.example.com`, IP), without `http://`. A ticket sent to one of these hosts reaches it unswapped. |
+| `COATCHECK_MAX_SWAP_BODY_BYTES` | `1048576` | Largest request body held in memory for `swap_body` swapping (1024 to 67108864). Larger bodies stream through unscanned. See [Request bodies](#request-bodies). |
 | `COATCHECK_ALLOW_UNBOUND_SECRETS` | `0` | Set to `1` to mint tickets for secrets with no allowed hosts instead of refusing them with `403`. Such tickets are swapped on requests to **any** host; coatcheck warns at startup and logs `result=unbound` on every swap. |
 | `COATCHECK_MISSING_SECRET_URL` | (unset) | Returned as `vault_url` in 404s, e.g. a dashboard where users add secrets. Omitted when unset. |
 | `COATCHECK_CA_SUBJECT` | `CN=coatcheck CA, O=coatcheck` | Subject of a newly generated CA. |
@@ -210,12 +211,14 @@ At swap time the host checked is the `CONNECT` target on HTTPS (never the `Host`
 
 Tickets are swapped in the request line and headers for every secret, but in the request **body** only for secrets that opt in, because APIs often echo request bodies back (validation errors, created objects), which would hand the real value to the agent. Opt in with `"swap_body": true` on the secret's policy entry, or `"_swap_body": true` inside a JSON secret. Either one enables it, and an explicit `false` in either disables it. Mint responses then include `"swap_body": true`.
 
-- Host binding applies as in headers: a body ticket bound to another host gets the whole request refused with `403`.
-- A ticket in the body whose secret doesn't opt in is sent as a literal and logged as `[swap] result=body-skipped secrets=…`.
+- A body is only held and scanned when a live `swap_body` ticket could be swapped for the request's host. Every other body streams through untouched, as do bodies larger than `COATCHECK_MAX_SWAP_BODY_BYTES` (default 1 MiB): coatcheck forwards what it held and streams the rest unscanned, logging `[swap] result=body-unscanned`. In an unscanned body a ticket stays a literal, so the request fails closed.
+- In a scanned body, host binding applies as in headers: a body ticket bound to another host gets the whole request refused with `403`.
+- A ticket in a scanned body whose secret doesn't opt in is sent as a literal and logged as `[swap] result=body-skipped secrets=…`.
 - The value is escaped for the body's `Content-Type`: JSON-string-escaped for `application/json` and `*/*+json`, percent-encoded for `application/x-www-form-urlencoded`, raw UTF-8 for anything else (including multipart).
 - `Content-Length` is rewritten. A chunked HTTPS body is re-sent as a single chunk; on plain HTTP the body is always sent with `Content-Length`.
 - Bodies with a `Content-Encoding` (gzip, br, …) are not scanned.
-- Bodies are buffered whole before forwarding.
+
+In headers, a value containing a control character (CR, LF, NUL, …) can't be sent: the request is refused with `403` and `X-Coatcheck-Denied: invalid-value`, and logged as `result=invalid-value`. In the request line (URL) a value's spaces, control and non-ASCII characters are percent-encoded.
 
 ## Trusting the CA in the agent container
 
@@ -266,7 +269,7 @@ coatcheck does a **literal substring replace** of active ticket strings, so the 
 - **Client-side signing**, such as AWS SigV4, HMAC request signatures, or JWT minting. The client computes a signature over the ticket, not the real secret.
 - **Expired tickets.** After 15 minutes the ticket is forwarded literally.
 
-If an upstream returns 401 while you are using a ticket, assume the swap did not happen before you assume the stored credential is wrong. coatcheck logs one line per request with no values: `[swap] … result=hit secrets=…` on success, `result=denied secrets=…` when a ticket was sent to a host it isn't bound to (the request was not forwarded), `result=unbound` when an unbound ticket was swapped, `result=body-skipped secrets=…` when a ticket appeared in a request body but its secret doesn't enable `swap_body`, or `result=miss unswapped_ticket_literals=N` when a `cct_<64 hex>` string reaches the upstream intact.
+If an upstream returns 401 while you are using a ticket, assume the swap did not happen before you assume the stored credential is wrong. coatcheck logs one line per request with no values: `[swap] … result=hit secrets=…` on success, `result=denied secrets=…` when a ticket was sent to a host it isn't bound to (the request was not forwarded), `result=unbound` when an unbound ticket was swapped, `result=body-skipped secrets=…` when a ticket appeared in a request body but its secret doesn't enable `swap_body`, `result=body-unscanned` when a body was too large to scan, `result=invalid-value secrets=…` when a value can't be sent in a header (the request was not forwarded), or `result=miss unswapped_ticket_literals=N` when a `cct_<64 hex>` string reaches the upstream intact.
 
 On the plain-HTTP path tickets are swapped only in the path, query, headers and (for `swap_body` secrets) body, never in the host or userinfo, and `Proxy-Authorization` and hop-by-hop headers are not forwarded.
 
@@ -306,7 +309,7 @@ Client rules:
 coatcheck is **pre-1.0**. The HTTP API, ticket format (`cct_…`), and configuration may change. Known gaps, roughly in priority order:
 
 - **Host binding stops redirection, not misuse.** A ticket only works on its secret's allowed hosts, so an agent can't send it to an attacker's server. It can still use the credential maliciously against an allowed host, and an operator who sets `COATCHECK_ALLOW_UNBOUND_SECRETS=1` gives up the protection for unbound secrets.
-- **Request bodies are substituted only on opt-in** (`swap_body`, see [Request bodies](#request-bodies)), and never when content-encoded. On the MITM path, chunked and `Content-Length` bodies are framed strictly: a request with ambiguous framing (for example both `Content-Length` and `Transfer-Encoding`, or a coding other than `chunked`) gets `400` with `X-Coatcheck-Denied: bad-framing` and the tunnel is closed. Request trailers pass through unswapped.
+- **Request bodies are substituted only on opt-in** (`swap_body`, see [Request bodies](#request-bodies)), and never when content-encoded. On the MITM path, chunked and `Content-Length` bodies are framed strictly: a request with ambiguous framing (for example both `Content-Length` and `Transfer-Encoding`, or a coding other than `chunked`) gets `400` with `X-Coatcheck-Denied: bad-framing` and the tunnel is closed. A header section over 64 KiB gets `431`. Request trailers pass through unswapped.
 - **`HTTPS_PROXY` is advisory.** A process that ignores it bypasses coatcheck, which means no substitution and also no protection. Pair coatcheck with egress enforcement (network policy, firewall, or security group) so the agent can reach the internet only through the proxy.
 - **Interception follows the bindings, not the request.** In the default `bound` mode, a keep-alive tunnel opened to a host before any ticket for it existed (a host bound only by a secret's `_allowed_hosts`) stays a raw tunnel, so a ticket later sent down it reaches the upstream unswapped. Clients that pin certificates fail on intercepted hosts unless listed in `COATCHECK_PASSTHROUGH_HOSTS`. Intercepted tunnels speak HTTP/1.1 only (ALPN), and WebSocket frames after an upgrade are not inspected.
 - **Without `COATCHECK_API_TOKEN`, any local process can mint tickets.** That is the intended sidecar setup (loopback, shared network namespace), and coatcheck refuses to start off loopback without a token. The token is one shared secret: there are no per-client identities or scopes.

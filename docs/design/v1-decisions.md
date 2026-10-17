@@ -263,6 +263,54 @@ by the agent is deferred, and if it is ever added it may only narrow.
 - **Bytes outside tickets are preserved exactly** (the body is handled as
   latin1, so binary bodies round-trip).
 
+### Swap-path hardening (recorded while implementing roadmap item 19)
+
+- **A real value must fit where its ticket sits.**
+  - *Header fields:* a value containing a control character other than tab
+    (CR, LF and NUL included; RFC 9110 §5.5) can't be a header value;
+    spliced in, it would add header lines (and could desync the
+    `Content-Length` rewrite). The request is refused before anything is
+    forwarded: `403` with `X-Coatcheck-Denied: invalid-value`, logged as
+    `[swap] result=invalid-value secrets=…`, tunnel closed on HTTPS. Same on
+    the forward path (before, Node threw and the client got `502`). Who can
+    plant such a value: the operator, or an OAuth token endpoint whose
+    `access_token` is written back on refresh. The agent can't write secrets.
+  - *MITM request line:* the swapped request target gets the same
+    percent-encoding the forward path applies (control, space, non-ASCII), so
+    a value with a space can't split the request line.
+  - *Bodies* are unchanged: JSON and form values are escaped, other types
+    get the raw bytes (the operator opted the secret in).
+- **Bodies stream unless a swap is possible.** At the end of a request head,
+  the body is buffered only when a live `swap_body` ticket could be swapped
+  for the target (bound to it, or unbound). Otherwise it is forwarded as it
+  arrives, as before item 17. A ticket minted after the head was read
+  doesn't apply to that body, and its literal passes through (fails closed).
+  In a streamed body nothing is scanned, so a `swap_body` ticket bound to
+  another host leaves as its literal instead of getting `403 host-mismatch`,
+  and no `body-skipped` line is logged. The value is never sent either way.
+- **A buffered body is capped** at `COATCHECK_MAX_SWAP_BODY_BYTES` (default
+  1 MiB, from 1 KiB to 64 MiB). Past the cap, coatcheck forwards what it has
+  buffered and streams the rest, unscanned, with the original framing,
+  logging `[swap] result=body-unscanned`. Rejected: `413`. It would break
+  large uploads to any host that also has a body-swap secret, and a ticket in
+  a body that large still fails closed as a literal.
+- **Chunked bodies are decoded incrementally.** The decoder keeps its state
+  between TLS records, so a chunked upload costs linear time. A streamed
+  chunked body is forwarded chunk framing and all; a malformed chunk found
+  mid-stream still gets `400 bad-framing` and closes both legs (the upstream
+  sees a truncated request).
+- **The header section is capped at 64 KiB.** A head that doesn't end within
+  it gets `431` and the tunnel is closed. Before, an endless head grew the
+  buffer without bound. 64 KiB is above common servers' defaults (Node: 16 KiB).
+- **One pattern scan per input.** The token store finds `cct_<64 hex>`
+  literals with `TICKET_PATTERN` and looks each one up, instead of a
+  substring search per live ticket. Cost: one pass over the input plus the
+  tickets present.
+- **Shared rules carry their own `swap_body`.** `Policy.shared` maps a name to
+  `{ allowedHosts, swapBody? }`, like a per-agent `PolicyRule`.
+- **The MITM parses each request head once** (`parseRequestHead`): framing,
+  `Content-Type`, `Content-Encoding` and `Upgrade` come from one parse.
+
 ### Default: deny, at mint time
 
 - `/_vault/{name}` for an unbound secret returns `403` with an error naming the
@@ -369,6 +417,7 @@ file.
 | `COATCHECK_SECRET_CACHE_TTL_SECONDS` | `300` | `withCache` |
 | `COATCHECK_MITM` | `bound` | `bound`: MITM only hosts in the policy file, on live tickets, or on adapters. `always`: MITM every CONNECT (opt-in) |
 | `COATCHECK_PASSTHROUGH_HOSTS` | empty | never MITM (cert-pinned clients); exact or wildcard |
+| `COATCHECK_MAX_SWAP_BODY_BYTES` | `1048576` | largest body buffered for `swap_body`; larger ones stream unscanned (item 19) |
 | `COATCHECK_CA_DIR` | unset | unset: ephemeral in-memory CA. Set: persist the CA key and cert only |
 | `COATCHECK_CA_SUBJECT` | `CN=coatcheck CA,O=coatcheck` | |
 | `COATCHECK_MISSING_SECRET_URL` | unset | `vault_url` hint in 404s; omitted when unset |

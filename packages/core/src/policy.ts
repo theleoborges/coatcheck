@@ -9,9 +9,13 @@ export interface Policy {
   /** Per-agent secrets: exact names, or a prefix ending in `*`. */
   secrets: PolicyRule[];
   /** Shared secrets (exact names). Listed here = allowlisted for `/_secret/*`. */
-  shared: ReadonlyMap<string, HostPattern[]>;
-  /** Shared secrets with an explicit `swap_body`. */
-  sharedSwapBody: ReadonlyMap<string, boolean>;
+  shared: ReadonlyMap<string, SharedRule>;
+}
+
+export interface SharedRule {
+  allowedHosts: HostPattern[];
+  /** Explicit `swap_body`; undefined when absent. */
+  swapBody?: boolean;
 }
 
 export interface PolicyRule {
@@ -23,7 +27,7 @@ export interface PolicyRule {
   swapBody?: boolean;
 }
 
-export const EMPTY_POLICY: Policy = { secrets: [], shared: new Map(), sharedSwapBody: new Map() };
+export const EMPTY_POLICY: Policy = { secrets: [], shared: new Map() };
 
 type Json = unknown;
 
@@ -62,8 +66,7 @@ export function parsePolicy(text: string, problems: string[], source = 'policy f
     if (hosts) secrets.push({ name: base, wildcard, allowedHosts: hosts, ...(swapBody === undefined ? {} : { swapBody }) });
   }
 
-  const shared = new Map<string, HostPattern[]>();
-  const sharedSwapBody = new Map<string, boolean>();
+  const shared = new Map<string, SharedRule>();
   for (const [name, entry] of section(raw.shared, 'shared', source, problems)) {
     if (!isValidSecretName(name)) {
       problems.push(`${source}: shared["${name}"]: shared secrets must be exact, valid names`);
@@ -71,11 +74,10 @@ export function parsePolicy(text: string, problems: string[], source = 'policy f
     }
     const hosts = allowedHosts(entry, `shared["${name}"]`, source, problems);
     const swapBody = swapBodyOf(entry, `shared["${name}"]`, source, problems);
-    if (hosts) shared.set(name, hosts);
-    if (hosts && swapBody !== undefined) sharedSwapBody.set(name, swapBody);
+    if (hosts) shared.set(name, { allowedHosts: hosts, ...(swapBody === undefined ? {} : { swapBody }) });
   }
 
-  return { secrets, shared, sharedSwapBody };
+  return { secrets, shared };
 }
 
 /**
@@ -101,7 +103,7 @@ export function policyHostsFor(policy: Policy, secretName: string): HostPattern[
 
 /** Every host pattern the policy names (per-agent rules and shared secrets). */
 export function allPolicyHosts(policy: Policy): HostPattern[] {
-  return [...policy.secrets.flatMap(r => r.allowedHosts), ...[...policy.shared.values()].flat()];
+  return [...policy.secrets.flatMap(r => r.allowedHosts), ...[...policy.shared.values()].flatMap(r => r.allowedHosts)];
 }
 
 function isObject(v: Json): v is Record<string, Json> {

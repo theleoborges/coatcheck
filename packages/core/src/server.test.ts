@@ -785,12 +785,16 @@ describe('coatcheck server: request body substitution', () => {
     expect(upstream.received.map(e => e.url)).toEqual(['/form', '/next']);
   });
 
-  it('never swaps a ticket into the body unless its secret opts in (reflection attack)', async () => {
+  it.each([
+    ['scanned: a body ticket is live for the host, so the body is buffered', true],
+    ['streamed: no body ticket is live for the host', false],
+  ])('never swaps a ticket into the body unless its secret opts in (reflection attack, %s)', async (_name, bodyTicketLive) => {
     const logs = captureLogs();
     const upstream = await startHttpsUpstream();
     const { port } = await startProxy({ policy, provider: provider() });
     const headerKey = (await mint(port, 'header-key')).token;
     const optedOut = (await mint(port, 'opted-out')).token;
+    if (bodyTicketLive) await mint(port, 'body-key');
 
     // An allowed host that echoes its input: a swapped body would hand the value back to the agent.
     const t = await tunnel(upstream.port, port);
@@ -801,11 +805,27 @@ describe('coatcheck server: request body substitution', () => {
     const echo = JSON.parse(res.body) as Echo;
     expect(echo.headers['x-key']).toBe('real-header-key');
     expect(echo.body).toBe(body);
-    expect(logs).toContainEqual(expect.stringContaining('result=body-skipped secrets=header-key,opted-out'));
+    if (bodyTicketLive) expect(logs).toContainEqual(expect.stringContaining('result=body-skipped secrets=header-key,opted-out'));
     expect(logs.join('\n')).not.toContain('real-header-key');
   });
 
   it('denies a body ticket bound to another host and forwards nothing (exfiltration attack)', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ policy, provider: provider(), mitm: 'always' });
+    const { token } = await mint(port, 'github-token');
+    await mint(port, 'body-key'); // a body ticket live for this host: the body is scanned
+
+    const t = await tunnel(upstream.port, port);
+    const body = `{"stolen":"${token}"}`;
+    t.write(`POST /collect HTTP/1.1\r\nHost: api.github.com\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n${body}`);
+    const [res] = await readResponses(t, 1);
+    expect(res.head).toMatch(/^HTTP\/1\.1 403 /);
+    expect(res.head).toMatch(/X-Coatcheck-Denied: host-mismatch/i);
+    expect(upstream.received).toEqual([]);
+  });
+
+  it('streams a body when no body ticket is live for the host: a mis-bound one leaves only as a literal', async () => {
     captureLogs();
     const upstream = await startHttpsUpstream();
     const { port } = await startProxy({ policy, provider: provider(), mitm: 'always' });
@@ -815,9 +835,8 @@ describe('coatcheck server: request body substitution', () => {
     const body = `{"stolen":"${token}"}`;
     t.write(`POST /collect HTTP/1.1\r\nHost: api.github.com\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n${body}`);
     const [res] = await readResponses(t, 1);
-    expect(res.head).toMatch(/^HTTP\/1\.1 403 /);
-    expect(res.head).toMatch(/X-Coatcheck-Denied: host-mismatch/i);
-    expect(upstream.received).toEqual([]);
+    expect(res.body).not.toContain('ghp_REAL_VALUE');
+    expect((JSON.parse(res.body) as Echo).body).toBe(body);
   });
 
   it('leaves content-encoded bodies alone', async () => {
@@ -855,6 +874,115 @@ describe('coatcheck server: request body substitution', () => {
 
     expect(await post(`x=${github}`)).toBe(403);
     expect(upstream.received).toHaveLength(1);
+  });
+});
+
+describe('coatcheck server: swap-path hardening', () => {
+  it('refuses a value with CR/LF in a header instead of injecting header lines (CL desync attack)', async () => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy({ mitm: 'always' });
+    const allowedHosts = hosts('127.0.0.1');
+    // E.g. an access_token a hostile OAuth endpoint wrote back on refresh.
+    const evil = tokenStore.issue('oauth:access_token', 'x\r\nContent-Length: 0\r\nX-Injected: 1', { allowedHosts }).id;
+
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(`POST /a HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer ${evil}\r\nContent-Length: 4\r\n\r\nGET `);
+    const [res] = await readResponses(t, 1);
+    expect(res.head).toMatch(/^HTTP\/1\.1 403 /);
+    expect(res.head).toMatch(/X-Coatcheck-Denied: invalid-value/i);
+    expect(upstream.received).toEqual([]);
+    expect(logs).toContainEqual(expect.stringContaining('result=invalid-value secrets=oauth:access_token'));
+    expect(logs.join('\n')).not.toContain('X-Injected');
+  });
+
+  it('percent-encodes a value swapped into the MITM request line, so a space cannot split it', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy();
+    const tok = tokenStore.issue('k', 'real value é HTTP/1.1', { allowedHosts: hosts('127.0.0.1') }).id;
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(`GET /p?k=${tok} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n`);
+    const [res] = await readResponses(t, 1);
+    expect((JSON.parse(res.body) as Echo).url).toBe('/p?k=real%20value%20%C3%A9%20HTTP/1.1');
+  });
+
+  it('answers 431 and closes the tunnel when a header section never ends (memory exhaustion)', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { port } = await startProxy({ mitm: 'always' });
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    const closed = new Promise<void>(r => t.once('close', () => r()));
+    t.write(`GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Pad: ${'a'.repeat(70 * 1024)}`);
+    const [res] = await readResponses(t, 1);
+    expect(res.head).toMatch(/^HTTP\/1\.1 431 /);
+    await closed;
+    expect(upstream.received).toEqual([]);
+  });
+
+  it('streams a body when no body ticket is live: the upstream sees the head before the body ends', async () => {
+    captureLogs();
+    const upstream = await startRawTlsUpstream();
+    const { tokenStore, port } = await startProxy();
+    const tok = tokenStore.issue('k', 'real-key', { allowedHosts: hosts('127.0.0.1') }).id;
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(`POST /up HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Key: ${tok}\r\nContent-Length: 100000\r\n\r\n${'x'.repeat(1000)}`);
+    await vi.waitFor(() => expect(upstream.heads).toHaveLength(1));
+    expect(upstream.heads[0]).toContain('X-Key: real-key');
+  });
+
+  it.each([
+    ['Content-Length', (b: string) => `Content-Length: ${b.length}\r\n\r\n${b}`],
+    ['chunked', (b: string) => `Transfer-Encoding: chunked\r\n\r\n${[b.slice(0, 1500), b.slice(1500)].map(c => `${c.length.toString(16)}\r\n${c}\r\n`).join('')}0\r\n\r\n`],
+  ])('streams a %s body past COATCHECK_MAX_SWAP_BODY_BYTES unscanned: the ticket stays a literal', async (_name, frame) => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy({ maxSwapBodyBytes: 1024 });
+    const tok = tokenStore.issue('k', 'real-key', { allowedHosts: hosts('127.0.0.1'), swapBody: true }).id;
+    const body = `${'x'.repeat(2000)}${tok}`;
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    const responses = readResponses(t, 2);
+    t.write(`POST /big HTTP/1.1\r\nHost: 127.0.0.1\r\n${frame(body)}`);
+    t.write(`POST /small HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${tok.length}\r\n\r\n${tok}`);
+    const [big, small] = await responses;
+    expect((JSON.parse(big.body) as Echo).body).toBe(body);
+    expect((JSON.parse(small.body) as Echo).body).toBe('real-key');
+    expect(logs).toContainEqual(expect.stringContaining('result=body-unscanned reason=too-large max_bytes=1024'));
+  });
+
+  it('forward path: refuses CR/LF values, and streams bodies past the cap unscanned', async () => {
+    const logs = captureLogs();
+    const upstream = await startHttpUpstream();
+    const { tokenStore, port } = await startProxy({ maxSwapBodyBytes: 1024 });
+    const allowedHosts = hosts('http://127.0.0.1');
+    const tok = tokenStore.issue('k', 'real-key', { allowedHosts, swapBody: true }).id;
+    const post = (payload: string) => new Promise<number>((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: `http://127.0.0.1:${upstream.port}/p` },
+        res => { res.resume(); res.on('end', () => resolve(res.statusCode ?? 0)); });
+      req.on('error', reject);
+      req.end(payload);
+    });
+    const big = `${'x'.repeat(3000)}${tok}`;
+    expect(await post(big)).toBe(200);
+    expect(upstream.received[0].body).toBe(big);
+    expect(logs).toContainEqual(expect.stringContaining('scheme=http host=127.0.0.1 result=body-unscanned'));
+    expect(await post(`a=${tok}`)).toBe(200);
+    expect(upstream.received[1].body).toBe('a=real-key');
+  });
+
+  it('applies swap_body from a shared secret\'s policy entry', async () => {
+    captureLogs();
+    const policy = parsePolicy(JSON.stringify({
+      shared: { 'shared-key': { allowed_hosts: ['127.0.0.1'], swap_body: true } },
+    }), []);
+    const { port } = await startProxy({ policy, provider: createMemoryProvider({ shared: { 'shared-key': 'real-shared' } }) });
+    const res = await fetch(`http://127.0.0.1:${port}/_secret/shared-key`);
+    expect(await res.json()).toMatchObject({ swap_body: true, allowed_hosts: ['127.0.0.1'] });
   });
 });
 
@@ -1011,9 +1139,15 @@ describe('coatcheck server: plain HTTP', () => {
     expect(ok.status).toBe(200);
     expect(upstream.received[0].url).toBe('/p?k=real%20value%20%C3%A9');
 
-    // A real value Node refuses in a header must not throw out of the request handler.
+    // A real value that can't be a header value is refused before anything is sent.
     const crlf = tokenStore.issue('h', 'bad\r\nx-injected: 1', { allowedHosts }).id;
-    expect((await viaProxy(port, `http://127.0.0.1:${upstream.port}/`, { 'x-key': crlf })).status).toBe(502);
+    const refused = await viaProxy(port, `http://127.0.0.1:${upstream.port}/`, { 'x-key': crlf });
+    expect(refused.status).toBe(403);
+    expect(refused.headers['x-coatcheck-denied']).toBe('invalid-value');
+    expect(upstream.received).toHaveLength(1);
+    // A value Node still refuses (above U+00FF) must not throw out of the request handler.
+    const wide = tokenStore.issue('w', 'value \u2603', { allowedHosts }).id;
+    expect((await viaProxy(port, `http://127.0.0.1:${upstream.port}/`, { 'x-key': wide })).status).toBe(502);
     expect((await fetch(`http://127.0.0.1:${port}/_health`)).status).toBe(200);
   });
 

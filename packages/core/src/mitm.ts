@@ -10,9 +10,11 @@ import { parseConnectTarget } from './connect-target.js';
 import { matchesHost, parseHostPattern, type HostPattern } from './host-matcher.js';
 import { allPolicyHosts, type Policy } from './policy.js';
 import type { MitmMode } from './config.js';
-import { headerValue, requestFraming, scanChunked } from './http1-framing.js';
+import { ChunkedDecoder, parseRequestHead, type RequestHead } from './http1-framing.js';
 import { swapRequestBody } from './body-swap.js';
-import { DENIED_HEADER, hostMismatchBody, logSwapOutcome } from './swap-log.js';
+import { headerFieldValue, percentEncodeUnsafe } from './value-encoding.js';
+import type { SwapInfo } from './token-store.js';
+import { DENIED_HEADER, hostMismatchBody, invalidValueBody, logBodyUnscanned, logSwapOutcome, type SwapOutcome } from './swap-log.js';
 
 export interface MitmDeps {
   tokenStore: TokenStore;
@@ -29,7 +31,32 @@ export interface MitmDeps {
   mitm: MitmMode;
   /** Never MITM'd, in either mode. */
   passthroughHosts: readonly HostPattern[];
+  /** Largest request body buffered for `swap_body` swapping; larger ones stream unscanned. */
+  maxSwapBodyBytes: number;
 }
+
+const STATUS_TEXT = { 400: 'Bad Request', 403: 'Forbidden', 431: 'Request Header Fields Too Large' } as const;
+
+/** A header section that hasn't ended within this many bytes gets 431. */
+export const MAX_HEAD_BYTES = 64 * 1024;
+
+/** The body of the request being read, after its head. */
+type BodyState =
+  /** Forwarded as it arrives. */
+  | { mode: 'stream'; remaining: number; decoder?: ChunkedDecoder }
+  /** Held for `swap_body` swapping, up to `maxSwapBodyBytes`. */
+  | {
+      mode: 'buffer';
+      remaining: number;
+      decoder?: ChunkedDecoder;
+      head: RequestHead;
+      /** The swapped head, without the final CRLFCRLF. */
+      headOut: string;
+      headOutcome: SwapOutcome & { postSwapText: string };
+      raw: Buffer[];
+      rawBytes: number;
+      data: Buffer[];
+    };
 
 /**
  * Handle a `CONNECT host:port` request. `bound` mode MITMs only targets a ticket
@@ -37,7 +64,7 @@ export interface MitmDeps {
  * MITMs everything. Passthrough hosts are always a raw tunnel.
  */
 export function createConnectHandler(deps: MitmDeps) {
-  const { tokenStore, ca, cdpSessionStore, cdp, upstreamCa, mitm, passthroughHosts } = deps;
+  const { tokenStore, ca, cdpSessionStore, cdp, upstreamCa, mitm, passthroughHosts, maxSwapBodyBytes } = deps;
   const policyHosts = allPolicyHosts(deps.policy);
   // Parsed once: a bad adapter host pattern fails here, at startup.
   const adapters = deps.browserAdapters.map(adapter => ({
@@ -137,99 +164,192 @@ export function createConnectHandler(deps: MitmDeps) {
       else pendingWrites.push(buf);
     }
 
+    // The body of the request being read (null between requests), and whether
+    // that request asked for an upgrade (honoured once it has been sent).
+    let body: BodyState | null = null;
+    let upgradeRequested = false;
+    // The binding key is the validated CONNECT target (upstream TLS proves it
+    // is the recipient), never Host or SNI.
+    const swapTarget = { host: hostname, scheme: 'https' as const };
+
     /**
-     * Process buffered client data, extracting complete HTTP requests and
-     * swapping tokens in each one. Handles HTTP keep-alive: after the first
-     * request, subsequent requests on the same connection are also parsed
-     * and token-swapped (not raw-piped).
+     * Process buffered client data request by request (HTTP keep-alive: every
+     * request on the tunnel is parsed and swapped, not raw-piped). Bodies
+     * stream unless a `swap_body` ticket could apply (design §3, "Swap-path
+     * hardening").
      */
     function processClientData() {
       while (!denied && !awaitingUpgrade && !rawPipe) {
+        if (body) {
+          if (!advanceBody(body)) return; // need more data
+          continue;
+        }
         // Empty lines before a request line are ignored (RFC 9112 §2.2), e.g.
         // a stray CRLF some clients send after a request body.
         while (requestData.length >= 2 && requestData[0] === 0x0d && requestData[1] === 0x0a) {
           requestData = requestData.subarray(2);
         }
         const headerEnd = requestData.indexOf('\r\n\r\n');
+        if (headerEnd > MAX_HEAD_BYTES || (headerEnd === -1 && requestData.length > MAX_HEAD_BYTES)) {
+          console.warn(`[connect] host=${hostname} rejected request: header section over ${MAX_HEAD_BYTES} bytes`);
+          denyAndClose(431, 'head-too-large', JSON.stringify({ error: 'Request header section too large', reason: 'head-too-large' }));
+          return;
+        }
         if (headerEnd === -1) return; // need more data
 
-        const headerStr = requestData.subarray(0, headerEnd).toString();
-        const bodyStart = headerEnd + 4;
+        const head = parseRequestHead(requestData.subarray(0, headerEnd).toString());
+        requestData = requestData.subarray(headerEnd + 4);
+        upgradeRequested = head.header('upgrade') !== undefined;
 
         // Find where this request ends (RFC 9112 §6); ambiguous framing is
         // refused, since the upstream might read it differently (design §5).
-        const framing = requestFraming(headerStr);
-        let totalLength: number;
-        let chunked: { data: Buffer; trailers: Buffer } | undefined;
+        const { framing } = head;
         if (framing.kind === 'invalid') {
-          console.warn(`[connect] host=${hostname} rejected request: ${framing.reason}`);
-          denyAndClose(400, 'bad-framing', JSON.stringify({ error: `Bad request framing: ${framing.reason}`, reason: 'bad-framing' }));
-          return;
-        } else if (framing.kind === 'chunked') {
-          const scan = scanChunked(requestData, bodyStart);
-          if (scan.kind === 'incomplete') return; // need more data
-          if (scan.kind === 'invalid') {
-            console.warn(`[connect] host=${hostname} rejected request: ${scan.reason}`);
-            denyAndClose(400, 'bad-framing', JSON.stringify({ error: `Bad request framing: ${scan.reason}`, reason: 'bad-framing' }));
-            return;
-          }
-          totalLength = scan.end;
-          chunked = scan;
-        } else {
-          totalLength = bodyStart + (framing.kind === 'length' ? framing.length : 0);
-          if (requestData.length < totalLength) return; // need more data for body
-        }
-
-        const body = requestData.subarray(bodyStart, totalLength);
-        requestData = requestData.subarray(totalLength); // remainder for next request
-
-        // Swap tokens in headers, and in the body for secrets that opt in.
-        // The binding key is the validated CONNECT target (upstream TLS proves
-        // it is the recipient), never Host or SNI.
-        const swapTarget = { host: hostname, scheme: 'https' as const };
-        const result = tokenStore.replaceAll(headerStr, swapTarget);
-        const bodySwap = swapRequestBody(tokenStore, chunked ? chunked.data : body, {
-          contentType: headerValue(headerStr, 'content-type'),
-          contentEncoding: headerValue(headerStr, 'content-encoding'),
-        }, swapTarget);
-        const deniedSwaps = [...result.denied, ...(bodySwap?.result.denied ?? [])];
-        logSwapOutcome('https', hostname, {
-          swaps: [...result.swaps, ...(bodySwap?.result.swaps ?? [])],
-          denied: deniedSwaps,
-          skipped: bodySwap?.result.skipped,
-        }, bodySwap ? `${result.output}\n${bodySwap.result.output}` : result.output);
-        if (deniedSwaps.length > 0) {
-          denyAndClose(403, 'host-mismatch', hostMismatchBody(deniedSwaps, hostname));
+          rejectFraming(framing.reason);
           return;
         }
 
-        let head = result.output;
-        let outBody: Buffer = body;
-        if (bodySwap && bodySwap.result.swaps.length > 0) {
-          const swapped = bodySwap.body;
-          if (chunked) {
-            // One chunk, then the last chunk and the trailers as received.
-            outBody = Buffer.concat([
-              Buffer.from(swapped.length > 0 ? `${swapped.length.toString(16)}\r\n` : ''),
-              swapped,
-              Buffer.from(swapped.length > 0 ? '\r\n0\r\n' : '0\r\n'),
-              chunked.trailers,
-            ]);
-          } else {
-            // Framing was validated: exactly one all-digit Content-Length.
-            head = head.replace(/^(content-length:[ \t]*)\d+/im, `$1${swapped.length}`);
-            outBody = swapped;
-          }
+        const swapped = swapHead(head);
+        if (swapped.denied.length > 0 || swapped.invalid.length > 0) {
+          logSwapOutcome('https', hostname, swapped, swapped.postSwapText);
+          denyForSwaps(swapped.denied, swapped.invalid);
+          return;
         }
 
-        const outBuf = Buffer.concat([
-          Buffer.from(head + '\r\n\r\n'),
-          outBody,
-        ]);
-
-        sendUpstream(outBuf);
-        if (/^upgrade:/im.test(headerStr)) awaitingUpgrade = true;
+        const remaining = framing.kind === 'length' ? framing.length : 0;
+        const decoder = framing.kind === 'chunked' ? new ChunkedDecoder() : undefined;
+        if (framing.kind !== 'none' && (decoder || remaining > 0) && tokenStore.hasLiveBodyTicketFor(swapTarget)) {
+          body = {
+            mode: 'buffer', remaining, decoder, head, headOut: swapped.output,
+            headOutcome: swapped, raw: [], rawBytes: 0, data: [],
+          };
+          continue;
+        }
+        logSwapOutcome('https', hostname, swapped, swapped.postSwapText);
+        sendUpstream(Buffer.from(swapped.output + '\r\n\r\n'));
+        if (decoder || remaining > 0) body = { mode: 'stream', remaining, decoder };
+        else finishRequest();
       }
+    }
+
+    /**
+     * Swap tickets in a head: in the request line (values percent-encoded, as
+     * on the forward path) and in the header fields (values that can't be a
+     * field value are refused).
+     */
+    function swapHead(head: RequestHead) {
+      const line = tokenStore.replaceAll(head.requestLine, swapTarget, percentEncodeUnsafe);
+      const fields = tokenStore.replaceAll(head.fieldLines.join('\r\n'), swapTarget, headerFieldValue);
+      const output = head.fieldLines.length > 0 ? `${line.output}\r\n${fields.output}` : line.output;
+      return {
+        output,
+        postSwapText: output,
+        swaps: [...line.swaps, ...fields.swaps],
+        denied: [...line.denied, ...fields.denied],
+        invalid: [...(line.invalid ?? []), ...(fields.invalid ?? [])],
+      };
+    }
+
+    /**
+     * Consume body bytes from `requestData`. Returns true when the body is
+     * complete (or the tunnel was denied), false when more data is needed.
+     */
+    function advanceBody(state: BodyState): boolean {
+      let consumed: Buffer;
+      if (state.decoder) {
+        const r = state.decoder.feed(requestData, state.mode === 'buffer' ? d => state.data.push(d) : undefined);
+        if ('error' in r) {
+          rejectFraming(r.error);
+          return true;
+        }
+        consumed = requestData.subarray(0, r.consumed);
+      } else {
+        consumed = requestData.subarray(0, Math.min(state.remaining, requestData.length));
+        state.remaining -= consumed.length;
+      }
+      requestData = requestData.subarray(consumed.length);
+      const complete = state.decoder ? state.decoder.done : state.remaining === 0;
+
+      if (state.mode === 'stream') {
+        if (consumed.length > 0) sendUpstream(consumed);
+      } else {
+        if (state.decoder === undefined) state.data.push(consumed);
+        state.raw.push(consumed);
+        state.rawBytes += consumed.length;
+        if (state.rawBytes > maxSwapBodyBytes) {
+          // Too large to hold: forward what we have and stream the rest unscanned.
+          logSwapOutcome('https', hostname, state.headOutcome, state.headOutcome.postSwapText);
+          logBodyUnscanned('https', hostname, maxSwapBodyBytes);
+          sendUpstream(Buffer.concat([Buffer.from(state.headOut + '\r\n\r\n'), ...state.raw]));
+          body = { mode: 'stream', remaining: state.remaining, decoder: state.decoder };
+          if (complete) finishRequest();
+          return complete;
+        }
+        if (complete) {
+          sendBuffered(state);
+          if (denied) return true;
+        }
+      }
+      if (complete) finishRequest();
+      return complete;
+    }
+
+    /** Swap a complete buffered body (opt-in secrets only) and send the request. */
+    function sendBuffered(state: Extract<BodyState, { mode: 'buffer' }>) {
+      const decoded = Buffer.concat(state.data);
+      const bodySwap = swapRequestBody(tokenStore, decoded, {
+        contentType: state.head.header('content-type'),
+        contentEncoding: state.head.header('content-encoding'),
+      }, swapTarget);
+      const outcome = state.headOutcome;
+      const deniedSwaps = [...outcome.denied, ...(bodySwap?.result.denied ?? [])];
+      logSwapOutcome('https', hostname, {
+        swaps: [...outcome.swaps, ...(bodySwap?.result.swaps ?? [])],
+        denied: deniedSwaps,
+        skipped: bodySwap?.result.skipped,
+      }, bodySwap ? `${outcome.postSwapText}\n${bodySwap.result.output}` : outcome.postSwapText);
+      if (deniedSwaps.length > 0) {
+        denyForSwaps(deniedSwaps, []);
+        return;
+      }
+
+      let head = state.headOut;
+      let outBody: Buffer = Buffer.concat(state.raw);
+      if (bodySwap && bodySwap.result.swaps.length > 0) {
+        const swapped = bodySwap.body;
+        if (state.decoder) {
+          // One chunk, then the last chunk and the trailers as received.
+          outBody = Buffer.concat([
+            Buffer.from(swapped.length > 0 ? `${swapped.length.toString(16)}\r\n` : ''),
+            swapped,
+            Buffer.from(swapped.length > 0 ? '\r\n0\r\n' : '0\r\n'),
+            state.decoder.trailers,
+          ]);
+        } else {
+          // Framing was validated (exactly one all-digit Content-Length), and
+          // swapped header values can't hold CR/LF, so this is the only such line.
+          head = head.replace(/^(content-length:[ \t]*)\d+/im, `$1${swapped.length}`);
+          outBody = swapped;
+        }
+      }
+      sendUpstream(Buffer.concat([Buffer.from(head + '\r\n\r\n'), outBody]));
+    }
+
+    /** The request has been sent in full: honour an upgrade it asked for. */
+    function finishRequest() {
+      body = null;
+      if (upgradeRequested) awaitingUpgrade = true;
+      upgradeRequested = false;
+    }
+
+    function rejectFraming(reason: string) {
+      console.warn(`[connect] host=${hostname} rejected request: ${reason}`);
+      denyAndClose(400, 'bad-framing', JSON.stringify({ error: `Bad request framing: ${reason}`, reason: 'bad-framing' }));
+    }
+
+    function denyForSwaps(deniedSwaps: SwapInfo[], invalid: SwapInfo[]) {
+      if (deniedSwaps.length > 0) denyAndClose(403, 'host-mismatch', hostMismatchBody(deniedSwaps, hostname));
+      else denyAndClose(403, 'invalid-value', invalidValueBody(invalid));
     }
 
     /** Watch upstream bytes for the response head that answers an upgrade request. */
@@ -257,23 +377,24 @@ export function createConnectHandler(deps: MitmDeps) {
     }
 
     /**
-     * Answer 403 (host mismatch) or 400 (bad framing) instead of forwarding,
+     * Answer 403 (host mismatch, invalid value), 400 (bad framing) or 431
+     * (header section too large) instead of forwarding,
      * and close the tunnel: requests pipelined ahead of this one that the
      * upstream hasn't answered are abandoned (design §3, "Host binding details").
      */
-    function denyAndClose(status: 400 | 403, reason: string, body: string) {
+    function denyAndClose(status: 400 | 403 | 431, reason: string, responseBody: string) {
       denied = true;
       pendingWrites = [];
       requestData = Buffer.alloc(0);
       realSocket.unpipe(tlsSocket);
       realSocket.destroy();
       tlsSocket.end(
-        `HTTP/1.1 ${status} ${status === 400 ? 'Bad Request' : 'Forbidden'}\r\n` +
+        `HTTP/1.1 ${status} ${STATUS_TEXT[status]}\r\n` +
         'Content-Type: application/json\r\n' +
         `${DENIED_HEADER}: ${reason}\r\n` +
-        `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+        `Content-Length: ${Buffer.byteLength(responseBody)}\r\n` +
         'Connection: close\r\n\r\n' +
-        body,
+        responseBody,
       );
     }
 

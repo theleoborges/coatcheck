@@ -18,7 +18,7 @@ describe('parsePolicy', () => {
     });
     expect(problems).toEqual([]);
     expect(policy.secrets.map(r => [r.name, r.wildcard])).toEqual([['github-token', false], ['google-', true]]);
-    expect(policy.shared.get('browserbase-api-key')).toEqual([{ kind: 'exact', host: 'api.browserbase.com', plaintext: false }]);
+    expect(policy.shared.get('browserbase-api-key')).toEqual({ allowedHosts: [{ kind: 'exact', host: 'api.browserbase.com', plaintext: false }] });
   });
 
   it('parses swap_body on secrets and shared entries, and only booleans', () => {
@@ -29,7 +29,7 @@ describe('parsePolicy', () => {
     expect(problems).toEqual([]);
     expect(policyRuleFor(policy, 'a')?.swapBody).toBe(true);
     expect(policyRuleFor(policy, 'b')?.swapBody).toBeUndefined();
-    expect(policy.sharedSwapBody.get('s')).toBe(false);
+    expect(policy.shared.get('s')?.swapBody).toBe(false);
     expect(parse({ secrets: { a: { allowed_hosts: ['a.example.com'], swap_body: 'yes' } } }).problems)
       .toEqual([expect.stringContaining('secrets["a"].swap_body must be true or false')]);
   });

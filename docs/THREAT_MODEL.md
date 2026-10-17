@@ -241,10 +241,18 @@ Bodies are rewritten only for secrets with `swap_body` (policy) or
 likely to echo input back to the agent (validation errors, created
 objects). Opting in accepts that reflection risk for that secret: an agent
 that can get an allowed host to echo a request body can read the value.
-Host binding still applies to body tickets (a mis-bound one denies the
+A body is only buffered and scanned when a live `swap_body` ticket could be
+swapped for the host, and only up to `COATCHECK_MAX_SWAP_BODY_BYTES`; other
+bodies stream unscanned, so their tickets leave as literals (fail closed).
+In a scanned body host binding applies (a mis-bound ticket denies the
 request; test in `server.test.ts`), and a ticket of a secret that hasn't
 opted in reaches the upstream as a literal. Content-encoded bodies are not
-scanned. The MITM parser frames `Transfer-Encoding: chunked` and
+scanned. A real value with a control character (CR/LF) is never spliced
+into a header, where it would inject header lines and could desync framing
+with the upstream: the request is refused with `403 invalid-value` (attack
+test in `server.test.ts`). Values in the request line are percent-encoded.
+The header section is capped at 64 KiB (`431`), and buffered bodies at the
+cap above, so one tunnel can't grow coatcheck's memory without bound. The MITM parser frames `Transfer-Encoding: chunked` and
 `Content-Length` bodies per RFC 9112 (`http1-framing.ts`), so body bytes can't
 be parsed as a new request whose header tickets would be swapped. Ambiguous
 framing (both headers, codings other than `chunked`, repeated or malformed

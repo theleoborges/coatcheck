@@ -155,8 +155,8 @@ export function handleVaultRequest(
       }
       // The allowlist entry always carries hosts, so a shared secret is never unbound.
       const parsed = parseSecretValue(secret.value);
-      const binding = resolveBinding(
-        secretName, deps.policy.shared.get(secretName), parsed.inBand, false, deps.policy.sharedSwapBody.get(secretName));
+      const rule = deps.policy.shared.get(secretName);
+      const binding = resolveBinding(secretName, rule?.allowedHosts, parsed.inBand, false, rule?.swapBody);
       if (!sendBindingError(res, binding)) return;
       issueTicket(res, deps, `shared:${secretName}`, parsed.kind === 'simple' ? parsed.value : secret.value, binding);
     }).catch(err => {

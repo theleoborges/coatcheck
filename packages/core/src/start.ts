@@ -53,6 +53,7 @@ export async function startCoatcheck(opts: StartOptions): Promise<RunningCoatche
     mitm: config.mitm,
     passthroughHosts: config.passthroughHosts,
     apiToken: config.apiToken,
+    maxSwapBodyBytes: config.maxSwapBodyBytes,
   });
 
   const { port } = await coatcheck.listen(config.port, config.bindHost);
