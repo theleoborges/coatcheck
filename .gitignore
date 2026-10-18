@@ -7,7 +7,6 @@ coverage/
 .env.*
 *.tsbuildinfo
 
-# Example-agent credentials and generated certificates (never commit)
+# Example-agent credentials (never commit)
 .aws-reporter-key
 .aws-reporter-key.tmp
-examples/agents/*/certs/

@@ -20,6 +20,7 @@ const KEYS = new Map([
   [env('LEDGER_OPERATOR_KEY_ID'), { secret: env('LEDGER_OPERATOR_SECRET'), role: 'operator' }],
 ]);
 const WINDOW_S = 30;
+const MAX_BODY = 1024 * 1024;
 const data = JSON.parse(fs.readFileSync(new URL('./data.json', import.meta.url), 'utf8'));
 const transfers = [];
 
@@ -76,8 +77,15 @@ const server = https.createServer({
   cert: fs.readFileSync(process.env.LEDGER_TLS_CERT ?? '/certs/ledger.crt'),
 }, (req, res) => {
   const chunks = [];
-  req.on('data', c => chunks.push(c));
+  let size = 0;
+  req.on('error', () => res.destroy());
+  req.on('data', c => {
+    size += c.length;
+    if (size > MAX_BODY) { send(res, 413, { error: 'body too large' }); req.destroy(); return; }
+    chunks.push(c);
+  });
   req.on('end', () => {
+    if (size > MAX_BODY) return;
     const body = Buffer.concat(chunks);
     const auth = authenticate(req, body);
     const path = req.url.split('?')[0];

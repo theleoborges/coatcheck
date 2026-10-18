@@ -52,7 +52,6 @@ if [ "$code" = 200 ] && [ "$(jq '.transactions | length' /tmp/resp.json)" -gt 10
 # Negative checks.
 code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$COATCHECK_URL/_vault/ledger?field=secret")"
 [ "$code" = 400 ] && pass "?field=secret refused (400)" || flunk "?field=secret ($code)"
-if env | grep -qi 'ledger_.*secret'; then flunk "a ledger secret is in the agent's env"; else pass "no ledger secret in the agent's env"; fi
 code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOK" "$LEDGER_URL/v1/accounts")"
 [ "$code" = 401 ] && pass "ticket as a bearer literal: service 401" || flunk "bearer literal ($code)"
 code="$(ledger "$TOK" GET /v1/accounts/acc_ops '' "$(date +%s)" /v1/accounts)"
@@ -61,9 +60,19 @@ code="$(ledger "$TOK" GET /v1/accounts '' "$(( $(date +%s) - 600 ))")"
 [ "$code" = 401 ] && [ "$(jq -r .reason /tmp/resp.json)" = stale-timestamp ] && pass "replayed old timestamp: service 401 stale-timestamp" || flunk "old timestamp ($code)"
 code="$(ledger "$TOK" POST /v1/transfers '{"from":"acc_reserve","to":"acc_ops","amount":100}')"
 [ "$code" = 403 ] && pass "POST /v1/transfers with the auditor key: service 403" || flunk "POST transfers ($code)"
-if curl -s --max-time 5 --noproxy '*' -o /dev/null "$LEDGER_URL/v1/accounts"; then flunk "reached the ledger without the proxy"; else pass "no route to the ledger without the proxy"; fi
+# -k: the agent doesn't trust the ledger's certificate, so without it a TLS
+# failure would pass this check even with a route to the ledger.
+if curl -sk --max-time 5 --noproxy '*' -o /dev/null "$LEDGER_URL/v1/accounts"; then flunk "reached the ledger without the proxy"; else pass "no route to the ledger without the proxy"; fi
 exit "$fail"
 INNER
+
+# No ledger key material in the agent's environment (checked by value).
+agent_env="$(docker compose run --rm -T --no-deps --entrypoint env agent)"
+leaked=0
+for v in "$LEDGER_AUDITOR_KEY_ID" "$LEDGER_AUDITOR_SECRET" "$LEDGER_OPERATOR_KEY_ID" "$LEDGER_OPERATOR_SECRET"; do
+  if echo "$agent_env" | grep -qF "$v"; then leaked=1; fi
+done
+if [ "$leaked" = 0 ]; then echo "ok   no ledger key material in the agent's env"; else echo "FAIL ledger key material in the agent's env"; status=1; fi
 
 echo; echo "--- coatcheck swap log"
 logs="$(docker compose logs coatcheck)"
@@ -75,6 +84,6 @@ signed="$(echo "$logs" | grep -c 'result=signed signing=hmac secrets=ledger' || 
 if [ "$signed" -ge 4 ]; then echo "ok   $signed result=signed signing=hmac lines"; else echo "FAIL expected >= 4 result=signed signing=hmac lines, got $signed"; status=1; fi
 check "signature-mismatch logged" 'result=signature-mismatch secrets=ledger'
 check "bearer literal logged as signing-skipped" 'result=signing-skipped secrets=ledger'
-if echo "$logs" | grep -q "$LEDGER_AUDITOR_SECRET"; then echo "FAIL the auditor secret appears in coatcheck's log"; status=1; else echo "ok   no secret in coatcheck's log"; fi
+if echo "$logs" | grep -qF -e "$LEDGER_AUDITOR_SECRET" -e "$LEDGER_AUDITOR_KEY_ID"; then echo "FAIL the auditor key appears in coatcheck's log"; status=1; else echo "ok   no key material in coatcheck's log"; fi
 [ "$status" = 0 ] && echo "smoke: PASS" || echo "smoke: FAIL"
 exit "$status"
