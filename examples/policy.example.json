@@ -6,6 +6,6 @@
     "github-*": { "allowed_hosts": ["api.github.com", "github.com"] }
   },
   "shared": {
-    "browserbase-api-key": { "allowed_hosts": ["api.browserbase.com"] }
+    "browserbase-api-key": { "allowed_hosts": ["api.browserbase.com"], "swap_headers": ["X-BB-API-Key"] }
   }
 }

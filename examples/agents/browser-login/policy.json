@@ -1,9 +1,9 @@
 {
   "secrets": {
-    "anthropic-api-key": { "allowed_hosts": ["api.anthropic.com"] },
+    "anthropic-api-key": { "allowed_hosts": ["api.anthropic.com"], "swap_headers": ["x-api-key"] },
     "the-internet-login": { "allowed_hosts": ["the-internet.herokuapp.com"] }
   },
   "shared": {
-    "browserbase-api-key": { "allowed_hosts": ["api.browserbase.com"] }
+    "browserbase-api-key": { "allowed_hosts": ["api.browserbase.com"], "swap_headers": ["X-BB-API-Key"] }
   }
 }

@@ -294,6 +294,14 @@ Done: the unused `http-proxy` dependency was removed during extraction.
     and the browser to trust its CA. Design sketch at the end of
     `docs/design/cdp-broker-login.md`.
 
+22. **[Done]** **Swap placement** (design: `docs/design/v1-decisions.md`,
+    "Swap placement"). Tickets are swapped only in `Authorization` /
+    `Proxy-Authorization` values by default; the URL and other headers are
+    opt-in per secret (`swap_url`, `swap_headers`, in-band `_swap_url`,
+    `_swap_headers`), like `swap_body`. Closes reflection through an allowed
+    host's echo of the path, a parameter or a custom header. Example policies
+    opt in `x-api-key` (Anthropic) and `X-BB-API-Key` (Browserbase).
+
 ## After 1.0
 
 - Single-use tickets, opt-in per secret.
@@ -310,6 +318,10 @@ Done: the unused `http-proxy` dependency was removed during extraction.
 ## Documented, not planned
 
 These are recorded as residual risk in `docs/THREAT_MODEL.md`:
+
+- HTTP(S) responses are not redacted, so an allowed host that echoes the
+  credential it authenticates with exposes it (item 22 keeps the agent from
+  choosing where a ticket lands; the operator chooses the hosts).
 
 - The `Host` header and SNI are not compared with the CONNECT target, and the
   policy never uses them.

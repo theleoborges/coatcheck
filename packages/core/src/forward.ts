@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { URL } from 'node:url';
-import type { TokenStore, SwapInfo, SwapResult } from './token-store.js';
+import type { HeadLocation, TokenStore, SwapInfo, SwapResult } from './token-store.js';
 import { DENIED_HEADER, hostMismatchBody, invalidValueBody, logBodyUnscanned, logSwapOutcome } from './swap-log.js';
 import { swapRequestBody } from './body-swap.js';
 import { headerFieldValue, percentEncodeUnsafe } from './value-encoding.js';
@@ -19,8 +19,8 @@ const HOP_BY_HOP = new Set([
 
 /**
  * Forward a plain-HTTP proxy request (`GET http://host/path`), swapping tickets
- * in the path, query and headers, and in the body for secrets that opt in
- * (`swap_body`). Tickets only swap for hosts their secret is bound to with an
+ * in the `Authorization` header, and in the path and query, other headers and
+ * the body for secrets that opt in (`swap_url`, `swap_headers`, `swap_body`). Tickets only swap for hosts their secret is bound to with an
  * `http://` entry; otherwise the request is answered `403` and never forwarded.
  * The body streams unless a `swap_body` ticket could apply; then it is
  * buffered up to `maxSwapBodyBytes` (design §3, "Swap-path hardening").
@@ -49,22 +49,24 @@ export function handleForwardRequest(
   const swaps: SwapInfo[] = [];
   const denied: SwapInfo[] = [];
   const invalid: SwapInfo[] = [];
+  const skipped: SwapInfo[] = [];
   let postSwapText = '';
   const record = (r: SwapResult): string => {
     swaps.push(...r.swaps);
     denied.push(...r.denied);
     invalid.push(...(r.invalid ?? []));
+    skipped.push(...(r.skipped ?? []));
     return r.output;
   };
-  const swap = (text: string, encode: (value: string) => string | null): string => {
-    const output = record(tokenStore.replaceAll(text, target, encode));
+  const swap = (text: string, location: HeadLocation, encode: (value: string) => string | null): string => {
+    const output = record(tokenStore.replaceAll(text, target, location, encode));
     postSwapText += output + '\n';
     return output;
   };
   // A ticket in `Authorization: Basic` is hidden by base64; open it first.
   const swapHeader = (name: string, value: string): string => {
     const basic = name === 'authorization' ? swapBasicCredentials(tokenStore, value, target) : null;
-    if (!basic) return swap(value, headerFieldValue);
+    if (!basic) return swap(value, { kind: 'header', name }, headerFieldValue);
     // The re-encoded base64 can't hold a ticket literal; log the decoded text.
     postSwapText += basic.userPass + '\n';
     return record(basic);
@@ -75,7 +77,8 @@ export function handleForwardRequest(
   // A real value may hold characters Node refuses in a request path (space,
   // non-ASCII), so those are percent-encoded; one that can't be a header value
   // (control characters) refuses the request.
-  const path = swap(parsed.pathname + parsed.search, percentEncodeUnsafe);
+  // Each ticket swaps only where its secret allows (`Authorization` by default).
+  const path = swap(parsed.pathname + parsed.search, { kind: 'url' }, percentEncodeUnsafe);
   const headers: http.OutgoingHttpHeaders = {};
   for (const [key, value] of Object.entries(stripHopByHop(req.headers))) {
     if (typeof value === 'string') headers[key] = swapHeader(key, value);
@@ -94,7 +97,7 @@ export function handleForwardRequest(
     }
   };
   if (denied.length > 0 || invalid.length > 0) {
-    logSwapOutcome('http', hostname, { swaps, denied, invalid }, postSwapText);
+    logSwapOutcome('http', hostname, { swaps, denied, invalid, skipped }, postSwapText);
     deny();
     return;
   }
@@ -136,7 +139,7 @@ export function handleForwardRequest(
   req.on('error', () => res.destroy());
   const hasBody = req.headers['content-length'] !== undefined || req.headers['transfer-encoding'] !== undefined;
   if (!hasBody || !tokenStore.hasLiveBodyTicketFor(target)) {
-    logSwapOutcome('http', hostname, { swaps, denied }, postSwapText);
+    logSwapOutcome('http', hostname, { swaps, denied, skipped }, postSwapText);
     const proxyReq = send();
     if (proxyReq) req.pipe(proxyReq);
     return;
@@ -153,7 +156,7 @@ export function handleForwardRequest(
     // with the client's framing.
     req.off('data', onData);
     req.off('end', onEnd);
-    logSwapOutcome('http', hostname, { swaps, denied }, postSwapText);
+    logSwapOutcome('http', hostname, { swaps, denied, skipped }, postSwapText);
     logBodyUnscanned('http', hostname, maxSwapBodyBytes);
     const proxyReq = send();
     if (!proxyReq) return;
@@ -162,7 +165,6 @@ export function handleForwardRequest(
   };
   const onEnd = () => {
     let body: Buffer = Buffer.concat(chunks);
-    let skipped: SwapInfo[] | undefined;
     const bodySwap = swapRequestBody(tokenStore, body, {
       contentType: firstHeader(req.headers['content-type']),
       contentEncoding: firstHeader(req.headers['content-encoding']),
@@ -170,7 +172,7 @@ export function handleForwardRequest(
     if (bodySwap) {
       swaps.push(...bodySwap.result.swaps);
       denied.push(...bodySwap.result.denied);
-      skipped = bodySwap.result.skipped;
+      skipped.push(...(bodySwap.result.skipped ?? []));
       postSwapText += bodySwap.result.output;
       body = bodySwap.body;
     }

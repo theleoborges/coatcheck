@@ -39,6 +39,17 @@ describe('parseSecretValue: _swap_body', () => {
   });
 });
 
+describe('parseSecretValue: _swap_url and _swap_headers', () => {
+  it('parses them and refuses invalid values', () => {
+    expect(parseSecretValue(JSON.stringify({ value: 'x', _swap_url: true, _swap_headers: ['X-Api-Key'] })))
+      .toEqual({ kind: 'simple', value: 'x', inBand: { swapUrl: true, swapHeaders: ['x-api-key'] } });
+    for (const bad of [{ _swap_url: 'true' }, { _swap_headers: 'x-api-key' }, { _swap_headers: [] }, { _swap_headers: ['a b'] }, { _swap_headers: ['host'] }]) {
+      const v = parseSecretValue(JSON.stringify({ value: 'x', ...bad }));
+      expect('error' in v.inBand, JSON.stringify(bad)).toBe(true);
+    }
+  });
+});
+
 describe('userFields', () => {
   it('hides every underscore-prefixed key', () => {
     expect(userFields({ a: 1, _cleartext: [], _allowed_hosts: [], _future: 1, b: 2 })).toEqual(['a', 'b']);
@@ -48,17 +59,17 @@ describe('userFields', () => {
 describe('resolveBinding', () => {
   it('refuses an unbound secret unless unbound secrets are allowed', () => {
     expect(resolveBinding('k', undefined, {}, false)).toMatchObject({ ok: false, status: 403, error: expect.stringContaining("'k' is not bound") });
-    expect(resolveBinding('k', undefined, {}, true)).toEqual({ ok: true, allowedHosts: undefined, swapBody: false });
+    expect(resolveBinding('k', undefined, {}, true)).toEqual({ ok: true, allowedHosts: undefined, swapBody: false, swapUrl: false, swapHeaders: [] });
   });
 
   it('uses whichever source is present', () => {
-    expect(resolveBinding('k', hosts('a.example.com'), {}, false)).toEqual({ ok: true, allowedHosts: hosts('a.example.com'), swapBody: false });
-    expect(resolveBinding('k', undefined, { hosts: hosts('b.example.com') }, false)).toEqual({ ok: true, allowedHosts: hosts('b.example.com'), swapBody: false });
+    expect(resolveBinding('k', hosts('a.example.com'), {}, false)).toEqual({ ok: true, allowedHosts: hosts('a.example.com'), swapBody: false, swapUrl: false, swapHeaders: [] });
+    expect(resolveBinding('k', undefined, { hosts: hosts('b.example.com') }, false)).toEqual({ ok: true, allowedHosts: hosts('b.example.com'), swapBody: false, swapUrl: false, swapHeaders: [] });
   });
 
   it('intersects the policy and in-band hosts: the secret can only narrow the operator', () => {
     const b = resolveBinding('k', hosts('*.example.com'), { hosts: hosts('api.example.com', 'attacker.example') }, false);
-    expect(b).toEqual({ ok: true, allowedHosts: hosts('api.example.com'), swapBody: false });
+    expect(b).toEqual({ ok: true, allowedHosts: hosts('api.example.com'), swapBody: false, swapUrl: false, swapHeaders: [] });
   });
 
   it('refuses an empty intersection with 403 and an invalid in-band list with 500', () => {
@@ -68,7 +79,7 @@ describe('resolveBinding', () => {
 
   it('enables body swapping when either source opts in and neither opts out', () => {
     const swap = (policy: boolean | undefined, inBand: boolean | undefined) => {
-      const b = resolveBinding('k', hosts('a.example.com'), inBand === undefined ? {} : { swapBody: inBand }, false, policy);
+      const b = resolveBinding('k', hosts('a.example.com'), inBand === undefined ? {} : { swapBody: inBand }, false, { swapBody: policy });
       return b.ok && b.swapBody;
     };
     expect(swap(undefined, undefined)).toBe(false);
@@ -84,5 +95,30 @@ describe('allowedHostsJson', () => {
   it('formats entries, or null when unbound', () => {
     expect(allowedHostsJson(hosts('api.github.com', 'http://*.svc.example.com'))).toEqual(['api.github.com', 'http://*.svc.example.com']);
     expect(allowedHostsJson(undefined)).toBeNull();
+  });
+
+  it('enables URL swapping when either source opts in and neither opts out', () => {
+    const swap = (policy: boolean | undefined, inBand: boolean | undefined) => {
+      const b = resolveBinding('k', hosts('a.example.com'), inBand === undefined ? {} : { swapUrl: inBand }, false, { swapUrl: policy });
+      return b.ok && b.swapUrl;
+    };
+    expect(swap(undefined, undefined)).toBe(false);
+    expect(swap(true, undefined)).toBe(true);
+    expect(swap(undefined, true)).toBe(true);
+    expect(swap(true, false)).toBe(false);
+    expect(swap(false, true)).toBe(false);
+  });
+
+  it('takes swap headers from either source, intersecting when both are present, minus the defaults', () => {
+    const headers = (policy: string[] | undefined, inBand: string[] | undefined) => {
+      const b = resolveBinding('k', hosts('a.example.com'), inBand ? { swapHeaders: inBand } : {}, false, { swapHeaders: policy });
+      return b.ok && b.swapHeaders;
+    };
+    expect(headers(undefined, undefined)).toEqual([]);
+    expect(headers(['x-b', 'x-a'], undefined)).toEqual(['x-a', 'x-b']);
+    expect(headers(undefined, ['x-a'])).toEqual(['x-a']);
+    // A secret can narrow the operator's list but never widen it.
+    expect(headers(['x-a', 'x-b'], ['x-b', 'x-evil'])).toEqual(['x-b']);
+    expect(headers(['authorization', 'x-a'], undefined)).toEqual(['x-a']);
   });
 });

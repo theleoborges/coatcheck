@@ -2,6 +2,8 @@ import http from 'node:http';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { oauthErrorCode, handleVaultRequest, VaultDeps } from './vault-handler.js';
 import { TokenStore } from './token-store.js';
+
+const AUTH = { kind: 'header', name: 'authorization' } as const;
 import { CdpSessionStore, type LoginRequest, type LoginResult } from './cdp-session-store.js';
 import { createMemoryProvider, type MemoryProviderInit } from './memory-provider.js';
 import { EMPTY_POLICY, parsePolicy, type Policy } from './policy.js';
@@ -343,13 +345,13 @@ describe('Vault Handler', () => {
   });
 
   it('issued multi-field tokens are swappable in strings', async () => {
-    await setup({ trello: JSON.stringify({ 'api-key': 'trello-key-123', 'token': 'trello-tok-456' }) });
+    await setup({ trello: JSON.stringify({ 'api-key': 'trello-key-123', 'token': 'trello-tok-456', _swap_url: true }) });
 
     const { body: b1 } = await fetchJSON(port, '/_vault/trello?field=api-key');
     const { body: b2 } = await fetchJSON(port, '/_vault/trello?field=token');
 
     const url = `https://api.trello.com/1/boards?key=${b1.token}&token=${b2.token}`;
-    const swapped = tokenStore.replaceAll(url, https('api.trello.com'));
+    const swapped = tokenStore.replaceAll(url, https('api.trello.com'), { kind: 'url' });
     expect(swapped.output).toBe('https://api.trello.com/1/boards?key=trello-key-123&token=trello-tok-456');
   });
 
@@ -370,7 +372,7 @@ describe('Vault Handler', () => {
       const { status, body } = await fetchJSON(port, '/_vault/unlisted-key');
       expect(status).toBe(200);
       expect(body.allowed_hosts).toBeNull();
-      expect(tokenStore.replaceAll(body.token as string, https('anything.example')).swaps).toEqual([
+      expect(tokenStore.replaceAll(body.token as string, https('anything.example'), AUTH).swaps).toEqual([
         { secretName: 'unlisted-key', ageMs: expect.any(Number), unbound: true },
       ]);
     });
@@ -380,8 +382,8 @@ describe('Vault Handler', () => {
       const { status, body } = await fetchJSON(port, '/_vault/github');
       expect(status).toBe(200);
       expect(body.allowed_hosts).toEqual(['api.github.com']);
-      expect(tokenStore.replaceAll(`${body.token}`, https('api.github.com')).output).toBe('ghp_real');
-      expect(tokenStore.replaceAll(`${body.token}`, https('attacker.example')).denied).toHaveLength(1);
+      expect(tokenStore.replaceAll(`${body.token}`, https('api.github.com'), AUTH).output).toBe('ghp_real');
+      expect(tokenStore.replaceAll(`${body.token}`, https('attacker.example'), AUTH).denied).toHaveLength(1);
     });
 
     it('binds a secret by its in-band _allowed_hosts alone, as a simple secret', async () => {
@@ -396,7 +398,7 @@ describe('Vault Handler', () => {
       await setup({ supabase: JSON.stringify({ key: 'k', _allowed_hosts: ['proj.supabase.co', 'attacker.example'] }) });
       const { body } = await fetchJSON(port, '/_vault/supabase?field=key');
       expect(body.allowed_hosts).toEqual(['proj.supabase.co']);
-      expect(tokenStore.replaceAll(`${body.token}`, https('attacker.example')).denied).toHaveLength(1);
+      expect(tokenStore.replaceAll(`${body.token}`, https('attacker.example'), AUTH).denied).toHaveLength(1);
     });
 
     it('refuses an empty intersection with 403 and an invalid _allowed_hosts with 500', async () => {
@@ -429,7 +431,7 @@ describe('Vault Handler', () => {
       await setup({}, { 'browserbase-api-key': 'bb_real' });
       const { body } = await fetchJSON(port, '/_secret/browserbase-api-key');
       expect(body.allowed_hosts).toEqual(['api.browserbase.com']);
-      expect(tokenStore.replaceAll(`${body.token}`, https('attacker.example')).denied).toHaveLength(1);
+      expect(tokenStore.replaceAll(`${body.token}`, https('attacker.example'), AUTH).denied).toHaveLength(1);
     });
 
     it('binds a web login to the policy hosts and refuses an unbound login', async () => {
@@ -504,10 +506,11 @@ describe('Vault Handler', () => {
     });
 
     it('issued shared-secret tokens are swappable in headers', async () => {
-      await setup({}, { 'browserbase-api-key': 'bb_live_xyz_real' });
+      await setup({}, { 'browserbase-api-key': JSON.stringify({ value: 'bb_live_xyz_real', _swap_headers: ['X-BB-API-Key'] }) });
       const { body } = await fetchJSON(port, '/_secret/browserbase-api-key');
+      expect(body.swap_headers).toEqual(['x-bb-api-key']);
       const header = `x-bb-api-key: ${body.token}\r\n`;
-      const swapped = tokenStore.replaceAll(header, https('api.browserbase.com'));
+      const swapped = tokenStore.replaceAll(header, https('api.browserbase.com'), { kind: 'header', name: 'x-bb-api-key' });
       expect(swapped.output).toBe('x-bb-api-key: bb_live_xyz_real\r\n');
     });
   });
@@ -805,8 +808,8 @@ describe('Vault Handler', () => {
         await setup({ google: googleSecret });
         const { body } = await fetchJSON(port, '/_vault/google/refresh', 'POST');
         expect(body.allowed_hosts).toEqual(['*.googleapis.com']);
-        expect(tokenStore.replaceAll(`${body.token}`, https('www.googleapis.com')).output).toBe('ya29.new-token');
-        expect(tokenStore.replaceAll(`${body.token}`, https('attacker.example')).denied).toHaveLength(1);
+        expect(tokenStore.replaceAll(`${body.token}`, https('www.googleapis.com'), AUTH).output).toBe('ya29.new-token');
+        expect(tokenStore.replaceAll(`${body.token}`, https('attacker.example'), AUTH).denied).toHaveLength(1);
       } finally {
         globalThis.fetch = originalFetch;
       }

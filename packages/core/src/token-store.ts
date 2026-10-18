@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { matchesHost, type HostPattern, type MatchTarget } from './host-matcher.js';
+import { DEFAULT_SWAP_HEADERS } from './secret-binding.js';
 
 /**
  * Prefix of every ticket id ("coatcheck ticket"). Distinctive so tickets are
@@ -28,6 +29,10 @@ interface TokenEntry {
   allowedHosts?: readonly HostPattern[];
   /** Also swapped in request bodies (opt-in per secret), snapshotted at mint. */
   swapBody: boolean;
+  /** Also swapped in the request line (opt-in per secret), snapshotted at mint. */
+  swapUrl: boolean;
+  /** Header names (lowercase) whose values it is swapped in: the defaults plus opt-ins. */
+  swapHeaders: ReadonlySet<string>;
 }
 
 export interface IssueOptions {
@@ -37,7 +42,20 @@ export interface IssueOptions {
   allowedHosts?: readonly HostPattern[];
   /** Also substitute in HTTP(S) request bodies (see replaceAllInBody). Default false. */
   swapBody?: boolean;
+  /** Also substitute in the request line (path and query). Default false. */
+  swapUrl?: boolean;
+  /** Header names to substitute in besides `Authorization` and `Proxy-Authorization`. */
+  swapHeaders?: readonly string[];
 }
+
+/**
+ * Where in a request a ticket sits. By default a ticket is swapped only in
+ * the value of an `Authorization` or `Proxy-Authorization` header; the request
+ * line, other headers and the body are opt-in per secret, because an upstream
+ * that reflects them (a 404 echoing the path, a stored query parameter) would
+ * hand the real value to the agent.
+ */
+export type HeadLocation = { kind: 'url' } | { kind: 'header'; name: string };
 
 export interface SessionValue {
   value: string;
@@ -54,6 +72,8 @@ export interface SwapInfo {
   ageMs: number;
   /** Set when the ticket carries no host binding (swapped for any host). */
   unbound?: true;
+  /** For a ticket skipped in a request head: where it sat (`url` or `header:<name>`). */
+  where?: string;
 }
 
 export interface SwapResult {
@@ -66,8 +86,9 @@ export interface SwapResult {
    */
   denied: SwapInfo[];
   /**
-   * replaceAllInBody only: tickets present in the body whose secret doesn't
-   * opt in to body swapping. Left as literals; they never deny.
+   * Tickets whose secret doesn't opt in to being swapped where they sit (the
+   * body, the request line, or a header other than the defaults). Left as
+   * literals. In a body they never deny; in a head a host mismatch still does.
    */
   skipped?: SwapInfo[];
   /**
@@ -89,6 +110,11 @@ export type ValueEncoder = (value: string) => string | null;
 function substitute(input: string, replacements: ReadonlyMap<string, string>): string {
   if (replacements.size === 0) return input;
   return input.replace(TICKET_PATTERN, id => replacements.get(id) ?? id);
+}
+
+/** Whether a ticket's secret is swapped at `location` in a request head. */
+function swappedAt(entry: TokenEntry, location: HeadLocation): boolean {
+  return location.kind === 'url' ? entry.swapUrl : entry.swapHeaders.has(location.name.toLowerCase());
 }
 
 /**
@@ -129,6 +155,8 @@ export class TokenStore {
       expiresAt: now + ttlSeconds * 1000,
       allowedHosts: opts.allowedHosts,
       swapBody: opts.swapBody ?? false,
+      swapUrl: opts.swapUrl ?? false,
+      swapHeaders: new Set([...DEFAULT_SWAP_HEADERS, ...(opts.swapHeaders ?? []).map(h => h.toLowerCase())]),
     });
 
     return { id, ttlSeconds };
@@ -148,7 +176,9 @@ export class TokenStore {
   /**
    * Replace all active token IDs in a string with their real values, for a
    * request going to `target` (the CONNECT target on HTTPS, the URL host on the
-   * forward path). This is the core of the proxy.
+   * forward path). This is the core of the proxy. `location` is where the
+   * string sits (the request line, or one header's value): tickets whose
+   * secret isn't swapped there are reported in `skipped` and left as literals.
    * Returns the rewritten string plus per-secret swap info so the call site can log
    * which secrets were swapped and how old the tokens were at swap time (diagnostic).
    * If any ticket present is bound to other hosts, nothing is swapped and the
@@ -157,8 +187,8 @@ export class TokenStore {
    * URL); when it returns null the value can't be represented there, nothing
    * is swapped, and the ticket is reported in `invalid`.
    */
-  replaceAll(input: string, target: MatchTarget, encode: ValueEncoder = v => v): SwapResult {
-    return this.replaceHttp(input, target, false, encode);
+  replaceAll(input: string, target: MatchTarget, location: HeadLocation, encode: ValueEncoder = v => v): SwapResult {
+    return this.replaceHttp(input, target, location, encode);
   }
 
   /**
@@ -168,10 +198,11 @@ export class TokenStore {
    * secrets are reported in `skipped` and left as literals.
    */
   replaceAllInBody(input: string, target: MatchTarget, encode: ValueEncoder): SwapResult {
-    return this.replaceHttp(input, target, true, encode);
+    return this.replaceHttp(input, target, 'body', encode);
   }
 
-  private replaceHttp(input: string, target: MatchTarget, body: boolean, encode: ValueEncoder): SwapResult {
+  private replaceHttp(input: string, target: MatchTarget, location: HeadLocation | 'body', encode: ValueEncoder): SwapResult {
+    const body = location === 'body';
     const swaps: SwapInfo[] = [];
     const denied: SwapInfo[] = [];
     const invalid: SwapInfo[] = [];
@@ -191,6 +222,10 @@ export class TokenStore {
         denied.push(info);
         continue;
       }
+      if (!body && !swappedAt(entry, location)) {
+        skipped.push({ ...info, where: location.kind === 'url' ? 'url' : `header:${location.name.toLowerCase()}` });
+        continue;
+      }
       const value = encode(entry.realValue);
       if (value === null) {
         invalid.push(info);
@@ -200,7 +235,7 @@ export class TokenStore {
       swaps.push(info);
     }
 
-    const extra = { ...(body ? { skipped } : {}), ...(invalid.length > 0 ? { invalid } : {}) };
+    const extra = { ...(body || skipped.length > 0 ? { skipped } : {}), ...(invalid.length > 0 ? { invalid } : {}) };
     if (denied.length > 0 || invalid.length > 0) return { output: input, swaps: [], denied, ...extra };
     return { output: substitute(input, replacements), swaps, denied, ...extra };
   }

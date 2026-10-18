@@ -4,6 +4,8 @@ import { headerFieldValue } from './value-encoding.js';
 
 const BASIC_CREDENTIALS = /^(basic[ \t]+)([A-Za-z0-9+/]+={0,2})([ \t]*)$/i;
 const AUTHORIZATION_FIELD = /^(authorization:[ \t]*)(.*)$/i;
+/** A Basic credential sits in `Authorization`, where every ticket is swapped by default. */
+const AUTHORIZATION = { kind: 'header', name: 'authorization' } as const;
 
 /** A Basic swap's outcome; `userPass` is the decoded credential after the swap, for spotting un-swapped literals in logs. */
 export type BasicSwapResult = SwapResult & { userPass: string };
@@ -47,8 +49,8 @@ export function swapBasicCredentials(store: TokenStore, value: string, target: M
   }
 
   const colon = decoded.indexOf(':');
-  const user = store.replaceAll(colon === -1 ? decoded : decoded.slice(0, colon), target, userIdValue);
-  const pass = colon === -1 ? null : store.replaceAll(decoded.slice(colon + 1), target, passwordValue);
+  const user = store.replaceAll(colon === -1 ? decoded : decoded.slice(0, colon), target, AUTHORIZATION, userIdValue);
+  const pass = colon === -1 ? null : store.replaceAll(decoded.slice(colon + 1), target, AUTHORIZATION, passwordValue);
 
   const parts = pass ? [user, pass] : [user];
   const denied = parts.flatMap(p => p.denied);

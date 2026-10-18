@@ -34,6 +34,29 @@ describe('parsePolicy', () => {
       .toEqual([expect.stringContaining('secrets["a"].swap_body must be true or false')]);
   });
 
+  it('parses swap_url and swap_headers, lowercasing header names, and refuses bad values', () => {
+    const { policy, problems } = parse({
+      secrets: { a: { allowed_hosts: ['a.example.com'], swap_url: true, swap_headers: ['X-Api-Key', 'x-api-key'] } },
+      shared: { s: { allowed_hosts: ['s.example.com'], swap_headers: ['X-BB-API-Key'] } },
+    });
+    expect(problems).toEqual([]);
+    expect(policyRuleFor(policy, 'a')).toMatchObject({ swapUrl: true, swapHeaders: ['x-api-key'] });
+    expect(policy.shared.get('s')).toMatchObject({ swapHeaders: ['x-bb-api-key'] });
+    expect(parse({
+      secrets: {
+        a: { allowed_hosts: ['a.example.com'], swap_url: 'yes' },
+        b: { allowed_hosts: ['b.example.com'], swap_headers: [] },
+        c: { allowed_hosts: ['c.example.com'], swap_headers: ['bad name'] },
+        d: { allowed_hosts: ['d.example.com'], swap_headers: ['Host'] },
+      },
+    }).problems).toEqual([
+      expect.stringContaining('secrets["a"].swap_url must be true or false'),
+      expect.stringContaining('secrets["b"].swap_headers must be a non-empty array'),
+      expect.stringContaining('secrets["c"].swap_headers [0] "bad name": not a header name'),
+      expect.stringContaining('secrets["d"].swap_headers [0] "host": a value can\'t be swapped into Host'),
+    ]);
+  });
+
   it('accepts an empty object', () => {
     expect(parse({}).problems).toEqual([]);
   });

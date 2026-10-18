@@ -1,5 +1,6 @@
 import { parseHostPattern, type HostPattern } from './host-matcher.js';
 import { isValidSecretName } from './secret-provider.js';
+import { parseSwapHeaders, type SwapSettings } from './secret-binding.js';
 
 /**
  * The operator's policy file (`COATCHECK_POLICY_FILE`): allowed hosts per secret
@@ -12,19 +13,19 @@ export interface Policy {
   shared: ReadonlyMap<string, SharedRule>;
 }
 
-export interface SharedRule {
+/**
+ * Explicit `swap_body`, `swap_url` and `swap_headers` (where a ticket is
+ * swapped, design §3) are each undefined when absent.
+ */
+export interface SharedRule extends SwapSettings {
   allowedHosts: HostPattern[];
-  /** Explicit `swap_body`; undefined when absent. */
-  swapBody?: boolean;
 }
 
-export interface PolicyRule {
+export interface PolicyRule extends SwapSettings {
   /** Exact name, or prefix when `wildcard`. */
   name: string;
   wildcard: boolean;
   allowedHosts: HostPattern[];
-  /** Explicit `swap_body` (request body substitution, design §3); undefined when absent. */
-  swapBody?: boolean;
 }
 
 export const EMPTY_POLICY: Policy = { secrets: [], shared: new Map() };
@@ -62,8 +63,8 @@ export function parsePolicy(text: string, problems: string[], source = 'policy f
       continue;
     }
     const hosts = allowedHosts(entry, `secrets["${name}"]`, source, problems);
-    const swapBody = swapBodyOf(entry, `secrets["${name}"]`, source, problems);
-    if (hosts) secrets.push({ name: base, wildcard, allowedHosts: hosts, ...(swapBody === undefined ? {} : { swapBody }) });
+    const swap = swapSettingsOf(entry, `secrets["${name}"]`, source, problems);
+    if (hosts) secrets.push({ name: base, wildcard, allowedHosts: hosts, ...swap });
   }
 
   const shared = new Map<string, SharedRule>();
@@ -73,8 +74,8 @@ export function parsePolicy(text: string, problems: string[], source = 'policy f
       continue;
     }
     const hosts = allowedHosts(entry, `shared["${name}"]`, source, problems);
-    const swapBody = swapBodyOf(entry, `shared["${name}"]`, source, problems);
-    if (hosts) shared.set(name, { allowedHosts: hosts, ...(swapBody === undefined ? {} : { swapBody }) });
+    const swap = swapSettingsOf(entry, `shared["${name}"]`, source, problems);
+    if (hosts) shared.set(name, { allowedHosts: hosts, ...swap });
   }
 
   return { secrets, shared };
@@ -125,8 +126,8 @@ function allowedHosts(entry: Json, where: string, source: string, problems: stri
     return null;
   }
   for (const key of Object.keys(entry)) {
-    if (key !== 'allowed_hosts' && key !== 'swap_body') {
-      problems.push(`${source}: ${where}: unknown key '${key}' (allowed: allowed_hosts, swap_body)`);
+    if (!ENTRY_KEYS.includes(key)) {
+      problems.push(`${source}: ${where}: unknown key '${key}' (allowed: ${ENTRY_KEYS.join(', ')})`);
     }
   }
   const list = entry.allowed_hosts;
@@ -143,11 +144,21 @@ function allowedHosts(entry: Json, where: string, source: string, problems: stri
   return out.length === list.length ? out : null;
 }
 
-function swapBodyOf(entry: Json, where: string, source: string, problems: string[]): boolean | undefined {
-  if (!isObject(entry) || entry.swap_body === undefined) return undefined;
-  if (typeof entry.swap_body !== 'boolean') {
-    problems.push(`${source}: ${where}.swap_body must be true or false`);
-    return undefined;
+const ENTRY_KEYS = ['allowed_hosts', 'swap_body', 'swap_url', 'swap_headers'];
+
+/** The entry's explicit swap settings; keys that are absent or invalid are left out. */
+function swapSettingsOf(entry: Json, where: string, source: string, problems: string[]): SwapSettings {
+  const out: SwapSettings = {};
+  if (!isObject(entry)) return out;
+  for (const [key, field] of [['swap_body', 'swapBody'], ['swap_url', 'swapUrl']] as const) {
+    if (entry[key] === undefined) continue;
+    if (typeof entry[key] !== 'boolean') problems.push(`${source}: ${where}.${key} must be true or false`);
+    else out[field] = entry[key];
   }
-  return entry.swap_body;
+  if (entry.swap_headers !== undefined) {
+    const headers = parseSwapHeaders(entry.swap_headers);
+    if (typeof headers === 'string') problems.push(`${source}: ${where}.swap_headers ${headers}`);
+    else out.swapHeaders = headers;
+  }
+  return out;
 }
