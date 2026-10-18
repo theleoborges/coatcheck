@@ -77,7 +77,15 @@ The same demo runs against the AWS provider with [LocalStack](https://github.com
 docker compose -f examples/docker-compose.localstack.yml up --build
 ```
 
-**Getting coatcheck.** The `@coatcheck/*` packages aren't on npm yet and there is no published image: build the image from this repository (`docker build -t coatcheck .`) or run from source (see [Development](#development)).
+**Getting coatcheck.** The broker is `@coatcheck/core` (the `coatcheck` bin); secret backends are separate packages installed alongside it and picked by `COATCHECK_PROVIDER` ([Secret providers](#secret-providers)):
+
+```bash
+npm install -g @coatcheck/core @coatcheck/provider-env   # env + file providers
+npm install -g @coatcheck/provider-aws                   # add for COATCHECK_PROVIDER=aws
+COATCHECK_PROVIDER=env COATCHECK_SECRET_EXAMPLE_API_KEY=sk-demo coatcheck
+```
+
+Node ≥ 24. There is no published container image yet: build one from this repository (`docker build -t coatcheck .`, as the compose files do) or run from source (see [Development](#development)).
 
 ## Example agents
 

@@ -1,6 +1,11 @@
 # @coatcheck/core
 
-The coatcheck broker: HTTPS MITM proxy, vault API, tickets, CA, and CDP proxy, plus the `coatcheck` bin. Secret backends are separate packages loaded at startup by `COATCHECK_PROVIDER` (`@coatcheck/provider-env`, `@coatcheck/provider-aws`, or your own module). See the [main README](../../README.md).
+The coatcheck broker: HTTPS MITM proxy, vault API, tickets, CA, and CDP proxy, plus the `coatcheck` bin. Secret backends are separate packages loaded at startup by `COATCHECK_PROVIDER` (`@coatcheck/provider-env`, `@coatcheck/provider-aws`, or your own module). See the [main README](https://github.com/theleoborges/coatcheck#readme).
+
+```bash
+npm install -g @coatcheck/core @coatcheck/provider-env   # the `coatcheck` bin + the env and file providers
+COATCHECK_PROVIDER=env COATCHECK_SECRET_EXAMPLE_API_KEY=… coatcheck
+```
 
 Embedding:
 

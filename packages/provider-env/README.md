@@ -1,6 +1,11 @@
 # @coatcheck/provider-env
 
-coatcheck secret providers with no cloud dependency. Both ship in the coatcheck Docker image.
+coatcheck secret providers with no cloud dependency. Both ship in the coatcheck Docker image. See the [main README](https://github.com/theleoborges/coatcheck#readme).
+
+```bash
+npm install -g @coatcheck/core @coatcheck/provider-env
+COATCHECK_PROVIDER=env COATCHECK_SECRET_EXAMPLE_API_KEY=… coatcheck
+```
 
 ## `env` (`COATCHECK_PROVIDER=env`)
 

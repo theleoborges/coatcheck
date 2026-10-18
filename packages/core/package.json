@@ -8,7 +8,28 @@
     "url": "git+https://github.com/theleoborges/coatcheck.git",
     "directory": "packages/core"
   },
-  "private": true,
+  "homepage": "https://github.com/theleoborges/coatcheck#readme",
+  "bugs": {
+    "url": "https://github.com/theleoborges/coatcheck/issues"
+  },
+  "keywords": [
+    "secrets",
+    "credentials",
+    "credential-broker",
+    "ai-agents",
+    "agents",
+    "proxy",
+    "https-proxy",
+    "mitm",
+    "cdp",
+    "playwright",
+    "browser-automation",
+    "sidecar",
+    "security"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "engines": {
     "node": ">=24"

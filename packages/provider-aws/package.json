@@ -8,7 +8,24 @@
     "url": "git+https://github.com/theleoborges/coatcheck.git",
     "directory": "packages/provider-aws"
   },
-  "private": true,
+  "homepage": "https://github.com/theleoborges/coatcheck#readme",
+  "bugs": {
+    "url": "https://github.com/theleoborges/coatcheck/issues"
+  },
+  "keywords": [
+    "coatcheck",
+    "secrets",
+    "aws",
+    "ssm",
+    "parameter-store",
+    "secrets-manager",
+    "sts",
+    "assume-role",
+    "ai-agents"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "engines": {
     "node": ">=24"
