@@ -4,9 +4,9 @@ Credential broker sidecar for AI agents. The agent never holds real secrets: it 
 
 ## Origin
 
-Extracted (with history, via `git filter-repo`) from `packages/secret-proxy` in a private monorepo for Liv, an AI chief-of-staff product that has since shut down. In Liv it ran as an ECS Fargate sidecar next to each user's agent. The deployment-specific values it carried (store path prefixes, `AGENT_LABEL`, CA subject, dashboard URL) are now configuration with neutral `coatcheck` defaults (`packages/core/src/config.ts`, `packages/provider-aws/src/index.ts`). Never reintroduce Liv-specific names, hostnames, or user data.
+Extracted (with history, via `git filter-repo`) from a private monorepo, where it ran as an ECS Fargate sidecar next to each user's agent in a product that has since shut down. The deployment-specific values it carried (store path prefixes, `AGENT_LABEL`, CA subject, dashboard URL) are now configuration with neutral `coatcheck` defaults (`packages/core/src/config.ts`, `packages/provider-aws/src/index.ts`). Never reintroduce names, hostnames, or user data from that deployment.
 
-Repo is **private** until we're ready to publish. Target license Apache-2.0.
+Public repo, Apache-2.0. Published to npm as `@coatcheck/*` (see "Positioning").
 
 ## Positioning (decided)
 
@@ -61,7 +61,7 @@ npm workspaces (`packages/*`), TypeScript project references (`tsc -b`). Core ne
 1. ~~**Tickets are not bound to destination hosts**~~ — fixed on HTTP(S) (roadmap item 9): tickets snapshot allowed hosts (policy ∩ in-band `_allowed_hosts`), unbound secrets are refused at mint, and the MITM/forward paths deny mismatches with `403`. On CDP there are no credential tickets at all: coatcheck performs the login itself (roadmap item 20, `docs/design/cdp-broker-login.md`), checking the page's committed origin against the login secret's allowed hosts.
 2. ~~**Shell injection / path traversal in `ca.ts`**~~ — fixed: strict `CONNECT` target validation (`connect-target.ts`) and in-process cert generation (`ca.ts`, no `openssl`).
 3. ~~**Plain-HTTP forward path also swaps**~~ — fixed with gap 1: plaintext only matches `http://` entries, so an agent-run loopback listener never receives a value (test in `server.test.ts`).
-4. **The AWS "sidecar assumes a separate role" pattern Liv used was bypassable** — both containers in an ECS task share one task role, and that role was allowed `sts:AssumeRole` on the proxy role, so the agent could assume it directly. `docs/THREAT_MODEL.md` documents correct patterns (separate task, ExternalId only injected into the sidecar, blocking 169.254.170.2); `docs/deploy/aws-ecs.md` is the reference deployment and provider-aws supports `COATCHECK_AWS_EXTERNAL_ID` (warns without it). Any AWS deployment guide/provider must not repeat this.
+4. **The AWS "sidecar assumes a separate role" pattern the original deployment used was bypassable** — both containers in an ECS task share one task role, and that role was allowed `sts:AssumeRole` on the proxy role, so the agent could assume it directly. `docs/THREAT_MODEL.md` documents correct patterns (separate task, ExternalId only injected into the sidecar, blocking 169.254.170.2); `docs/deploy/aws-ecs.md` is the reference deployment and provider-aws supports `COATCHECK_AWS_EXTERNAL_ID` (warns without it). Any AWS deployment guide/provider must not repeat this.
 
 Full list with severities: `docs/THREAT_MODEL.md`. Proxy integration tests (MITM, passthrough, forward, `connectUrl` rewrite): `packages/core/src/server.test.ts`.
 
