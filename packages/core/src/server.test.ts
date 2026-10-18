@@ -1150,6 +1150,93 @@ describe('coatcheck server: swap-path hardening', () => {
   });
 });
 
+describe('coatcheck server: Basic auth', () => {
+  const basic = (user: string, pass: string) => `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
+
+  it('swaps a ticket inside Authorization: Basic on the MITM path (git credential helper)', async () => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy();
+    const tok = tokenStore.issue('github-token', 'ghp_REAL_VALUE', { allowedHosts: hosts('127.0.0.1') }).id;
+
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(`GET /org/repo.git/info/refs HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: ${basic('x-access-token', tok)}\r\n\r\n`);
+    const [res] = await readResponses(t, 1);
+    expect((JSON.parse(res.body) as Echo).headers.authorization).toBe(basic('x-access-token', 'ghp_REAL_VALUE'));
+    expect(logs).toContainEqual(expect.stringContaining('[swap] scheme=https host=127.0.0.1 result=hit secrets=github-token'));
+    expect(logs.join('\n')).not.toContain('ghp_REAL_VALUE');
+  });
+
+  it('blocks the exfiltration over HTTPS: a Basic-wrapped ticket sent to another host is refused', async () => {
+    const logs = captureLogs();
+    const upstream = await startHttpsUpstream(); // stands in for attacker.example
+    const { tokenStore, port } = await startProxy({ mitm: 'always' });
+    const tok = tokenStore.issue('github-token', 'ghp_REAL_VALUE', { allowedHosts: hosts('api.github.com') }).id;
+
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(`GET / HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: ${basic('u', tok)}\r\n\r\n`);
+    const [res] = await readResponses(t, 1);
+    expect(res.head).toMatch(/^HTTP\/1\.1 403 /);
+    expect(res.head).toMatch(/\r\nX-Coatcheck-Denied: host-mismatch\r\n/i);
+    expect(upstream.received).toHaveLength(0);
+    expect(logs).toContainEqual(expect.stringContaining('[swap] scheme=https host=127.0.0.1 result=denied secrets=github-token'));
+    expect(logs.join('\n')).not.toContain('ghp_REAL_VALUE');
+  });
+
+  it('swaps on the forward path for http:// bindings and refuses a plaintext listener otherwise', async () => {
+    captureLogs();
+    const upstream = await startHttpUpstream();
+    const { tokenStore, port } = await startProxy();
+    const plain = tokenStore.issue('k', 'real-http', { allowedHosts: hosts('http://127.0.0.1') }).id;
+    const tlsOnly = tokenStore.issue('github-token', 'ghp_REAL_VALUE', { allowedHosts: hosts('127.0.0.1') }).id;
+
+    const ok = await viaProxy(port, `http://127.0.0.1:${upstream.port}/`, { authorization: basic('me@example.com', plain) });
+    expect(ok.status).toBe(200);
+    expect(upstream.received[0].headers.authorization).toBe(basic('me@example.com', 'real-http'));
+
+    const refused = await viaProxy(port, `http://127.0.0.1:${upstream.port}/`, { authorization: basic('u', tlsOnly) });
+    expect(refused.status).toBe(403);
+    expect(refused.headers['x-coatcheck-denied']).toBe('host-mismatch');
+    expect(upstream.received).toHaveLength(1);
+  });
+
+  it('logs a miss for an unknown or expired ticket inside a Basic credential, on both paths', async () => {
+    const logs = captureLogs();
+    const https = await startHttpsUpstream();
+    const plain = await startHttpUpstream();
+    const { port } = await startProxy({ mitm: 'always' });
+    const stale = `cct_${'ab'.repeat(32)}`;
+
+    const { socket } = await connect(port, `127.0.0.1:${https.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(`GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: ${basic('u', stale)}\r\n\r\n`);
+    await readResponses(t, 1);
+    expect(https.received[0].headers.authorization).toBe(basic('u', stale));
+    expect(logs).toContainEqual(expect.stringContaining('[swap] scheme=https host=127.0.0.1 result=miss unswapped_ticket_literals=1'));
+
+    expect((await viaProxy(port, `http://127.0.0.1:${plain.port}/`, { authorization: basic('u', stale) })).status).toBe(200);
+    expect(logs).toContainEqual(expect.stringContaining('[swap] scheme=http host=127.0.0.1 result=miss unswapped_ticket_literals=1'));
+    expect(logs.join('\n')).not.toContain(stale);
+  });
+
+  it('refuses a value with ":" in the Basic user-id instead of moving the user/password split', async () => {
+    captureLogs();
+    const upstream = await startHttpsUpstream();
+    const { tokenStore, port } = await startProxy();
+    const tok = tokenStore.issue('user', 'admin:extra', { allowedHosts: hosts('127.0.0.1') }).id;
+
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    t.write(`GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: ${basic(tok, 'pw')}\r\n\r\n`);
+    const [res] = await readResponses(t, 1);
+    expect(res.head).toMatch(/^HTTP\/1\.1 403 /);
+    expect(res.head).toMatch(/X-Coatcheck-Denied: invalid-value/i);
+    expect(upstream.received).toEqual([]);
+  });
+});
+
 describe('coatcheck server: API token', () => {
   const TOKEN = 'test-api-token-0123456789abcdef0123456789';
   const basic = (user: string, pass: string) => `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;

@@ -1,9 +1,10 @@
 import http from 'node:http';
 import { URL } from 'node:url';
-import type { TokenStore, SwapInfo } from './token-store.js';
+import type { TokenStore, SwapInfo, SwapResult } from './token-store.js';
 import { DENIED_HEADER, hostMismatchBody, invalidValueBody, logBodyUnscanned, logSwapOutcome } from './swap-log.js';
 import { swapRequestBody } from './body-swap.js';
 import { headerFieldValue, percentEncodeUnsafe } from './value-encoding.js';
+import { swapBasicCredentials } from './basic-auth.js';
 
 /**
  * Hop-by-hop headers (RFC 9110 §7.6.1) that must not be forwarded, plus
@@ -49,13 +50,24 @@ export function handleForwardRequest(
   const denied: SwapInfo[] = [];
   const invalid: SwapInfo[] = [];
   let postSwapText = '';
-  const swap = (text: string, encode: (value: string) => string | null): string => {
-    const r = tokenStore.replaceAll(text, target, encode);
+  const record = (r: SwapResult): string => {
     swaps.push(...r.swaps);
     denied.push(...r.denied);
     invalid.push(...(r.invalid ?? []));
-    postSwapText += r.output + '\n';
     return r.output;
+  };
+  const swap = (text: string, encode: (value: string) => string | null): string => {
+    const output = record(tokenStore.replaceAll(text, target, encode));
+    postSwapText += output + '\n';
+    return output;
+  };
+  // A ticket in `Authorization: Basic` is hidden by base64; open it first.
+  const swapHeader = (name: string, value: string): string => {
+    const basic = name === 'authorization' ? swapBasicCredentials(tokenStore, value, target) : null;
+    if (!basic) return swap(value, headerFieldValue);
+    // The re-encoded base64 can't hold a ticket literal; log the decoded text.
+    postSwapText += basic.userPass + '\n';
+    return record(basic);
   };
 
   // Only the path and query: a ticket in the host or userinfo is left as a
@@ -66,8 +78,8 @@ export function handleForwardRequest(
   const path = swap(parsed.pathname + parsed.search, percentEncodeUnsafe);
   const headers: http.OutgoingHttpHeaders = {};
   for (const [key, value] of Object.entries(stripHopByHop(req.headers))) {
-    if (typeof value === 'string') headers[key] = swap(value, headerFieldValue);
-    else if (Array.isArray(value)) headers[key] = value.map(v => swap(v, headerFieldValue));
+    if (typeof value === 'string') headers[key] = swapHeader(key, value);
+    else if (Array.isArray(value)) headers[key] = value.map(v => swapHeader(key, v));
   }
   headers.host = parsed.host;
 

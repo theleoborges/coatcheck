@@ -102,13 +102,16 @@ curl -H "Authorization: Bearer $TOK" https://api.example.com/v1/items
 curl -H "Authorization: token $TOK"  https://api.example.com/v1/items
 curl -H "X-API-Key: $TOK"            https://api.example.com/v1/items
 curl "https://api.example.com/v1/items?api_key=$TOK"
+curl -u "me@example.com:$TOK"        https://api.example.com/v1/items   # Basic: decoded, swapped, re-encoded
 ```
+
+A ticket in `Authorization: Basic` (`curl -u`, `https://user:$TOK@host/`,
+`.netrc`, git credential helpers) is swapped in the user name or password.
+A real value with a control character, or a `:` in the user name slot, is
+refused with `403 invalid-value`.
 
 Fails silently (the upstream receives `cct_…` and returns 401/403):
 
-- **HTTP Basic auth.** `curl -u user:$TOK`, `https://user:$TOK@host/`,
-  `.netrc`, credential helpers. The client base64-encodes `user:cct_…` into
-  `Authorization: Basic …`, which hides the literal.
 - **Ticket in the request body**, unless the secret opts in (`swap_body` in
   the policy file or `_swap_body: true` in the secret; the ticket response
   then shows `"swap_body": true`). Without it, the body is forwarded
@@ -280,28 +283,30 @@ Rules:
 
 ## 7. git over HTTPS
 
-git defaults to Basic auth, which hides the ticket. Send it as a Bearer header
-instead. GitHub, GitLab, Gitea, and Bitbucket Cloud accept Bearer tokens for
-smart-HTTP.
+git sends credentials as `Authorization: Basic`. coatcheck decodes Basic
+credentials, swaps tickets in the user name or password, and re-encodes them,
+so a credential helper can hand git a ticket as the password. Mint a fresh one
+per request so a cached ticket never outlives its TTL:
+
+```bash
+# The empty entry drops earlier helpers (e.g. osxkeychain), which would store
+# the ticket and hand it back after it expires.
+git config --global --add credential.https://git.example.com.helper ''
+git config --global --add credential.https://git.example.com.helper \
+  '!f() { test "$1" = get || exit 0; echo username=x-access-token;
+          echo "password=$(curl -sf http://127.0.0.1:3128/_vault/git-token | jq -er .token)"; }; f'
+git clone https://git.example.com/org/repo.git
+```
+
+(`x-access-token` is GitHub's convention for a token as the password; most
+hosts accept any user name with a token.) `GIT_ASKPASS` and `.netrc` work the
+same way, but a ticket written to a file expires after 15 minutes. A Bearer
+header works too, on hosts that accept Bearer tokens for smart-HTTP:
 
 ```bash
 TOK=$(curl -sf http://127.0.0.1:3128/_vault/git-token | jq -er .token)
 git -c http.extraHeader="Authorization: Bearer ${TOK}" clone https://git.example.com/org/repo.git
 ```
-
-`-c` scopes the header to one invocation; nothing is written to
-`~/.gitconfig`. For a multi-step workflow:
-
-```bash
-git_auth() { git -c http.extraHeader="Authorization: Bearer ${TOK}" "$@"; }
-git_auth clone https://git.example.com/org/repo.git
-cd repo
-# local commands need no auth
-git_auth push
-```
-
-Do not use any of these with a ticket: `https://user:$TOK@host/…`, a
-credential helper, `GIT_ASKPASS`, `.netrc`. All end in Basic auth.
 
 ## 8. Shell wrapper example
 

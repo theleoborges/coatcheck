@@ -13,6 +13,7 @@ import type { MitmMode } from './config.js';
 import { ChunkedDecoder, parseRequestHead, type RequestHead } from './http1-framing.js';
 import { swapRequestBody } from './body-swap.js';
 import { headerFieldValue, percentEncodeUnsafe } from './value-encoding.js';
+import { swapBasicFieldLine, type BasicSwapResult } from './basic-auth.js';
 import type { SwapInfo } from './token-store.js';
 import { DENIED_HEADER, hostMismatchBody, uninspectableBodyBody, invalidValueBody, logBodyUnscanned, logSwapOutcome, type SwapOutcome } from './swap-log.js';
 
@@ -65,8 +66,11 @@ type BodyState =
       remaining: number;
       decoder?: ChunkedDecoder;
       head: RequestHead;
-      /** The head's swap outcome; `output` is the swapped head, without the final CRLFCRLF. */
-      headOutcome: SwapOutcome & { output: string };
+      /**
+       * The head's swap outcome; `output` is the swapped head, without the
+       * final CRLFCRLF; `logText` adds decoded Basic credentials, for the miss log.
+       */
+      headOutcome: SwapOutcome & { output: string; logText: string };
       raw: Buffer[];
       rawBytes: number;
       data: Buffer[];
@@ -252,7 +256,7 @@ export function createConnectHandler(deps: MitmDeps) {
 
         const swapped = swapHead(head);
         if (swapped.denied.length > 0 || swapped.invalid.length > 0) {
-          logSwapOutcome('https', hostname, swapped, swapped.output);
+          logSwapOutcome('https', hostname, swapped, swapped.logText);
           denyForSwaps(swapped.denied, swapped.invalid);
           return;
         }
@@ -269,7 +273,7 @@ export function createConnectHandler(deps: MitmDeps) {
         // A declared length past the cap is known uninspectable from the head,
         // so it is refused here rather than after holding a cap's worth of it.
         if (adapterReq && framing.kind === 'length' && framing.length > maxSwapBodyBytes) {
-          logSwapOutcome('https', hostname, swapped, swapped.output);
+          logSwapOutcome('https', hostname, swapped, swapped.logText);
           denyUninspectable(`larger than ${maxSwapBodyBytes} bytes`);
           return;
         }
@@ -277,7 +281,7 @@ export function createConnectHandler(deps: MitmDeps) {
           body = { mode: 'buffer', remaining, decoder, head, headOutcome: swapped, raw: [], rawBytes: 0, data: [], adapterReq };
           continue;
         }
-        logSwapOutcome('https', hostname, swapped, swapped.output);
+        logSwapOutcome('https', hostname, swapped, swapped.logText);
         sendUpstream(Buffer.from(swapped.output + '\r\n\r\n'));
         if (hasBody) body = { mode: 'stream', remaining, decoder };
         else finishRequest();
@@ -287,17 +291,27 @@ export function createConnectHandler(deps: MitmDeps) {
     /**
      * Swap tickets in a head: in the request line (values percent-encoded, as
      * on the forward path) and in the header fields (values that can't be a
-     * field value are refused).
+     * field value are refused). `Authorization: Basic` credentials are
+     * decoded, swapped and re-encoded first (base64 hides their tickets).
      */
     function swapHead(head: RequestHead) {
       const line = tokenStore.replaceAll(head.requestLine, swapTarget, percentEncodeUnsafe);
-      const fields = tokenStore.replaceAll(head.fieldLines.join('\r\n'), swapTarget, headerFieldValue);
+      const basic: BasicSwapResult[] = [];
+      const fieldLines = head.fieldLines.map(l => {
+        const r = swapBasicFieldLine(tokenStore, l, swapTarget);
+        if (!r) return l;
+        basic.push(r);
+        return r.output;
+      });
+      const fields = tokenStore.replaceAll(fieldLines.join('\r\n'), swapTarget, headerFieldValue);
+      const parts = [line, ...basic, fields];
       const output = head.fieldLines.length > 0 ? `${line.output}\r\n${fields.output}` : line.output;
       return {
         output,
-        swaps: [...line.swaps, ...fields.swaps],
-        denied: [...line.denied, ...fields.denied],
-        invalid: [...(line.invalid ?? []), ...(fields.invalid ?? [])],
+        logText: [output, ...basic.map(b => b.userPass)].join('\n'),
+        swaps: parts.flatMap(p => p.swaps),
+        denied: parts.flatMap(p => p.denied),
+        invalid: parts.flatMap(p => p.invalid ?? []),
       };
     }
 
@@ -330,12 +344,12 @@ export function createConnectHandler(deps: MitmDeps) {
         if (state.rawBytes > maxSwapBodyBytes) {
           if (state.adapterReq) {
             // An adapter-host body past the cap can't be inspected: refuse it.
-            logSwapOutcome('https', hostname, state.headOutcome, state.headOutcome.output);
+            logSwapOutcome('https', hostname, state.headOutcome, state.headOutcome.logText);
             denyUninspectable(`larger than ${maxSwapBodyBytes} bytes`);
             return true;
           }
           // Too large to hold: forward what we have and stream the rest unscanned.
-          logSwapOutcome('https', hostname, state.headOutcome, state.headOutcome.output);
+          logSwapOutcome('https', hostname, state.headOutcome, state.headOutcome.logText);
           logBodyUnscanned('https', hostname, maxSwapBodyBytes);
           sendUpstream(Buffer.concat([Buffer.from(state.headOutcome.output + '\r\n\r\n'), ...state.raw]));
           body = { mode: 'stream', remaining: state.remaining, decoder: state.decoder };
@@ -364,7 +378,7 @@ export function createConnectHandler(deps: MitmDeps) {
         swaps: [...outcome.swaps, ...(bodySwap?.result.swaps ?? [])],
         denied: deniedSwaps,
         skipped: bodySwap?.result.skipped,
-      }, bodySwap ? `${outcome.output}\n${bodySwap.result.output}` : outcome.output);
+      }, bodySwap ? `${outcome.logText}\n${bodySwap.result.output}` : outcome.logText);
       if (deniedSwaps.length > 0) {
         denyForSwaps(deniedSwaps, []);
         return;
