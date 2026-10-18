@@ -1,8 +1,12 @@
 name: Release
 
-# Publishes @coatcheck/* to npm when a v* tag is pushed, with provenance,
-# through npm trusted publishing (OIDC): no npm token is stored in the repo.
-# Each package must list this workflow as a trusted publisher on npmjs.com.
+# Stages @coatcheck/* on npm when a v* tag is pushed, with provenance, through
+# npm trusted publishing (OIDC): no npm token is stored in the repo, and the
+# trusted publisher is stage-only, so nothing goes live from here. A
+# maintainer reviews and approves each staged version with 2FA
+# (`npx npm@latest stage approve <id>`, or the Staged Packages tab on
+# npmjs.com), core first because the providers peer-depend on it.
+# Each package lists this workflow as its trusted publisher on npmjs.com.
 
 on:
   push:
@@ -22,6 +26,8 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
           cache: npm
+      # `npm stage` needs a newer npm than Node 24 bundles.
+      - run: npm install -g npm@latest && npm --version
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run lint
@@ -40,10 +46,11 @@ jobs:
             fi
           done
 
-      # Dependency order: providers peer-depend on core. A version that is
-      # already on the registry is skipped, so re-running the workflow (or
-      # tagging a release that was first published by hand) doesn't fail.
-      - name: Publish
+      # A version that is already live is skipped, so re-running the workflow
+      # (or tagging a release that was first published by hand) doesn't fail.
+      # Staged-but-unapproved versions can't be listed from CI (`npm stage
+      # list` needs proof of presence), so re-staging one fails loudly instead.
+      - name: Stage for publishing
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           for pkg in @coatcheck/core @coatcheck/provider-env @coatcheck/provider-aws; do
@@ -51,5 +58,6 @@ jobs:
               echo "$pkg@$TAG is already published, skipping"
               continue
             fi
-            npm publish -w "$pkg" --provenance --access public
+            npm stage publish -w "$pkg" --provenance --access public
           done
+          echo "Staged. Approve on npmjs.com (Staged Packages) or: npx npm@latest stage list && npx npm@latest stage approve <id>"
