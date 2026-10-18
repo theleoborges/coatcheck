@@ -6,6 +6,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import tls from 'node:tls';
+import { gzipSync } from 'node:zlib';
 import { X509Certificate } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { TokenStore } from './token-store.js';
@@ -318,6 +319,106 @@ describe('coatcheck server: CONNECT', () => {
     // Non-extension fields are preserved, and the forwarded Content-Length matches.
     expect(forwarded).toMatchObject({ projectId: 'p', browserSettings: { viewport: { width: 1280, height: 720 } } });
     expect(Number(upstream.received[0].headers['content-length'] ?? '0')).toBe(Buffer.byteLength(JSON.stringify(forwarded)));
+  });
+
+  // Attack (issue #13): the extension params ride in a body shape the adapter
+  // can't read — JSON under another content type, content-encoded, padded past
+  // the cap, or malformed. Each is refused; nothing reaches the browser service.
+  describe('refuses adapter-host request bodies it cannot inspect', () => {
+    const ext = JSON.stringify({ projectId: 'p', extensionId: 'ext-1' });
+    const frame = (headers: string, body: Buffer | string) => Buffer.concat([
+      Buffer.from(`POST /v1/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\n${headers}Content-Length: ${Buffer.byteLength(body)}\r\n\r\n`),
+      Buffer.isBuffer(body) ? body : Buffer.from(body),
+    ]);
+    const cdp = { cdp: { port: 8444, advertiseHost: '127.0.0.1' }, browserbaseApiHost: '127.0.0.1' };
+
+    // A JSON config under another (or no) content type is still JSON: it is
+    // inspected and stripped rather than streamed on the strength of the label.
+    it.each([
+      ['text/plain', 'Content-Type: text/plain\r\n'],
+      ['no Content-Type', ''],
+    ])('inspects and strips a JSON body declared as %s', async (_name, header) => {
+      const upstream = await startHttpsUpstream(JSON.stringify({ id: 's1' }));
+      const { port } = await startProxy(cdp);
+      const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+      const t = await startTls(socket, proxyCa.caCertPem);
+      t.write(frame(header, ext));
+      const [res] = await readResponses(t, 1);
+      expect(res.head).toMatch(/^HTTP\/1\.1 200 /);
+      expect(JSON.parse(upstream.received[0].body ?? '')).toEqual({ projectId: 'p' });
+    });
+
+    it.each<[string, Buffer]>([
+      ['gzip-encoded JSON', frame('Content-Type: application/json\r\nContent-Encoding: gzip\r\n', gzipSync(ext))],
+      ['malformed JSON', frame('Content-Type: application/json\r\n', "{projectId: 'p', extensionId: 'ext-1'}")],
+      ['JSON padded past COATCHECK_MAX_SWAP_BODY_BYTES', frame('Content-Type: application/json\r\n', JSON.stringify({ pad: 'x'.repeat(2000), extensionId: 'ext-1' }))],
+      // Declared past the cap: refused from the head, before any body arrives.
+      ['Content-Length past COATCHECK_MAX_SWAP_BODY_BYTES', Buffer.from('POST /v1/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 5000000\r\n\r\n')],
+      // The multipart exemption keys on Content-Type; a repeated field lets an
+      // upstream that honours the last one read the body as JSON.
+      ['JSON behind a repeated Content-Type (multipart first)', frame('Content-Type: multipart/form-data; boundary=b\r\nContent-Type: application/json\r\n', ext)],
+    ])('%s is refused with 403 uninspectable-body and never forwarded', async (_name, request) => {
+      const upstream = await startHttpsUpstream(JSON.stringify({ id: 's1' }));
+      const { port } = await startProxy({ ...cdp, maxSwapBodyBytes: 1024 });
+      const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+      const t = await startTls(socket, proxyCa.caCertPem);
+      const closed = new Promise<void>(r => t.once('close', () => r()));
+      t.write(request);
+      const [res] = await readResponses(t, 1);
+      expect(res.head).toMatch(/^HTTP\/1\.1 403 /);
+      expect(res.head).toMatch(/X-Coatcheck-Denied: uninspectable-body/i);
+      expect(JSON.parse(res.body)).toMatchObject({ reason: 'uninspectable-body', host: '127.0.0.1' });
+      await closed;
+      expect(upstream.received).toEqual([]);
+    });
+
+    it('forwards an empty chunked body: nothing to inspect', async () => {
+      const upstream = await startHttpsUpstream(JSON.stringify({ ok: true }));
+      const { port } = await startProxy(cdp);
+      const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+      const t = await startTls(socket, proxyCa.caCertPem);
+      t.write('POST /v1/sessions/s1/stop HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n');
+      const [res] = await readResponses(t, 1);
+      expect(res.head).toMatch(/^HTTP\/1\.1 200 /);
+      expect(upstream.received[0].url).toBe('/v1/sessions/s1/stop');
+      expect(upstream.received[0].body).toBe('');
+    });
+
+    it('inspects a JSON body sent with Content-Encoding: identity', async () => {
+      const upstream = await startHttpsUpstream(JSON.stringify({ id: 's1' }));
+      const { port } = await startProxy(cdp);
+      const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+      const t = await startTls(socket, proxyCa.caCertPem);
+      t.write(frame('Content-Type: application/json\r\nContent-Encoding: identity\r\n', ext));
+      const [res] = await readResponses(t, 1);
+      expect(res.head).toMatch(/^HTTP\/1\.1 200 /);
+      expect(JSON.parse(upstream.received[0].body ?? '')).toEqual({ projectId: 'p' });
+    });
+
+    it('forwards a multipart upload unchanged: no JSON config to inspect', async () => {
+      const upstream = await startHttpsUpstream(JSON.stringify({ ok: true }));
+      const { port } = await startProxy(cdp);
+      const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+      const t = await startTls(socket, proxyCa.caCertPem);
+      const body = '--b\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\n{"extensionId":"ext-1"}\r\n--b--\r\n';
+      t.write(frame('Content-Type: multipart/form-data; boundary=b\r\n', body));
+      const [res] = await readResponses(t, 1);
+      expect(res.head).toMatch(/^HTTP\/1\.1 200 /);
+      expect(upstream.received[0].body).toBe(body);
+      expect(upstream.received[0].headers['content-type']).toBe('multipart/form-data; boundary=b');
+    });
+
+    it('still streams a non-JSON body to the same host when CDP is disabled', async () => {
+      const upstream = await startHttpsUpstream();
+      const { tokenStore, port } = await startProxy({ browserbaseApiHost: '127.0.0.1' });
+      tokenStore.issue('k', 'v');
+      const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+      const t = await startTls(socket, proxyCa.caCertPem);
+      t.write(frame('Content-Type: text/plain\r\n', ext));
+      const [res] = await readResponses(t, 1);
+      expect(res.head).toMatch(/^HTTP\/1\.1 200 /);
+      expect(upstream.received[0].body).toBe(ext);
+    });
   });
 
   it('uses custom adapters from the library API, matched by wildcard host', async () => {

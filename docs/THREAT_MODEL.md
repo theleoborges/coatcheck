@@ -154,7 +154,7 @@ the agent can also reach the internet directly.
 | Secret names are validated before any provider call | `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (no `/`, no leading `.`), checked after URL-decoding on every route that takes a name; invalid names get `400` (`isValidSecretName`, `packages/core/src/secret-provider.ts`; `packages/core/src/vault-handler.ts`) |
 | Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`packages/core/src/mitm.ts`) |
 | CONNECT targets cannot reach a shell or the filesystem | Targets are parsed strictly (RFC 1123 DNS name or IP literal, port 1–65535; otherwise `400`) (`packages/core/src/connect-target.ts`). Certificates are generated in-process with WebCrypto; leaf keys stay in memory (LRU, 1000 entries) and only the CA is written to disk, when `COATCHECK_CA_DIR` is set (`packages/core/src/ca.ts`). |
-| Browser-service responses carry no raw CDP route | With CDP enabled, adapter hosts' JSON responses are rewritten: the Browserbase adapter points every Browserbase `ws(s)` URL (session `connectUrl`, debug endpoint `wsUrl` and `debuggerUrl`s) at the local CDP proxy and deletes `signingKey`, `seleniumRemoteUrl` and live-view URLs; it also strips `extensionId` from session-create request bodies (`packages/core/src/browser-adapters.ts`, `packages/core/src/json-response-rewriter.ts`; attack test in `packages/core/src/server.test.ts`) |
+| Browser-service responses carry no raw CDP route | With CDP enabled, adapter hosts' JSON responses are rewritten: the Browserbase adapter points every Browserbase `ws(s)` URL (session `connectUrl`, debug endpoint `wsUrl` and `debuggerUrl`s) at the local CDP proxy and deletes `signingKey`, `seleniumRemoteUrl` and live-view URLs; it also strips `extensionId` from session-create request bodies, and refuses (`403 uninspectable-body`) any request body on that host it can't read as JSON — content-encoded, over `COATCHECK_MAX_SWAP_BODY_BYTES`, or not JSON, `multipart/form-data` uploads excepted — so the strip can't be bypassed by re-shaping the body (`packages/core/src/browser-adapters.ts`, `packages/core/src/mitm.ts`, `packages/core/src/json-response-rewriter.ts`; attack test in `packages/core/src/server.test.ts`) |
 | Logs carry no values | Swap logs record secret names, host, and ticket age only (`packages/core/src/swap-log.ts`) |
 | OAuth refresh failures don't log provider bodies | Only the HTTP status and the RFC 6749 `error` code (sanitised to `[A-Za-z0-9_.-]`, at most 64 chars) are logged (`oauthErrorCode`, `packages/core/src/vault-handler.ts`) |
 
@@ -303,7 +303,13 @@ browser-service API-key ticket, the agent could call Browserbase's
 pass through the CDP proxy. The adapter rewrites those URLs to the local proxy
 or removes them, strips `signingKey` and `seleniumRemoteUrl` from responses,
 and (item 20) strips `extensionId` from session-create request bodies, since
-an uploaded extension can run agent code in the browser. What remains: URL
+an uploaded extension can run agent code in the browser. A body on the adapter
+host that coatcheck can't read as JSON (content-encoded, over
+`COATCHECK_MAX_SWAP_BODY_BYTES`, or not JSON; `multipart/form-data` uploads
+excepted, since no server reads those as a session config) is refused with
+`403 uninspectable-body` instead of forwarded, so the strip can't be bypassed
+by changing the body's shape (issue #13; attack tests per shape in
+`packages/core/src/server.test.ts`). What remains: URL
 shapes the adapter doesn't recognise, vendor endpoints outside the adapter
 hosts, browser-service hosts listed in `COATCHECK_PASSTHROUGH_HOSTS`, and any
 route the agent obtains from the vendor without coatcheck (for example a

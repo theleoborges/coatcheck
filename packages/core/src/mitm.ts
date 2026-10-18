@@ -14,7 +14,7 @@ import { ChunkedDecoder, parseRequestHead, type RequestHead } from './http1-fram
 import { swapRequestBody } from './body-swap.js';
 import { headerFieldValue, percentEncodeUnsafe } from './value-encoding.js';
 import type { SwapInfo } from './token-store.js';
-import { DENIED_HEADER, hostMismatchBody, invalidValueBody, logBodyUnscanned, logSwapOutcome, type SwapOutcome } from './swap-log.js';
+import { DENIED_HEADER, hostMismatchBody, uninspectableBodyBody, invalidValueBody, logBodyUnscanned, logSwapOutcome, type SwapOutcome } from './swap-log.js';
 
 export interface MitmDeps {
   tokenStore: TokenStore;
@@ -43,10 +43,17 @@ export const MAX_HEAD_BYTES = 64 * 1024;
 /** Client bytes held before the upstream connects; past this the client is paused. */
 const MAX_PENDING_BYTES = 1024 * 1024;
 
-/** True for a JSON request content type (so a browser adapter can rewrite the body). */
-function isJsonContentType(ct: string | undefined): boolean {
-  return ct !== undefined && /^application\/(.*\+)?json\b/i.test(ct.trim());
+/**
+ * True for a `multipart/form-data` request. On an adapter host this is the one
+ * body shape forwarded without JSON inspection: a file upload to the browser
+ * service, which no server reads as a JSON session config.
+ */
+function isMultipartContentType(ct: string | undefined): boolean {
+  return ct !== undefined && /^multipart\/form-data\s*(;|$)/i.test(ct.trim());
 }
+
+/** A `Content-Type` field line (RFC 9112 §5: name, optional whitespace, colon). */
+const CONTENT_TYPE_LINE = /^content-type[ \t]*:/i;
 
 /** The body of the request being read, after its head. */
 type BodyState =
@@ -63,7 +70,11 @@ type BodyState =
       raw: Buffer[];
       rawBytes: number;
       data: Buffer[];
-      /** Browser-adapter request-body rewrite (strip extension params); mutates parsed JSON in place. */
+      /**
+       * Browser-adapter request-body rewrite (strip extension params); mutates
+       * parsed JSON in place. When set, a body that can't be inspected is
+       * refused rather than forwarded (`uninspectable-body`).
+       */
       adapterReq?: (body: unknown) => boolean;
     };
 
@@ -197,6 +208,10 @@ export function createConnectHandler(deps: MitmDeps) {
     // The binding key is the validated CONNECT target (upstream TLS proves it
     // is the recipient), never Host or SNI.
     const swapTarget = { host: hostname, scheme: 'https' as const };
+    // Browser-adapter request-body rewrite for this tunnel's host (CDP on):
+    // fixed per CONNECT, so resolved once rather than per keep-alive request.
+    const reqAdapter = adapterFor(hostname);
+    const adapterReq = reqAdapter?.rewriteRequestJson?.bind(reqAdapter);
 
     /**
      * Process buffered client data request by request (HTTP keep-alive: every
@@ -246,15 +261,20 @@ export function createConnectHandler(deps: MitmDeps) {
         const decoder = framing.kind === 'chunked' ? new ChunkedDecoder() : undefined;
         const hasBody = decoder !== undefined || remaining > 0;
         // Buffer the body when a swap_body ticket could apply, or when a browser
-        // adapter wants to strip parameters from a JSON request body (e.g.
-        // extension params on a session-create POST).
-        const reqAdapter = cdp ? adapterFor(hostname) : undefined;
-        const wantsAdapterReq = !!reqAdapter?.rewriteRequestJson && isJsonContentType(head.header('content-type'));
-        if (hasBody && (tokenStore.hasLiveBodyTicketFor(swapTarget) || wantsAdapterReq)) {
-          body = {
-            mode: 'buffer', remaining, decoder, head, headOutcome: swapped, raw: [], rawBytes: 0, data: [],
-            adapterReq: wantsAdapterReq ? reqAdapter!.rewriteRequestJson!.bind(reqAdapter) : undefined,
-          };
+        // adapter strips parameters from request bodies (extension params on a
+        // session-create POST). For the adapter every body is held, whatever
+        // its Content-Type: one it can't inspect is refused in sendBuffered,
+        // never streamed (a JSON config under another content type, encoded,
+        // or padded past the cap would otherwise carry the params through).
+        // A declared length past the cap is known uninspectable from the head,
+        // so it is refused here rather than after holding a cap's worth of it.
+        if (adapterReq && framing.kind === 'length' && framing.length > maxSwapBodyBytes) {
+          logSwapOutcome('https', hostname, swapped, swapped.output);
+          denyUninspectable(`larger than ${maxSwapBodyBytes} bytes`);
+          return;
+        }
+        if (hasBody && (tokenStore.hasLiveBodyTicketFor(swapTarget) || adapterReq)) {
+          body = { mode: 'buffer', remaining, decoder, head, headOutcome: swapped, raw: [], rawBytes: 0, data: [], adapterReq };
           continue;
         }
         logSwapOutcome('https', hostname, swapped, swapped.output);
@@ -308,6 +328,12 @@ export function createConnectHandler(deps: MitmDeps) {
         state.raw.push(consumed);
         state.rawBytes += consumed.length;
         if (state.rawBytes > maxSwapBodyBytes) {
+          if (state.adapterReq) {
+            // An adapter-host body past the cap can't be inspected: refuse it.
+            logSwapOutcome('https', hostname, state.headOutcome, state.headOutcome.output);
+            denyUninspectable(`larger than ${maxSwapBodyBytes} bytes`);
+            return true;
+          }
           // Too large to hold: forward what we have and stream the rest unscanned.
           logSwapOutcome('https', hostname, state.headOutcome, state.headOutcome.output);
           logBodyUnscanned('https', hostname, maxSwapBodyBytes);
@@ -355,12 +381,33 @@ export function createConnectHandler(deps: MitmDeps) {
       }
 
       // Browser-adapter request rewrite: strip extension params from the JSON.
-      if (state.adapterReq && effective !== null) {
-        let parsed: unknown;
-        try { parsed = JSON.parse(effective.toString('utf8')); } catch { parsed = undefined; }
-        if (parsed !== undefined && state.adapterReq(parsed)) {
-          effective = Buffer.from(JSON.stringify(parsed), 'utf8');
-          console.log(`[connect] host=${hostname} adapter stripped request params`);
+      // Fail closed: a body the adapter can't read as JSON is refused, whatever
+      // its Content-Type says, except a multipart upload (never a session config).
+      // An empty body carries no parameters and is forwarded as it is.
+      if (state.adapterReq && effective !== null && effective.length > 0) {
+        // `identity` is no encoding (as body-swap.ts reads it); anything else is.
+        const encoding = state.head.header('content-encoding')?.trim().toLowerCase();
+        if (encoding !== undefined && encoding !== 'identity') {
+          denyUninspectable('content-encoded');
+          return;
+        }
+        // The multipart exemption keys on Content-Type, so the upstream must
+        // read the same one: with the field repeated, servers differ on which
+        // (first, last, joined) they honour, and the body is refused instead.
+        if (state.head.fieldLines.filter(l => CONTENT_TYPE_LINE.test(l)).length > 1) {
+          denyUninspectable('repeated Content-Type');
+          return;
+        }
+        if (!isMultipartContentType(state.head.header('content-type'))) {
+          let parsed: unknown;
+          try { parsed = JSON.parse(effective.toString('utf8')) as unknown; } catch {
+            denyUninspectable('not JSON');
+            return;
+          }
+          if (state.adapterReq(parsed)) {
+            effective = Buffer.from(JSON.stringify(parsed), 'utf8');
+            console.log(`[connect] host=${hostname} adapter stripped request params`);
+          }
         }
       }
 
@@ -393,6 +440,12 @@ export function createConnectHandler(deps: MitmDeps) {
     function rejectFraming(reason: string) {
       console.warn(`[connect] host=${hostname} rejected request: ${reason}`);
       denyAndClose(400, 'bad-framing', JSON.stringify({ error: `Bad request framing: ${reason}`, reason: 'bad-framing' }));
+    }
+
+    /** An adapter-host request body coatcheck can't inspect for browser-code parameters. */
+    function denyUninspectable(why: string) {
+      console.warn(`[connect] host=${hostname} rejected request: body not inspectable (${why})`);
+      denyAndClose(403, 'uninspectable-body', uninspectableBodyBody(hostname, why));
     }
 
     function denyForSwaps(deniedSwaps: SwapInfo[], invalid: SwapInfo[]) {

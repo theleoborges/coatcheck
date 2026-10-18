@@ -166,11 +166,22 @@ responses, which the v1 adapter left in place.
 As built (`BrowserAdapter.rewriteRequestJson`, wired in `mitm.ts`): the
 Browserbase adapter deletes `extensionId` at the top level and inside
 `browserSettings` (field names checked against the Browserbase API,
-2026-10). It runs on every request to an adapter host whose `Content-Type` is
-JSON (`application/json`, `*/*+json`), not only `POST /v1/sessions`. The body
-is buffered under the same `COATCHECK_MAX_SWAP_BODY_BYTES` cap as `swap_body`;
-a body past the cap, a non-JSON content type, or a body that doesn't parse
-(for example one with a `Content-Encoding`) is forwarded unchanged.
+2026-10). It runs on every request to an adapter host that carries a body, not
+only `POST /v1/sessions`, and it fails closed (issue #13): the body is buffered
+under the same `COATCHECK_MAX_SWAP_BODY_BYTES` cap as `swap_body`, and one the
+adapter can't read as JSON — past the cap, with a `Content-Encoding`, or not
+parseable whatever its `Content-Type` says — is refused with
+`403 uninspectable-body` and the tunnel closed, never forwarded (a declared
+`Content-Length` past the cap is refused from the head, before the body is
+held). The one exception is `multipart/form-data` (file uploads to the browser
+service), which no server reads as a session config and so passes through
+uninspected; because that exemption keys on `Content-Type`, a request that
+repeats the field is refused too, since servers differ on which copy they
+honour. An empty body has nothing to inspect and is forwarded; an
+`identity` content coding counts as no encoding, as in `body-swap.ts`. An
+earlier version only inspected bodies whose `Content-Type` was JSON and
+forwarded everything else unchanged, which would have let a JSON config under
+another content type carry the extension parameters through.
 
 ## What this removes
 

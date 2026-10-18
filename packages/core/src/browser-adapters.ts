@@ -14,7 +14,13 @@ export interface BrowserAdapter {
   /**
    * Strip agent-controlled parameters from a JSON *request* body on the
    * adapter's hosts (the session-create body can carry browser code). Mutate in
-   * place; return true if changed. Only called for requests with a JSON body.
+   * place; return true if changed.
+   *
+   * Defining this makes coatcheck fail closed on the adapter's hosts: every
+   * non-empty request body is buffered (up to `COATCHECK_MAX_SWAP_BODY_BYTES`)
+   * and, whatever its `Content-Type` says, must parse as JSON — or be a
+   * `multipart/form-data` upload — else the request is refused with
+   * `403 uninspectable-body`. Called with the parsed JSON (any JSON value).
    */
   rewriteRequestJson?(body: unknown): boolean;
 }
