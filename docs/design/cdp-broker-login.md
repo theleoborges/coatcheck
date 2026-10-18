@@ -79,7 +79,7 @@ protected like every vault route.
 | `409` | `{"status":"page-ambiguous"}` | No page target, or more than one, matches (see `page`). |
 | `403` | `{"error":"credential-origin violation: …"}` | The page's committed origin isn't in the secret's allowed hosts, or is unknown / navigating / not http(s). Checked before the reload and again after it. Same rule as v1 origin binding. |
 | `403` | `{"error":"…"}` | The secret is unbound (no policy rule and no `_allowed_hosts`) and `COATCHECK_ALLOW_UNBOUND_SECRETS` is off, or its host sources don't intersect. Same mint-time rule as `/_vault/{name}`. |
-| `404` | `{"status":"selector-not-found","field":"…"}` | A field selector matched nothing. |
+| `404` | `{"status":"selector-not-found","field":"…"}` | A field selector matched nothing. Every selector is checked before any value is typed, so nothing was filled (a field that vanishes mid-fill is emptied first; #11). |
 | `404` | `{"status":"unknown-sid-or-secret","error":"…"}` | Unknown or not-connected sid, or no secret under that name. |
 | `501` | `{"error":"…"}` | The secret isn't a multi-value secret, or lacks a requested field. |
 | `502` | `{"status":"driver-error","cleared":true}` | One of coatcheck's own CDP commands failed (decision 8), including a `submit` selector that matches nothing. |

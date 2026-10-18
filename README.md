@@ -251,7 +251,7 @@ Login responses:
 | `200` | `ok` | Logged in; `url` is the page's URL afterwards. |
 | `400` | | Invalid request body (missing `sessionId`, `fields` or `submit`, or a malformed `until`). |
 | `403` | | The page's origin isn't one of the secret's allowed hosts (or is unknown), or the secret has no allowed hosts. Nothing was filled. |
-| `404` | `unknown-sid-or-secret`, `selector-not-found` | No live CDP connection for `sessionId`, no such secret, or a field selector matched nothing (`field` names it). |
+| `404` | `unknown-sid-or-secret`, `selector-not-found` | No live CDP connection for `sessionId`, no such secret, or a field selector matched nothing (`field` names it). Nothing is left filled. |
 | `409` | `no-success`, `interception-active`, `busy`, `page-ambiguous` | See above. |
 | `501` | | Not a multi-value secret with the requested fields. |
 | `502` | `upstream-closed`, `driver-error` | The browser connection closed, or a CDP command failed (including a `submit` selector that matched nothing); filled fields are cleared. |
