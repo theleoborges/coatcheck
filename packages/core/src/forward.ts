@@ -65,8 +65,9 @@ export function handleForwardRequest(
   const swapHeader = (name: string, value: string): string => {
     const basic = name === 'authorization' ? swapBasicCredentials(tokenStore, value, target) : null;
     if (!basic) return swap(value, headerFieldValue);
+    // The re-encoded base64 can't hold a ticket literal; log the decoded text.
     postSwapText += basic.userPass + '\n';
-    return swap(record(basic), headerFieldValue);
+    return record(basic);
   };
 
   // Only the path and query: a ticket in the host or userinfo is left as a

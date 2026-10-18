@@ -67,10 +67,32 @@ describe('swapBasicCredentials', () => {
     const canonical = b64(`u:${tok}`);
     expect(swapBasicCredentials(store, `Bearer ${canonical}`, GITHUB)).toBeNull();
     expect(swapBasicCredentials(store, `Basic ${b64('u:plain')}`, GITHUB)).toBeNull();
-    // Node would decode these the same, but the upstream may not: never open them.
-    expect(swapBasicCredentials(store, `Basic ${canonical.replace(/=+$/, '')}`, GITHUB)).toBeNull();
     expect(swapBasicCredentials(store, `Basic ${canonical.slice(0, 8)}!${canonical.slice(8)}`, GITHUB)).toBeNull();
     expect(swapBasicCredentials(store, `Basic ${canonical} extra`, GITHUB)).toBeNull();
+  });
+
+  it('never opens a non-canonical encoding, but keeps the ticket visible for the miss log', () => {
+    store = new TokenStore();
+    const tok = store.issue('pw', 'real', { allowedHosts }).id;
+    const canonical = b64(`u:${tok}`);
+    // Node would decode these the same, but the upstream may not.
+    for (const enc of [canonical.replace(/=+$/, ''), canonical.replace(/=+$/, '=')]) {
+      const value = `Basic ${enc}`;
+      const r = swapBasicCredentials(store, value, GITHUB);
+      expect(r?.output).toBe(value);
+      expect(r?.swaps).toEqual([]);
+      expect(r?.userPass).toContain(tok);
+    }
+  });
+
+  it('round-trips a user-id that is not UTF-8 (ISO-8859-1)', () => {
+    store = new TokenStore();
+    const tok = store.issue('pw', 'pä', { allowedHosts }).id;
+    const latin1 = Buffer.concat([Buffer.from([0x6a, 0xfc, 0x3a]), Buffer.from(tok)]); // "jü:" in latin1
+    const r = swapBasicCredentials(store, `Basic ${latin1.toString('base64')}`, GITHUB);
+    expect(r?.swaps.map(s => s.secretName)).toEqual(['pw']);
+    const out = Buffer.from(r!.output.slice(6), 'base64');
+    expect(out).toEqual(Buffer.concat([Buffer.from([0x6a, 0xfc, 0x3a]), Buffer.from('pä', 'utf8')]));
   });
 });
 

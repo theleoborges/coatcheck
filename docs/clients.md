@@ -289,7 +289,10 @@ so a credential helper can hand git a ticket as the password. Mint a fresh one
 per request so a cached ticket never outlives its TTL:
 
 ```bash
-git config --global credential.https://git.example.com.helper \
+# The empty entry drops earlier helpers (e.g. osxkeychain), which would store
+# the ticket and hand it back after it expires.
+git config --global --add credential.https://git.example.com.helper ''
+git config --global --add credential.https://git.example.com.helper \
   '!f() { test "$1" = get || exit 0; echo username=x-access-token;
           echo "password=$(curl -sf http://127.0.0.1:3128/_vault/git-token | jq -er .token)"; }; f'
 git clone https://git.example.com/org/repo.git
