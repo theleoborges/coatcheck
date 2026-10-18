@@ -93,6 +93,19 @@ export function invalidValueBody(invalid: SwapInfo[]): string {
   });
 }
 
+/**
+ * JSON body of the `403` sent when a request body to a browser-service host
+ * can't be inspected for browser-code parameters (content-encoded, over the
+ * size cap, or not JSON), so it is refused rather than forwarded.
+ */
+export function uninspectableBodyBody(hostname: string, why: string): string {
+  return JSON.stringify({
+    error: `Request body to browser-service host '${hostname}' can't be inspected (${why}); send plain JSON under COATCHECK_MAX_SWAP_BODY_BYTES`,
+    reason: 'uninspectable-body',
+    host: hostname,
+  });
+}
+
 function names(infos: SwapInfo[]): string {
   return infos.map(s => s.secretName).join(',');
 }

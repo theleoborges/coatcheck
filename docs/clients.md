@@ -196,7 +196,8 @@ its secret name, with allowed hosts like any other secret.
    from `COATCHECK_CDP_ADVERTISE_HOST` and `COATCHECK_CDP_PORT`). For
    Browserbase it also removes `signingKey`, `seleniumRemoteUrl` and live-view
    URLs from responses, and strips `extensionId` from the session-create
-   body:
+   body (a body to that host it can't read as JSON is refused with `403
+   uninspectable-body`; `multipart/form-data` uploads are the exception):
 
    ```js
    const COATCHECK = 'http://127.0.0.1:3128';

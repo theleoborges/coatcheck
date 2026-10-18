@@ -134,7 +134,8 @@ The Browserbase adapter (`packages/core/src/browser-adapters.ts`):
   non-WebSocket `debuggerUrl`/`debuggerFullscreenUrl`. Browserbase live view
   is therefore unavailable through coatcheck while CDP is enabled;
 - on requests (item 20): deletes `extensionId`, top-level and in
-  `browserSettings`, from JSON request bodies to the API host, so the agent
+  `browserSettings`, from request bodies to the API host, refusing any body it
+  can't read as JSON (`multipart/form-data` uploads excepted), so the agent
   can't load its own extension into the browser (details in
   `cdp-broker-login.md`, "Browser adapter addition").
 
