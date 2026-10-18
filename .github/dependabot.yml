@@ -7,6 +7,13 @@ updates:
     groups:
       minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      # Stay on the oldest supported Node's types (engines: node >=24).
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      # @typescript-eslint 8.x doesn't support TypeScript 7 yet.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: npm
     directory: /examples/agents/harness
     schedule:
@@ -14,11 +21,19 @@ updates:
     groups:
       minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      # Stay on the oldest supported Node's types (engines: node >=24).
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
   - package-ecosystem: docker
-    directory: /
+    directories: [/, /examples/agents]
     schedule:
       interval: weekly
+    ignore:
+      # Node image majors are bumped by hand, LTS to LTS (odd majors never get LTS).
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
