@@ -30,7 +30,7 @@ export function logSwapOutcome(
     console.warn(`[swap] scheme=${scheme} host=${hostname} result=denied secrets=${names(denied)}`);
   }
   if (invalid.length > 0) {
-    console.warn(`[swap] scheme=${scheme} host=${hostname} result=invalid-value secrets=${names(invalid)} (value has a character not allowed in a header)`);
+    console.warn(`[swap] scheme=${scheme} host=${hostname} result=invalid-value secrets=${names(invalid)} (value has a control character, or a ':' in a Basic auth user-id)`);
   }
   if (denied.length > 0 || invalid.length > 0) return; // nothing is forwarded, so un-swapped literals don't matter
 
@@ -87,7 +87,7 @@ export function hostMismatchBody(denied: SwapInfo[], hostname: string): string {
 export function invalidValueBody(invalid: SwapInfo[]): string {
   const secrets = [...new Set(invalid.map(d => d.secretName))];
   return JSON.stringify({
-    error: `Secret ${secrets.map(s => `'${s}'`).join(', ')} has a value that can't be sent in a header (control character)`,
+    error: `Secret ${secrets.map(s => `'${s}'`).join(', ')} has a value that can't be sent in a header (control character, or ':' in a Basic auth user-id)`,
     reason: 'invalid-value',
     secrets,
   });

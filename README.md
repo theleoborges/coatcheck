@@ -134,17 +134,17 @@ Unless `COATCHECK_CA_DIR` is set and on persistent storage, each coatcheck resta
 
 coatcheck does a **literal substring replace** of live ticket strings, so the rules follow from where it looks.
 
-**Works.** The ticket appears as plaintext in the request line or a header:
+**Works.** The ticket appears as plaintext in the request line or a header, or inside a Basic credential:
 
 - `Authorization: Bearer cct_…`
 - `Authorization: token cct_…` (GitHub style)
 - `X-API-Key: cct_…`, or any custom header
 - `https://api.example.com/v1/x?api_key=cct_…` (query string)
+- **HTTP Basic auth**: `curl -u user:cct_…`, `https://user:cct_…@host/`, `.netrc`, git credential helpers. coatcheck decodes `Authorization: Basic`, swaps tickets in the user name or password, and re-encodes it.
 - In the request body, only for secrets that opt in with `swap_body` (see [Request bodies](#request-bodies)).
 
 **Does not work.** The request still goes out, but with the ticket unchanged, and the upstream returns 401/403:
 
-- **HTTP Basic auth**, e.g. `curl -u user:cct_…`, `https://user:cct_…@host/` URLs, `.netrc`, and git credential helpers. Base64 encoding hides the ticket from the scan. For git, send a header instead: `git -c http.extraHeader="Authorization: Bearer cct_…"`.
 - **Tickets in request bodies** for secrets that don't opt in to `swap_body`.
 - **Any client that ignores `HTTPS_PROXY`.** Node's built-in `https` module is the common case: it needs an explicit agent such as `https-proxy-agent`, or `NODE_USE_ENV_PROXY=1` on Node ≥ 24. curl, git, Python `requests` and Node `fetch` honour the variable.
 - **Client-side signing**, such as AWS SigV4, HMAC request signatures, or JWT minting. The client computes a signature over the ticket, not the real secret.
@@ -157,7 +157,7 @@ If an upstream returns 401 while you are using a ticket, assume the swap did not
 | `hit secrets=…` | Tickets swapped. |
 | `denied secrets=…` | A ticket was sent to a host it isn't bound to. The request was not forwarded. |
 | `unbound secrets=…` | An unbound ticket was swapped (only with `COATCHECK_ALLOW_UNBOUND_SECRETS=1`). |
-| `invalid-value secrets=…` | A value contains a control character and can't go in a header. The request was not forwarded. |
+| `invalid-value secrets=…` | A value contains a control character and can't go in a header (or a `:`, in a Basic auth user name). The request was not forwarded. |
 | `body-skipped secrets=…` | A ticket appeared in a body, but its secret doesn't enable `swap_body`. |
 | `body-unscanned` | The body was larger than `COATCHECK_MAX_SWAP_BODY_BYTES` and streamed through unscanned. |
 | `miss unswapped_ticket_literals=N` | A `cct_<64 hex>` string reached the upstream intact (unknown or expired ticket). |
