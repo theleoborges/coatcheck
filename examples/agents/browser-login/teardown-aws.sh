@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Delete everything setup-aws.sh created. Usage: AWS_PROFILE=liv ./teardown-aws.sh
+# Delete everything setup-aws.sh created. Usage: AWS_PROFILE=… ./teardown-aws.sh
 set -uo pipefail
 cd "$(dirname "$0")"
 : "${AWS_PROFILE:?set AWS_PROFILE}"

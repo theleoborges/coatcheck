@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Create the ephemeral AWS resources for the browser-login example.
 #   - SSM SecureStrings under /coatcheck/demo/secrets/ (anthropic key, test-site login)
-#   - Secrets Manager coatcheck-demo/browserbase-api-key (shared key)
+#   - Secrets Manager coatcheck-demo/browserbase-api-key (shared key; skipped
+#     if BROWSERBASE_API_KEY is unset)
 #   - IAM role coatcheck-demo-broker: read-only on exactly those, assumable by the
 #     calling identity only with an ExternalId (the pattern from docs/deploy/aws-ecs.md)
-# Usage: AWS_PROFILE=liv ANTHROPIC_API_KEY=… BROWSERBASE_API_KEY=… ./setup-aws.sh
+#   - .external-id (local file, git-ignored) holding that ExternalId
+# All AWS resources are tagged purpose=coatcheck-demo. Safe to re-run.
+# Usage: AWS_PROFILE=… ANTHROPIC_API_KEY=… BROWSERBASE_API_KEY=… ./setup-aws.sh
 # Remove everything with ./teardown-aws.sh.
 set -euo pipefail
 cd "$(dirname "$0")"

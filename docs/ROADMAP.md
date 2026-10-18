@@ -11,6 +11,9 @@ Security fixes include a test that performs the attack and shows it is
 blocked. The decisions behind this list, and the alternatives that were
 rejected, are in `docs/design/v1-decisions.md`.
 
+Status: items 1–20 are done. What remains is item 21 and the "After 1.0"
+list, none of it scheduled yet.
+
 ## Phase 1: shell injection (HIGH)
 
 1. **[Done]** **Validate CONNECT targets.** Parse `host:port` strictly:
@@ -187,8 +190,11 @@ rejected, are in `docs/design/v1-decisions.md`.
 
 14. **[Done]** **Validate `mint-tokens` sessions.** Give `VaultDeps` the
     `CdpSessionStore`. An unknown or expired sid gets `404`.
+    (`mint-tokens` was later removed by item 20; `/login` keeps the check.)
 
-15. **[Done]** **CDP origin binding.**
+15. **[Done, superseded by item 20]** **CDP origin binding.** Item 20 removed
+    the `Input.insertText` substitution; origin tracking stays for the login's
+    origin check.
     - Track each CDP session's committed main-frame URL from
       `Page.frameNavigated`.
     - `Input.insertText` substitutes a session-bound ticket only when that host
@@ -295,7 +301,6 @@ Done: the unused `http-proxy` dependency was removed during extraction.
 - Mint-time host narrowing (`?host=`), which may only narrow the allowed hosts.
 - Provider-native host metadata (for example, AWS tags) through
   `Secret.allowedHosts`.
-- Buffer-and-replay for `page.type()`, instead of failing closed.
 - More than one concurrent CDP connection.
 - A local `--remote-debugging-port` browser adapter. It needs a rewrite hook
   on the forward path.
@@ -313,9 +318,10 @@ These are recorded as residual risk in `docs/THREAT_MODEL.md`:
   is in the page; redaction remains a backstop for browser-produced data.
 - Binary and screenshot frames are not inspected.
 - Second routes to the same remote browser exist beyond what adapters rewrite.
-- Script on an allowed origin can exfiltrate the filled value (until item 20;
-  afterwards only the site's own script runs while the value is present).
-- Cross-origin iframe logins (item 15).
+- Site script on the login page sees the password while it is in the page
+  (item 20 keeps agent script out; the site's own script must see it).
+- Cross-origin iframe logins fail (`404 selector-not-found`): selectors resolve in the main
+  document only (item 20).
 - Under `COATCHECK_MITM=bound`, a keep-alive tunnel opened before a host's
   first ticket existed stays passthrough. This fails closed.
 - The CA key is readable on deployments that share a filesystem.

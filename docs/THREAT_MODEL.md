@@ -43,21 +43,25 @@ go around it to the secret store. Three properties are required.
 
 ### Worked example: AWS (ECS/Fargate)
 
-As shipped, the AWS provider (`packages/provider-aws/src/index.ts`) reads per-agent secrets from SSM Parameter
-Store under a per-agent prefix and shared secrets from Secrets Manager, and
-optionally assumes a role named by `COATCHECK_AWS_ROLE_ARN` via STS before doing so
-(`packages/provider-aws/src/index.ts`).
+The AWS provider (`packages/provider-aws/src/index.ts`) reads per-agent
+secrets from SSM Parameter Store under `COATCHECK_AWS_SSM_PREFIX` (default
+`/coatcheck/secrets/`; put `{agentId}` in it for a per-agent path) and shared
+secrets from Secrets Manager under `COATCHECK_AWS_SHARED_PREFIX` (default
+`coatcheck/`). It optionally assumes a role named by `COATCHECK_AWS_ROLE_ARN`
+via STS before doing so.
 
-- Agent task role: explicit `Deny` on `ssm:GetParameter*` for
-  `…/user-secrets/*` and no `secretsmanager:GetSecretValue` on shared secrets.
+- Agent task role: explicit `Deny` on `ssm:GetParameter*` and
+  `ssm:PutParameter` for `/coatcheck/secrets/*`, and on
+  `secretsmanager:GetSecretValue` for the shared secrets.
 - Broker role (one per agent): `ssm:GetParameter`, `ssm:GetParametersByPath`,
-  `ssm:PutParameter` on that agent's `…/user-secrets/*`, and
+  `ssm:PutParameter` on that agent's `/coatcheck/secrets/<agent-id>/*`, and
   `secretsmanager:GetSecretValue` on the specific shared secrets coatcheck is
   allowed to broker.
 - Verification: from inside the agent container,
-  `aws ssm get-parameter --with-decryption --name …/user-secrets/x` and
-  `aws secretsmanager get-secret-value --secret-id <shared>` both return
-  `AccessDenied`.
+  `aws ssm get-parameter --with-decryption --name /coatcheck/secrets/<agent-id>/x`,
+  `aws secretsmanager get-secret-value --secret-id <shared>` and
+  `aws sts assume-role` on the broker role without the `ExternalId` all
+  return `AccessDenied`.
 
 **Pitfall: containers in one ECS task share one task role.** If the broker
 role's trust policy trusts the task role, and the task role is allowed
@@ -150,13 +154,13 @@ the agent can also reach the internet directly.
 | Secret names are validated before any provider call | `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` (no `/`, no leading `.`), checked after URL-decoding on every route that takes a name; invalid names get `400` (`isValidSecretName`, `packages/core/src/secret-provider.ts`; `packages/core/src/vault-handler.ts`) |
 | Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`packages/core/src/mitm.ts`) |
 | CONNECT targets cannot reach a shell or the filesystem | Targets are parsed strictly (RFC 1123 DNS name or IP literal, port 1–65535; otherwise `400`) (`packages/core/src/connect-target.ts`). Certificates are generated in-process with WebCrypto; leaf keys stay in memory (LRU, 1000 entries) and only the CA is written to disk, when `COATCHECK_CA_DIR` is set (`packages/core/src/ca.ts`). |
-| Browser-service responses carry no raw CDP route | With CDP enabled, adapter hosts' JSON responses are rewritten: the Browserbase adapter points every Browserbase `ws(s)` URL (session `connectUrl`, debug endpoint `wsUrl` and `debuggerUrl`s) at the local CDP proxy and deletes `signingKey` and live-view URLs (`browser-adapters.ts`, `json-response-rewriter.ts`; attack test in `server.test.ts`) |
+| Browser-service responses carry no raw CDP route | With CDP enabled, adapter hosts' JSON responses are rewritten: the Browserbase adapter points every Browserbase `ws(s)` URL (session `connectUrl`, debug endpoint `wsUrl` and `debuggerUrl`s) at the local CDP proxy and deletes `signingKey`, `seleniumRemoteUrl` and live-view URLs; it also strips `extensionId` from session-create request bodies (`packages/core/src/browser-adapters.ts`, `packages/core/src/json-response-rewriter.ts`; attack test in `packages/core/src/server.test.ts`) |
 | Logs carry no values | Swap logs record secret names, host, and ticket age only (`packages/core/src/swap-log.ts`) |
 | OAuth refresh failures don't log provider bodies | Only the HTTP status and the RFC 6749 `error` code (sanitised to `[A-Za-z0-9_.-]`, at most 64 chars) are logged (`oauthErrorCode`, `packages/core/src/vault-handler.ts`) |
 
 ## Known gaps
 
-Severity reflects the attacker above. File references are to `packages/core/src/`.
+Severity reflects the attacker above. Bare file names are in `packages/core/src/`.
 
 ### Fixed: tickets were not bound to destination hosts
 
@@ -178,16 +182,16 @@ attacks). What remains:
   `result=unbound`.
 - A secret's binding is only as narrow as its list. `*.example.com` trusts
   every subdomain, including ones a third party can host content on.
-- Browser (CDP) tickets are checked against the page's main-frame origin,
-  not the frame that has focus; see "Browser injection" below.
+- Broker login checks the page's committed main-frame origin and fills
+  selectors in the main document only, so a form in a cross-origin iframe
+  can't be filled (see "Residual risk accepted by design").
 
 ### MEDIUM: tickets are reusable until TTL
 
-Unscoped tickets are never revoked on use; any number of requests to the
-ticket's allowed hosts can carry the same ticket for 15 minutes
-(`COATCHECK_TICKET_TTL_SECONDS`). Only
-session-bound tickets are revoked early (on CDP disconnect). There is no
-single-use option.
+Tickets are never revoked on use; any number of requests to the ticket's
+allowed hosts can carry the same ticket for 15 minutes
+(`COATCHECK_TICKET_TTL_SECONDS`). There is no single-use option and no early
+revocation.
 
 ### LOW: `bound` MITM mode decides per tunnel, at CONNECT time
 
@@ -222,9 +226,9 @@ non-`127/8` address or hostname) without a token. What remains:
   reveal the active-ticket count and the public CA certificate.
 - The token is one shared secret with no per-client identity or scope; an
   agent that is given it can do everything any other client can.
-- The CDP listener authenticates only by sid, a 96-bit capability delivered
-  inside an intercepted browser-service response (design §4, "API token
-  details").
+- The CDP listener ignores `COATCHECK_API_TOKEN` and authenticates only by
+  sid, a 96-bit capability delivered inside an intercepted browser-service
+  response (`docs/design/v1-decisions.md`, "API token details").
 
 ### LOW: Host header not checked against the CONNECT target
 
@@ -254,18 +258,19 @@ into a header, where it would inject header lines and could desync framing
 with the upstream: the request is refused with `403 invalid-value` (attack
 test in `server.test.ts`). Values in the request line are percent-encoded.
 The header section is capped at 64 KiB (`431`), and buffered bodies at the
-cap above, so one tunnel can't grow coatcheck's memory without bound. The MITM parser frames `Transfer-Encoding: chunked` and
+cap above (default 1 MiB), so one tunnel can't grow coatcheck's memory
+without bound. The MITM parser frames `Transfer-Encoding: chunked` and
 `Content-Length` bodies per RFC 9112 (`http1-framing.ts`), so body bytes can't
 be parsed as a new request whose header tickets would be swapped. Ambiguous
 framing (both headers, codings other than `chunked`, repeated or malformed
 `Content-Length`, whitespace before a colon, obs-fold, malformed chunks) gets
 `400` and the tunnel is closed, which refuses request smuggling between
-coatcheck and the upstream. Request trailers pass through unswapped. The MITM speaks HTTP/1.1 only and advertises
-just `http/1.1` over ALPN. After a `101 Switching Protocols` response the
-tunnel becomes a raw pipe, so WebSocket frames are neither swapped nor
-inspected.
+coatcheck and the upstream. Request trailers pass through unswapped. The
+MITM speaks HTTP/1.1 only and advertises just `http/1.1` over ALPN. After a
+`101 Switching Protocols` response the tunnel becomes a raw pipe, so WebSocket
+frames are neither swapped nor inspected.
 
-### Browser injection
+### Fixed: agent scripts could read values filled into the page
 
 Fixed by roadmap item 20 (broker-performed login): coatcheck no longer hands
 the agent a credential ticket to fill. The v1 flow let the agent run its own
@@ -285,15 +290,24 @@ reads and asserts none yields the password). This removed the v1 outbound
 `Input.insertText` substitution, session-bound tickets, `mint-tokens`, and the
 keystroke detector; see `docs/design/cdp-injection.md` for what each did.
 
-Fixed by roadmap item 13 and extended by item 20: with a valid browser-service
-API-key ticket, the agent could call Browserbase's `/v1/sessions/{id}/debug`
-and receive raw CDP and live-view URLs that never pass through the CDP proxy
-(no redaction). The adapter rewrites those URLs to the local proxy or removes
-them, strips `signingKey` and `seleniumRemoteUrl` from responses, and (item 20)
-strips browser-extension parameters from session-create request bodies.
-Remaining second routes: URL shapes the adapter doesn't recognise, vendor
-endpoints outside the adapter hosts, and browser-service hosts listed in
-`COATCHECK_PASSTHROUGH_HOSTS`.
+### MEDIUM: second routes to the remote browser
+
+The login window's protections (held agent frames, removed scripts, inbound
+redaction) only apply to connections through coatcheck's CDP listener. An
+agent with its own route to the same browser could read the fields while
+coatcheck fills them.
+
+Fixed in part by roadmap item 13, extended by item 20: with a valid
+browser-service API-key ticket, the agent could call Browserbase's
+`/v1/sessions/{id}/debug` and receive raw CDP and live-view URLs that never
+pass through the CDP proxy. The adapter rewrites those URLs to the local proxy
+or removes them, strips `signingKey` and `seleniumRemoteUrl` from responses,
+and (item 20) strips `extensionId` from session-create request bodies, since
+an uploaded extension can run agent code in the browser. What remains: URL
+shapes the adapter doesn't recognise, vendor endpoints outside the adapter
+hosts, browser-service hosts listed in `COATCHECK_PASSTHROUGH_HOSTS`, and any
+route the agent obtains from the vendor without coatcheck (for example a
+vendor API key it holds directly).
 
 ## Residual risk accepted by design
 
@@ -311,7 +325,7 @@ endpoints outside the adapter hosts, and browser-service hosts listed in
   the raw value. This is the same upstream-trust boundary as above.
 - **Cross-origin iframe logins and 2FA are out of scope.** Selectors resolve in
   the main document only; a login whose form is an embedded cross-origin widget
-  is refused. 2FA/OTP flows are not handled.
+  fails with `selector-not-found`. 2FA/OTP flows are not handled.
 - **Binary and screenshot CDP frames are not inspected.** Redaction covers
   text frames; a screenshot taken outside the login window can capture whatever
   is rendered.

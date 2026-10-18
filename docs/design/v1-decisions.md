@@ -1,6 +1,9 @@
 # v1 design decisions
 
-Status: **decided**. These decisions are the basis for `docs/ROADMAP.md`.
+Status: **decided**, and implemented through roadmap item 19. These
+decisions are the basis for `docs/ROADMAP.md`. Roadmap item 20
+(`cdp-broker-login.md`) later replaced the CDP ticket flow; the sections it
+superseded carry a dated note and are otherwise kept as written.
 Implement them as written. If one proves wrong during implementation (for
 example, a test shows it doesn't work), stop and raise it; don't redesign it
 inside a roadmap item. Each section names the alternatives that were rejected
@@ -12,7 +15,7 @@ npm workspaces with three published packages. The `coatcheck` bin lives in core
 and loads the provider dynamically.
 
 ```
-package.json            private root: workspaces ["packages/*"], shared scripts, eslint, vitest workspace
+package.json            private root: workspaces ["packages/*"], shared scripts, eslint, vitest projects
 tsconfig.base.json      + per-package tsconfig with project references (tsc -b)
 Dockerfile, Dockerfile.dev   build all workspaces; runtime installs core + provider-aws + provider-env
 examples/               docker-compose.localstack.yml, docker-compose.env.yml (zero-AWS quickstart),
@@ -207,6 +210,10 @@ by the agent is deferred, and if it is ever added it may only narrow.
   hosts now; enforcing them against the page origin is roadmap item 15.
   Cleartext fields aren't tickets and are returned whether or not the secret
   is bound.
+
+  > **Superseded (2026-10, roadmap item 20).** `mint-tokens` is gone. `POST /_vault/{name}/login`
+  applies the same binding (unbound → `403`) and checks the page's committed
+  origin against it; no CDP ticket is issued.
 - **Unbound tickets in the token store.** A ticket issued without
   `allowedHosts` is unbound and substitutes for any host. The vault API only
   issues one when `COATCHECK_ALLOW_UNBOUND_SECRETS=1`; the mint response then
@@ -361,7 +368,9 @@ by the agent is deferred, and if it is ever added it may only narrow.
 
 - Tickets take a snapshot of `allowedHosts` at mint time.
   `TokenStore.issue(name, value, { ttlSeconds, allowedHosts, sessionId })`
-  replaces both `issue` and `issueForSession`.
+  replaces both `issue` and `issueForSession`. (Later: item 17 added
+  `swapBody`; item 20 removed `sessionId`, since there are no session-bound
+  tickets.)
 - `replaceAll(input, target: { host, scheme })` requires the target, so the
   compiler finds every call site.
 - **HTTPS MITM path.** The key is the validated CONNECT target. Upstream TLS
@@ -407,6 +416,13 @@ by the agent is deferred, and if it is ever added it may only narrow.
       cross-origin iframe (including one injected by the agent) types the real
       value into that iframe.
 
+  > **Superseded (2026-10, roadmap item 20).** There is no `Input.insertText` substitution any more.
+  coatcheck fills the form itself on a freshly reloaded document while the
+  agent's frames are held, checking the committed main-frame origin before
+  and after the reload. Selectors resolve in the main document only, so
+  cross-origin iframe logins fail with `404 selector-not-found`. The current residual risks are in
+  `cdp-broker-login.md`.
+
 ## 4. Configuration
 
 Use environment variables for scalar settings, plus one optional JSON policy
@@ -438,7 +454,7 @@ file.
 | `COATCHECK_PASSTHROUGH_HOSTS` | empty | never MITM (cert-pinned clients); exact or wildcard |
 | `COATCHECK_MAX_SWAP_BODY_BYTES` | `1048576` | largest body buffered for `swap_body`; larger ones stream unscanned (item 19) |
 | `COATCHECK_CA_DIR` | unset | unset: ephemeral in-memory CA. Set: persist the CA key and cert only |
-| `COATCHECK_CA_SUBJECT` | `CN=coatcheck CA,O=coatcheck` | |
+| `COATCHECK_CA_SUBJECT` | `CN=coatcheck CA, O=coatcheck` | |
 | `COATCHECK_MISSING_SECRET_URL` | unset | `vault_url` hint in 404s; omitted when unset |
 | `COATCHECK_CDP_ENABLED` | `0` | |
 | `COATCHECK_CDP_PORT` | `8444` | |
@@ -513,7 +529,9 @@ uses core's name rules, because JSON keys need no mapping.
   browser-service response, and Playwright's `connectOverCDP` URL is the only
   thing every client can carry. Revisit if a CDP adapter without that flow
   appears.
-- The demo `docker-compose.example.yml` binds `0.0.0.0`, so it requires
+- The demo compose files (`examples/docker-compose.localstack.yml` and
+  `examples/docker-compose.env.yml`; `docker-compose.example.yml` before item
+  12) bind `0.0.0.0`, so they require
   `COATCHECK_API_TOKEN` from the environment instead of hard-coding one: a
   published demo token would be no authentication at all.
 
@@ -554,6 +572,7 @@ Policy file:
     CONNECT is MITM'd. Otherwise the opt-out would silently stop working on
     hosts outside the policy.
   - *Session-bound (CDP) tickets don't count.* They never swap on HTTP(S).
+    (Item 20 removed session-bound tickets.)
   - *An adapter host counts only when CDP is enabled*, because that is the
     only time its responses are rewritten. Its API key ticket is normally
     covered by the policy's `shared` hosts anyway.
@@ -618,6 +637,9 @@ export interface BrowserAdapter {
 }
 ```
 
+Item 20 added an optional `rewriteRequestJson(body): boolean`, which the
+Browserbase adapter uses to strip `extensionId` from JSON request bodies.
+
 - The HTTP/1.1 framing in `browserbase-rewrite.ts` is vendor-neutral and
   becomes `createJsonResponseRewriter(transform)` in core. Adapters supply only
   the JSON transform.
@@ -635,6 +657,12 @@ export interface BrowserAdapter {
   logging.
 
 ### CDP origin binding details (recorded while implementing roadmap item 15)
+
+> **Superseded (2026-10, roadmap item 20).** The `Input.insertText` gate, the CDP errors and the
+`Runtime.*` handling below no longer exist. The origin-tracking rules (per
+flattened session, unknown while navigating, http(s) only) still hold: the
+login driver uses them for its origin check and page selection. The e2e
+setup is unchanged and now covers broker-performed login.
 
 - **Origin state is per flattened CDP `sessionId`** (the top-level
   `sessionId` field of a frame; frames without one share a root entry). It
@@ -689,6 +717,11 @@ export interface BrowserAdapter {
 
 ### `mint-tokens` session details (recorded while implementing roadmap item 14)
 
+> **Superseded (2026-10, roadmap item 20).** `mint-tokens` was removed. The sid lifetime rule
+still holds. `POST /_vault/{name}/login` needs a *connected* sid (a
+controller attached by the CDP proxy), checked before the provider is
+called, and answers `404` otherwise.
+
 - **A sid is live from `register` until its 10-minute TTL if no client
   connects; once a client connects, it stays live until that connection
   closes** (teardown revokes it). `mint-tokens` accepts only live sids.
@@ -726,7 +759,8 @@ export interface BrowserAdapter {
   view in the agent's hands is raw CDP, which is the bypass this item closes.
   Cost: Browserbase live view is unavailable through coatcheck while CDP is
   enabled. `seleniumRemoteUrl` is left: without `signingKey` it can't
-  authenticate.
+  authenticate. (Superseded by item 20: `seleniumRemoteUrl` is removed too,
+  as a route to the browser that bypasses the CDP proxy.)
 - **Library adapters replace the env list.** `startCoatcheck({ adapters })`
   uses exactly the adapters given; when omitted, `COATCHECK_BROWSER_ADAPTERS`
   (comma-separated built-in names, default `browserbase`; unknown names fail
@@ -780,7 +814,8 @@ export interface BrowserAdapter {
   consumers that break are clients that pattern-match `tok_`, and they are
   updated in the same change.
 - Export one `TICKET_PREFIX` / `TICKET_PATTERN` and use it everywhere,
-  including the CDP outbound pre-filter.
+  including the CDP outbound pre-filter (removed with outbound substitution
+  in item 20).
 - Deferred: a checksum suffix for registering the pattern with secret
   scanners.
 
@@ -791,8 +826,8 @@ export interface BrowserAdapter {
 | MITM only when the token store is non-empty | Fixed by §5 (`bound` default, `always` opt-in) |
 | Vault API and proxy unauthenticated | Fixed: `COATCHECK_API_TOKEN`, required off loopback |
 | STS-assume pitfall | Fixed in provider-aws (`ExternalId` plus a warning) and the AWS deploy guide |
-| `mint-tokens` doesn't validate `sessionId` | Fixed: unknown sid returns `404` |
-| No CDP origin binding; `Runtime.evaluate` exfiltration | Fixed by §3 |
+| `mint-tokens` doesn't validate `sessionId` | Fixed: unknown sid returns `404`. `mint-tokens` later removed by item 20; `/login` keeps the check |
+| No CDP origin binding; `Runtime.evaluate` exfiltration | Fixed by §3; replaced by broker-performed login (item 20) |
 | OAuth refresh logs the provider's body | Fixed: status and parsed `error` code only |
 | OAuth `token_url` unchecked | Fixed by §3 |
 | Secret names unvalidated | Fixed by §2 |
@@ -800,5 +835,5 @@ export interface BrowserAdapter {
 | Tickets reusable until TTL | Deferred past 1.0; host binding removes most of the risk. TTL becomes configurable |
 | Egress domain allowlist in the broker | Deferred past 1.0 (builds on `COATCHECK_MITM=always`) |
 | `Host` / SNI not compared with the CONNECT target | Documented: policy keys on the CONNECT target |
-| Transform-blind redaction, binary and screenshot frames, other routes to the browser, script-level exfiltration on an allowed origin, cross-origin iframe logins | Documented as accepted residual risk; README CDP claims corrected |
+| Transform-blind redaction, binary and screenshot frames, other routes to the browser, script-level exfiltration on an allowed origin, cross-origin iframe logins | Documented as accepted residual risk; README CDP claims corrected. Item 20 later closed script-level exfiltration (no agent script runs while the value is in the page) and cross-origin iframe logins fail (selectors resolve in the main document only); the rest stays documented |
 | CA key readable on shared-filesystem deployments | Documented in the deploy guide |

@@ -1,13 +1,18 @@
 # Local demo: coatcheck backed by LocalStack (SSM + Secrets Manager).
 #
+# Needs Docker. From the repo root:
+#
 #   export COATCHECK_API_TOKEN=$(openssl rand -hex 32)
-#   docker compose -f examples/docker-compose.localstack.yml up --build
-#   curl -s -H "Authorization: Bearer $COATCHECK_API_TOKEN" \
-#     localhost:3128/_vault/example-api-key              # -> {"token":"cct_...", ...}
+#   docker compose -f examples/docker-compose.localstack.yml up --build --wait
+#   # Mint a ticket: {"token":"cct_...","expires_in":900,...}
+#   TICKET=$(curl -s -H "Authorization: Bearer $COATCHECK_API_TOKEN" \
+#     localhost:3128/_vault/example-api-key | sed 's/.*"token":"\([^"]*\)".*/\1/')
 #   curl -s localhost:3128/_ca > /tmp/coatcheck-ca.crt
 #   curl -s --proxy http://coatcheck:$COATCHECK_API_TOKEN@localhost:3128 \
 #     --cacert /tmp/coatcheck-ca.crt \
-#     -H "Authorization: Bearer cct_..." https://httpbin.org/headers
+#     -H "Authorization: Bearer $TICKET" https://httpbin.org/headers
+#   docker compose -f examples/docker-compose.localstack.yml logs coatcheck   # [swap] ... result=hit
+#   docker compose -f examples/docker-compose.localstack.yml down
 #
 # httpbin echoes the real value back: the demo policy binds example-api-key to
 # httpbin.org. The same ticket sent to postman-echo.com (bound to

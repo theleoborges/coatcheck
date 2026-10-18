@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run the browser-login agent. Usage: AWS_PROFILE=liv ./run.sh [task.md]
+# Run the browser-login agent. Run ./setup-aws.sh first.
+# Usage: AWS_PROFILE=… BROWSERBASE_PROJECT_ID=… ./run.sh [task.md|attack.md|attack-transform.md]
 set -euo pipefail
 cd "$(dirname "$0")"
 : "${AWS_PROFILE:?set AWS_PROFILE}"
