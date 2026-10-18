@@ -21,14 +21,15 @@ It works like a coat check. You hand over the coat and get a ticket. The ticket 
 │                      │               │ in headers / URL         │
 │                      │               │                          │
 │ playwright           │  ws://…/cdp/  │ CDP WebSocket proxy      │
-│   page.fill(cct_…) ──┼──────────────>│ swap in Input.insertText ├──────────> browser service
+│   POST /_vault/{n}/  │               │ coatcheck fills & submits│
+│        login ────────┼──────────────>│ the form itself ─────────┼──────────> browser service
 │                      │<──────────────┤ redact echoed secrets    │            (Browserbase)
 └──────────────────────┘               └──────────────────────────┘
 ```
 
 1. **Ticket issuance.** The agent calls `GET http://127.0.0.1:3128/_vault/{name}`. coatcheck fetches the secret from its backend and returns `cct_` plus 64 hex characters. Tickets live only in coatcheck's memory, with a 15-minute TTL. Each ticket is bound to the secret's allowed hosts (see [Policy file](#policy-file)); a secret with no allowed hosts gets no ticket.
 2. **HTTPS substitution.** The agent container sets `HTTPS_PROXY` to coatcheck and trusts coatcheck's CA. coatcheck intercepts `CONNECT` tunnels to hosts a ticket could be used on (hosts in the policy file, hosts of a live ticket, and the browser service's API host) with a per-host certificate it signs itself, negotiating HTTP/1.1. It replaces every active ticket it finds in the request line and headers, then re-encrypts to the real host, with normal certificate verification. A ticket is only replaced when the `CONNECT` target is one of its allowed hosts; otherwise the request is refused with `403` and never forwarded. This works with unmodified tools such as curl, git over HTTPS (with a bearer header), Python `requests`, and Node `fetch`, because they only need proxy support and a trusted CA. Plain-HTTP proxy requests get the same treatment. Every other `CONNECT` is a blind TCP tunnel (see `COATCHECK_MITM`). WebSocket upgrades work through an intercepted tunnel: after `101 Switching Protocols` it becomes a raw pipe.
-3. **Browser (CDP) injection.** With the CDP proxy enabled, coatcheck rewrites the browser service's CDP URLs (the session `connectUrl`, and the debug endpoint's URLs) so they point at a local WebSocket proxy. The agent's Playwright client connects there. On the way out, coatcheck swaps session-scoped tickets inside `Input.insertText` (what `page.fill()` sends), and only when the page's origin is one of the login secret's allowed hosts. On the way back, it redacts any real value the page echoes. Keystroke-by-keystroke entry fails closed (details [below](#browser--cdp-credential-injection)).
+3. **Browser (CDP) injection.** With the CDP proxy enabled, coatcheck rewrites the browser service's CDP URLs (the session `connectUrl`, and the debug endpoint's URLs) so they point at a local WebSocket proxy. The agent's Playwright client connects there, navigates to the login page, and calls `POST /_vault/{name}/login`. coatcheck then performs the fill and submit itself over the CDP connection — on a freshly reloaded document, with the agent's frames held — so no credential ticket ever enters the browser. On the way back it redacts any real value the page echoes. Details [below](#browser--cdp-credential-injection).
 4. **OAuth refresh.** `POST /_vault/{name}/refresh` runs the refresh-token exchange inside coatcheck. It writes the new tokens back to the backend and returns only a ticket for the new access token.
 
 ## Quickstart
@@ -132,7 +133,7 @@ The API is served on the proxy port (default `127.0.0.1:3128`). With `COATCHECK_
 | `GET /_vault/{name}?field={f}` | `{"token":"cct_…","expires_in":900,"allowed_hosts":[…]}` | Ticket for one field; every field shares the secret's allowed hosts. If the secret's `_cleartext` array lists the field, returns `{"value":"…","cleartext":true}` instead (for non-sensitive values such as URLs and account IDs). |
 | `GET /_vault/{name}?check=1` | `{"exists":true}` | Checks whether a secret exists without decrypting it. |
 | `GET /_secret/{name}` | `{"token":"cct_…","expires_in":900,"allowed_hosts":[…]}` | Shared key from the backend's shared store. Returns 403 unless `{name}` is listed under `shared` in the policy file (with no policy file, every name gets 403). The ticket is bound to the hosts listed there. |
-| `POST /_vault/mint-tokens` | `{"username_token":"cct_…","password_token":"cct_…","expires_in":600,"allowed_hosts":[…]}` | Body: `{"secretName":"example-login","sessionId":"<cdp sid>","expires_in"?:N}`. The secret must be a multi-value secret with `username` and `password`. Tickets are bound to one CDP session (see below); `404` unless `sessionId` is a live sid from a rewritten URL (unknown, expired, or its connection has closed). Default TTL is 600 s, capped at 1800 s. The login secret must have allowed hosts; the tickets only fill pages on those hosts. |
+| `POST /_vault/{name}/login` | `{"status":"ok","url":"https://…"}` on success | Broker-performed browser login. Body: `{"sessionId":"<cdp sid>","page"?:{"url":"…"},"fields":{"<field>":"<css selector>",…},"submit":"<css selector>" or {"press":"Enter"},"until"?:"navigation"\|{"selector":"…"}\|{"urlPrefix":"…"},"timeoutMs"?:N}`. coatcheck fills each field of the multi-value secret `{name}` and submits, on the live CDP session, without any ticket entering the browser. The page's committed origin must be in the secret's allowed hosts (`403` otherwise). Other statuses: `404` (unknown sid/secret or a selector matched nothing), `409` (`no-success` on timeout — the filled fields are cleared first; `interception-active`; `busy`; `page-ambiguous`), `501` (not a multi-value secret with those fields), `502` (the upstream closed or a driver error — fields cleared). `timeoutMs` default 15 000, max 60 000. Replaces the removed `POST /_vault/mint-tokens`. |
 | `POST /_vault/{name}/refresh` | `{"token":"cct_…","expires_in":900,"allowed_hosts":[…]}` | Secret fields: `refresh_token`, `token_url`, `client_id`, `client_secret`. The `token_url` host must be one of the secret's allowed hosts (`403` otherwise), because `client_secret` is sent there. coatcheck posts a `refresh_token` grant, writes `access_token`, `expires_at`, and any rotated `refresh_token` back to the backend, and returns a ticket for the new access token, bound to the same hosts. |
 
 Secret names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` after URL-decoding; anything else (including `/` or a leading `.`) gets `400` before the backend is consulted. `refresh` returns `501` when the configured backend is read-only.
@@ -277,33 +278,40 @@ On the plain-HTTP path tickets are swapped only in the path, query, headers and 
 
 This lets an agent log into a website through a remote browser without handling the password itself. Set `COATCHECK_CDP_ENABLED=1`. Browserbase is the only supported browser service today.
 
-> **Known weakness in the current (v1) flow.** Once the agent's `page.fill()` has put the real value into the form, script the agent runs on that page (`page.evaluate`) can read it back in a form the redactor doesn't recognise. The v1 flow therefore protects against the password *accidentally* reaching the agent's context, logs or transcript; it does not protect against an agent that is actively trying to read it. The replacement design, where coatcheck performs the fill and submit itself while the agent is held, is [docs/design/cdp-broker-login.md](docs/design/cdp-broker-login.md) (roadmap item 20).
+coatcheck performs the fill and submit itself over the CDP connection (**broker-performed login**, roadmap item 20). The agent never has a credential ticket for the login, and never runs its own script while a real value is in the page: during the login window coatcheck holds the agent's CDP frames, removes the agent's new-document scripts and reloads to a fresh document, then fills and submits. This is what protects against an agent that is actively trying to read the password, not merely against accidental exposure. Design: [docs/design/cdp-broker-login.md](docs/design/cdp-broker-login.md).
 
-1. The agent creates a session with `POST https://api.browserbase.com/v1/sessions` **through `HTTPS_PROXY`**, authenticating with a `/_secret/browserbase-api-key` ticket. coatcheck rewrites the response's `connectUrl` from the real `wss://…` URL, which carries Browserbase's signing key, to `ws://{COATCHECK_CDP_ADVERTISE_HOST}:8444/cdp/{sid}`. It also removes `signingKey`, and rewrites (or, for live-view pages, removes) the URLs returned by `GET /v1/sessions/{id}/debug`, so the agent never sees a real CDP URL. A `sid` is valid for 10 minutes until a client connects.
-2. The agent mints session-bound tickets with `POST /_vault/mint-tokens {"secretName":"example-login","sessionId":"{sid}"}`. The sid must be one coatcheck issued and still live: unconnected sids expire after 10 minutes, connected ones when their connection closes. Anything else gets `404`.
-3. The agent connects (`chromium.connectOverCDP(connectUrl)`) and fills the form:
+1. The agent creates a session with `POST https://api.browserbase.com/v1/sessions` **through `HTTPS_PROXY`**, authenticating with a `/_secret/browserbase-api-key` ticket. coatcheck rewrites the response's `connectUrl` from the real `wss://…` URL, which carries Browserbase's signing key, to `ws://{COATCHECK_CDP_ADVERTISE_HOST}:8444/cdp/{sid}`. It removes `signingKey` and `seleniumRemoteUrl`, strips browser-extension parameters from the session-create request body, and rewrites (or, for live-view pages, removes) the URLs returned by `GET /v1/sessions/{id}/debug`, so the agent never sees a real route to the browser. A `sid` is valid for 10 minutes until a client connects.
+2. The agent connects (`chromium.connectOverCDP(connectUrl)`), navigates to the login page, and calls the login API instead of filling the form itself:
 
    ```js
-   await page.fill('input[name=email]', usernameToken);
-   await page.fill('input[name=password]', passwordToken);
-   await page.click('button[type=submit]');
+   await page.goto('https://www.example.com/login');
+   await fetch(`${COATCHECK_URL}/_vault/example-login/login`, {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${COATCHECK_API_TOKEN}` },
+     body: JSON.stringify({
+       sessionId: sid,
+       fields: { username: '#username', password: '#password' },
+       submit: 'button[type=submit]',
+       until: 'navigation',
+     }),
+   });
+   // carry on with the logged-in page
    ```
 
-What the CDP proxy does:
+What coatcheck does during the login window:
 
-- **Outbound, origin-bound.** Swaps session-bound tickets only in `Input.insertText.text` (what `page.fill()` sends), and only when the page's committed main-frame origin (tracked from `Page.frameNavigated`) is one of the login secret's allowed hosts. An `http://` page needs an `http://` entry. On another origin, before the first navigation, while a navigation is in progress, or on a non-http(s) page, the frame is dropped and the client gets a CDP error (`credential-origin violation: …`). Playwright retries a refused `fill` until its action timeout, so it surfaces as a `TimeoutError`; coatcheck logs `FAIL-CLOSED: origin binding refused …`.
-- **No script substitution.** `Runtime.evaluate` and `Runtime.callFunctionOn` are never substituted, so an expression can't be used to send the real value elsewhere. `page.fill()` still works on text, email and password inputs: Playwright passes the value to its injected script, which sees only the ticket, and types it with `Input.insertText`. Tickets in other methods are forwarded unchanged and logged.
-- **Session scoping.** Session-bound tickets substitute only on their own CDP session's frames, never on the HTTPS path. They are revoked when the WebSocket closes.
-- **Inbound.** Every real value from the session is replaced with `[REDACTED:{secret}:{field}]`. If a frame cannot be parsed, or still contains a real value after redaction, it is dropped.
-- **Keystroke fail-closed.** `page.type()` sends one `Input.dispatchKeyEvent` per character, so the ticket never appears whole in one frame and cannot be swapped. coatcheck tracks the typed characters. When they spell an active ticket, it drops the frame and returns a CDP error telling the client to use `page.fill()`. The preceding keystrokes have already been forwarded, so the field holds a partial ticket string, never the secret.
+- **Quiesce the agent.** Agent → browser frames are queued (released in order afterwards). Browser events and responses to the agent's earlier commands still flow, with inbound redaction.
+- **Fresh document.** It removes the new-document scripts the agent registered (`Page.addScriptToEvaluateOnNewDocument`) and reloads, so only the site's own JS runs. Listeners the agent installed through earlier script die with the old document.
+- **Origin check.** The page's committed main-frame origin (tracked from `Page.frameNavigated`) must be one of the login secret's allowed hosts. An `http://` page needs an `http://` entry. On another origin, an unknown origin, or during a navigation, the login is refused with `403` and nothing is filled.
+- **Fill and submit** each field with the real value via `Input.insertText`, then click the submit selector (or press Enter), and wait for the `until` condition. On timeout the filled fields are emptied before the agent resumes (`409 no-success`, `cleared: true`).
+- **Preconditions.** Request interception on the page (`Fetch.enable` / `Network.setRequestInterception`) refuses the login (`409 interception-active`) rather than silently disabling it. A second login on the same connection gets `409 busy`.
+- **Inbound redaction** stays as a backstop for browser-produced data: every real value from the session is replaced with `[REDACTED:{secret}:{field}]`, including its percent-encoded, HTML-entity and JSON-escaped forms. A frame that can't be parsed, or still carries a real value after redaction, is dropped.
 
 Client rules:
 
-- Use `page.fill()`, never `page.type()` or `page.evaluate()`, for credential fields.
-- Navigate to the login page (`page.goto`) and let it finish loading before filling.
-- Don't take screenshots during login, and don't toggle "show password". Pixels are not redacted, so a rendered secret ends up in the agent's context.
-- Don't read a password field's `.value` back. The frame is dropped, so the read fails.
-- Normal HTML login forms work. 2FA/OTP flows are not handled.
+- Navigate to the login page (`page.goto`) and let it finish loading before calling `/login`.
+- Outside the login window there are no credential tickets in the browser to protect: the agent may use `page.type()`, `page.evaluate()` and screenshots freely. During login, don't enable request interception on the page.
+- Normal HTML login forms work, full-page or SPA (`until` covers both). Logins inside a cross-origin iframe are refused: navigate to the identity provider's own page first. 2FA/OTP flows are not handled.
 - One CDP connection at a time per coatcheck instance. A second connection is refused with WebSocket close code 1013.
 
 ## Status & known limitations
@@ -316,9 +324,9 @@ coatcheck is **pre-1.0**. The HTTP API, ticket format (`cct_…`), and configura
 - **Interception follows the bindings, not the request.** In the default `bound` mode, a keep-alive tunnel opened to a host before any ticket for it existed (a host bound only by a secret's `_allowed_hosts`) stays a raw tunnel, so a ticket later sent down it reaches the upstream unswapped. Clients that pin certificates fail on intercepted hosts unless listed in `COATCHECK_PASSTHROUGH_HOSTS`. Intercepted tunnels speak HTTP/1.1 only (ALPN), and WebSocket frames after an upgrade are not inspected.
 - **Without `COATCHECK_API_TOKEN`, any local process can mint tickets.** That is the intended sidecar setup (loopback, shared network namespace), and coatcheck refuses to start off loopback without a token. The token is one shared secret: there are no per-client identities or scopes.
 - **Three built-in secret backends** (environment variables, a JSON file, AWS). HashiCorp Vault and Vercel are planned; anything else needs a custom provider module.
-- **Browserbase is the only built-in browser adapter.** Other services need a custom adapter (`BrowserAdapter` in `@coatcheck/core`). With CDP enabled, Browserbase live-view URLs are removed from API responses, because a live view is a raw CDP connection.
-- **Origin binding keys on the main frame, and trusts the page once it matches.** Script the agent runs on an allowed origin (`page.evaluate`) can read the filled value and send it anywhere, in a transformed form the redactor doesn't catch. Logins inside cross-origin iframes aren't handled correctly: a login form in an iframe from another origin (an embedded auth widget) is refused unless the main frame's origin is allowed; on an allowed main frame, a fill whose focus is inside a cross-origin iframe (including one the agent injected) types the real value into that iframe. A navigation started by page script can race a fill.
-- **CDP v1 limits:** agent script on the allowed origin can read a filled value back (see the note in [Browser / CDP credential injection](#browser--cdp-credential-injection); fix in progress), one session at a time, no 2FA, no `page.type()` support, and no screenshot redaction.
+- **Browserbase is the only built-in browser adapter.** Other services need a custom adapter (`BrowserAdapter` in `@coatcheck/core`). With CDP enabled, Browserbase live-view URLs, `seleniumRemoteUrl` and the signing key are removed from API responses, and extension parameters are stripped from session-create requests, because each is a route to run code in or connect directly to the browser.
+- **The site and the browser vendor see the password.** coatcheck performs the login against the real site, so the site necessarily receives the credential; this is the accepted upstream-trust boundary. Client-side-hashing and challenge logins work because the page's own JS sees the raw value.
+- **CDP limits:** cross-origin iframe logins are refused (navigate to the IdP's own page first), one CDP session at a time, and no 2FA/OTP. Binary and screenshot frames are not inspected; a screenshot the agent takes outside the login window can still capture a rendered value if the agent put one there by other means.
 
 ## How this differs from superfly/tokenizer
 
@@ -328,7 +336,7 @@ coatcheck makes different trade-offs:
 
 - **Unmodified tools.** coatcheck is a standard `HTTPS_PROXY` with TLS interception, so curl, git, SDKs, and code an LLM writes on the fly work if they honor the proxy variable and trust the CA. No client changes are needed.
 - **Secrets by name from a store.** The agent asks for `github-token` and gets a ticket. It never holds secret material, sealed or otherwise. The cost is a stateful component and a backend dependency.
-- **Browser/CDP injection.** coatcheck fills credentials into remote-browser sessions over CDP, with inbound redaction and keystroke fail-closed. tokenizer does not cover browsers.
+- **Browser/CDP injection.** coatcheck logs an agent into a website through a remote browser by performing the fill and submit itself over CDP, with the agent's frames held and inbound redaction as a backstop. tokenizer does not cover browsers.
 - **Weaker today.** coatcheck has no signing processors, an area where tokenizer is ahead. Both bind secrets to hosts; coatcheck's binding comes from an operator policy file and the stored secret rather than from the sealed secret.
 
 ## Development

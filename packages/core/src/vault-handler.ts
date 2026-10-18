@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { TokenStore } from './token-store.js';
 import type { CertAuthority } from './ca.js';
-import type { CdpSessionStore } from './cdp-session-store.js';
+import type { CdpSessionStore, LoginRequest, LoginResult } from './cdp-session-store.js';
 import { InvalidSecretNameError, isValidSecretName, type SecretProvider } from './secret-provider.js';
 import { policyRuleFor, type Policy } from './policy.js';
 import { matchesHost, type HostPattern } from './host-matcher.js';
@@ -17,8 +17,8 @@ export interface VaultDeps {
   policy: Policy;
   /** `COATCHECK_ALLOW_UNBOUND_SECRETS`: mint unbound tickets instead of refusing with 403. */
   allowUnboundSecrets?: boolean;
-  /** Live CDP sessions: `mint-tokens` refuses an unknown, expired or closed sid with 404. */
-  cdpSessionStore: Pick<CdpSessionStore, 'has'>;
+  /** Live CDP sessions: `login` refuses a session with no attached controller with 404. */
+  cdpSessionStore: Pick<CdpSessionStore, 'controller'>;
 }
 
 /**
@@ -165,14 +165,15 @@ export function handleVaultRequest(
     return true;
   }
 
-  // Mint session-scoped credential tokens for a web login (CDP injection).
-  // The credential is an ordinary multi-value secret (short handle like `example-login`,
-  // since vault names can't be FQDNs) with `username` and `password` fields.
-  // Tokens are bound to the agent's CDP session so they only resolve on that
-  // session's WebSocket frames.
-  if (url === '/_vault/mint-tokens' && req.method === 'POST') {
+  // Broker-performed browser login (CDP injection). coatcheck fills and submits
+  // the login form itself over the agent's CDP connection; no credential ticket
+  // ever enters the browser. Replaces mint-tokens.
+  const loginMatch = url.match(/^\/_vault\/([^/?]+)\/login$/);
+  if (loginMatch && req.method === 'POST') {
+    const secretName = decodeSecretName(loginMatch[1], res);
+    if (secretName === null) return true;
     readJsonBody(req).then(body => {
-      handleMintTokens(body, res, deps);
+      handleLogin(secretName, body, res, deps);
     }).catch(() => {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Invalid JSON body' }));
@@ -285,90 +286,128 @@ function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown
   });
 }
 
-const MINT_DEFAULT_TTL_SECONDS = 600; // 10 minutes
-const MINT_MAX_TTL_SECONDS = 1800; // 30 minutes — cap to bound credential exposure
+const LOGIN_DEFAULT_TIMEOUT_MS = 15_000;
+const LOGIN_MAX_TIMEOUT_MS = 60_000;
 
 /**
- * Mint session-scoped username/password tokens for a stored web login.
- *
- * The credential is a normal multi-value secret (vault names are alphanumeric +
- * dashes, so it's a short handle like `example-login`, NOT a domain) with `username` +
- * `password` fields. The user tells the agent which secret to use. Tokens are
- * bound to the caller's CDP session id so they only substitute on that session's
- * frames and are revoked when the session closes.
+ * Drive a broker-performed browser login (design: docs/design/cdp-broker-login.md).
+ * coatcheck fills the stored credential and submits the form itself over the
+ * agent's CDP connection, on a freshly reloaded document, while the agent's
+ * frames are held. No ticket for the credential ever reaches the browser.
  */
-function handleMintTokens(
+function handleLogin(
+  secretName: string,
   body: Record<string, unknown>,
   res: http.ServerResponse,
   deps: VaultDeps,
 ): void {
-  const { tokenStore, provider } = deps;
-  const secretName = typeof body.secretName === 'string' ? body.secretName : '';
   const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
-
-  if (!secretName || !sessionId) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Both `secretName` and `sessionId` are required' }));
-    return;
+  const fields = isRecord(body.fields) ? body.fields : null;
+  if (!sessionId || !fields || Object.keys(fields).length === 0) {
+    return send(res, 400, { error: '`sessionId` and a non-empty `fields` object are required' });
   }
-  if (!isValidSecretName(secretName)) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Invalid secret name' }));
-    return;
-  }
-  // Only sessions coatcheck created (via an adapter rewrite) and that are still
-  // live can take credentials; checked before the provider is consulted.
-  if (!deps.cdpSessionStore.has(sessionId)) {
-    console.warn(`[mint] secret=${secretName} rejected: unknown or expired CDP session`);
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Unknown or expired CDP session' }));
-    return;
+  // Every field selector must be a string.
+  const selectors: Record<string, string> = {};
+  for (const [field, sel] of Object.entries(fields)) {
+    if (typeof sel !== 'string' || sel === '') return send(res, 400, { error: `field '${field}' must map to a non-empty CSS selector` });
+    selectors[field] = sel;
   }
 
-  let ttl = MINT_DEFAULT_TTL_SECONDS;
-  if (typeof body.expires_in === 'number' && body.expires_in > 0) {
-    ttl = Math.min(body.expires_in, MINT_MAX_TTL_SECONDS);
+  const submit = parseSubmit(body.submit);
+  if (!submit) return send(res, 400, { error: '`submit` must be a selector string or {"press":"Enter"}' });
+  const until = parseUntil(body.until);
+  if (!until) return send(res, 400, { error: '`until` must be "navigation", {"selector":"…"} or {"urlPrefix":"…"}' });
+
+  let timeoutMs = LOGIN_DEFAULT_TIMEOUT_MS;
+  if (typeof body.timeoutMs === 'number' && body.timeoutMs > 0) timeoutMs = Math.min(body.timeoutMs, LOGIN_MAX_TIMEOUT_MS);
+
+  const pageUrlPrefix = isRecord(body.page) && typeof body.page.url === 'string' ? body.page.url : undefined;
+
+  // "Connected" means a controller is attached for the sid (design decision 1).
+  const controller = deps.cdpSessionStore.controller(sessionId);
+  if (!controller) {
+    console.warn(`[login] secret=${secretName} rejected: no live CDP connection for session`);
+    return send(res, 404, { status: 'unknown-sid-or-secret', error: 'Unknown or not-connected CDP session' });
   }
 
-  provider.secrets.get(secretName).then(secret => {
-    if (secret === null) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        error: `No credential stored under '${secretName}'`,
-        ...vaultUrlHint(deps),
-      }));
-      return;
+  deps.provider.secrets.get(secretName).then(secret => {
+    if (secret === null) return send(res, 404, { status: 'unknown-sid-or-secret', error: `No credential stored under '${secretName}'`, ...vaultUrlHint(deps) });
+
+    const parsedSecret = parseSecretValue(secret.value);
+    if (parsedSecret.kind !== 'multi') return send(res, 501, { error: `Secret '${secretName}' is not a multi-value web login` });
+    const cleartextFields: string[] = (Array.isArray(parsedSecret.fields._cleartext) ? parsedSecret.fields._cleartext : []).filter((f): f is string => typeof f === 'string');
+    const userFieldNames = userFields(parsedSecret.fields);
+    const fillable = new Set([...userFieldNames, ...cleartextFields]);
+
+    // Every requested field must exist on the secret.
+    const values: Record<string, string> = {};
+    for (const field of Object.keys(selectors)) {
+      const fieldValue = parsedSecret.fields[field];
+      // A `_cleartext` entry can name a field that isn't actually present; don't
+      // fill the literal string "undefined".
+      if (!fillable.has(field) || fieldValue === undefined) return send(res, 501, { error: `Secret '${secretName}' has no field '${field}'` });
+      values[field] = String(fieldValue);
     }
 
-    const secretValue = parseSecretValue(secret.value);
-    const parsed = secretValue.kind === 'multi' ? secretValue.fields : null;
-    const username = parsed?.username;
-    const password = parsed?.password;
-    if (!parsed || typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        error: `Secret '${secretName}' is not a web login — it must be a multi-value secret with 'username' and 'password' fields`,
-      }));
-      return;
-    }
-
-    // Snapshot the login's hosts now; the CDP path enforces them from roadmap item 15.
-    const binding = bindingFor(deps, secretName, secretValue.inBand);
+    const binding = bindingFor(deps, secretName, parsedSecret.inBand);
     if (!sendBindingError(res, binding)) return;
-    const opts = { sessionId, ttlSeconds: ttl, allowedHosts: binding.allowedHosts };
-    const usernameToken = tokenStore.issue(`${secretName}:username`, username, opts);
-    const passwordToken = tokenStore.issue(`${secretName}:password`, password, opts);
-    console.log(`[mint] secret=${secretName} session=${sessionId} ttl_s=${ttl}${binding.allowedHosts ? '' : ' unbound=1'}`);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      username_token: usernameToken.id,
-      password_token: passwordToken.id,
-      expires_in: ttl,
-      allowed_hosts: allowedHostsJson(binding.allowedHosts),
-    }));
-  }).catch(err => {
-    sendProviderError(res, err, `Error minting tokens for '${secretName}':`, 'Failed to mint tokens');
-  });
+
+    // Register the sensitive field values (not `_cleartext`) for inbound
+    // redaction for the life of the window; dropped at session teardown.
+    const redactValues = Object.keys(selectors)
+      .filter(f => !cleartextFields.includes(f))
+      .map(f => ({ value: values[f], secretName: `${secretName}:${f}` }));
+    deps.tokenStore.registerSessionValues(sessionId, redactValues);
+
+    controller.login({
+      fields: selectors,
+      values,
+      cleartextFields,
+      secretName,
+      allowedHosts: binding.allowedHosts,
+      pageUrlPrefix,
+      submit,
+      until,
+      timeoutMs,
+    }).then(result => sendLoginResult(res, result))
+      .catch(err => sendProviderError(res, err, `Error during login for '${secretName}':`, 'Login failed'));
+  }).catch(err => sendProviderError(res, err, `Error fetching credential '${secretName}':`, 'Failed to fetch credential'));
+}
+
+function parseSubmit(raw: unknown): LoginRequest['submit'] | null {
+  if (typeof raw === 'string' && raw !== '') return { selector: raw };
+  if (isRecord(raw) && raw.press === 'Enter') return { press: 'Enter' };
+  return null;
+}
+
+function parseUntil(raw: unknown): LoginRequest['until'] | null {
+  if (raw === undefined || raw === 'navigation') return { kind: 'navigation' };
+  if (isRecord(raw)) {
+    if (typeof raw.selector === 'string' && raw.selector !== '') return { kind: 'selector', selector: raw.selector };
+    if (typeof raw.urlPrefix === 'string' && raw.urlPrefix !== '') return { kind: 'urlPrefix', urlPrefix: raw.urlPrefix };
+  }
+  return null;
+}
+
+/** Map a driver `LoginResult` to its HTTP response (design status table). */
+function sendLoginResult(res: http.ServerResponse, result: LoginResult): void {
+  switch (result.status) {
+    case 200: return send(res, 200, { status: 'ok', url: result.url });
+    case 403: return send(res, 403, { error: result.error });
+    case 404: return send(res, 404, { status: 'selector-not-found', ...(result.field ? { field: result.field } : {}) });
+    case 409: return send(res, 409, { status: result.reason, ...(result.cleared ? { cleared: true } : {}) });
+    case 501: return send(res, 501, { error: 'Secret is not a multi-value login with the requested fields' });
+    case 502: return send(res, 502, { status: result.reason, ...(result.cleared ? { cleared: true } : {}) });
+  }
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+function send(res: http.ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
 }
 
 /**

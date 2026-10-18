@@ -1,9 +1,24 @@
 # Browser credential injection via CDP substitution
 
-Status: **implemented (v1)**, behind `COATCHECK_CDP_ENABLED=1`.
-Code: `packages/core/src/cdp/proxy.ts`, `packages/core/src/cdp/substitution.ts`, `packages/core/src/cdp/keystroke-detector.ts`,
+Status: **superseded in part by broker-performed login** (roadmap item 20,
+`docs/design/cdp-broker-login.md`), behind `COATCHECK_CDP_ENABLED=1`.
+
+> **Superseded sections.** The v1 flow handed the agent session-bound tickets
+> to fill with `page.fill()` and swapped them inside `Input.insertText`. Item 20
+> removed that: coatcheck now performs the fill and submit itself (see
+> `cdp-broker-login.md`). The following sections describe code that no longer
+> exists and are kept only to explain what was removed and why:
+> **Step 2: session-bound tickets (`POST /_vault/mint-tokens`)**,
+> **Outbound substitution**, and **Keystroke detector**. What remains in force:
+> the connectUrl rewrite and browser adapters (Step 1, now also stripping
+> request extension params and `seleniumRemoteUrl`), the CDP proxy connection
+> (Step 3), origin tracking (reused for the login origin check and page
+> selection), inbound redaction (extended to browser-applied encodings), and
+> teardown/revocation.
+
+Code: `packages/core/src/cdp/proxy.ts`, `packages/core/src/cdp/login-driver.ts`, `packages/core/src/cdp/substitution.ts`,
 `packages/core/src/cdp-session-store.ts`, `packages/core/src/browser-adapters.ts`, `packages/core/src/json-response-rewriter.ts`, wiring in `packages/core/src/mitm.ts` and `packages/core/src/start.ts`,
-mint endpoint in `packages/core/src/vault-handler.ts`.
+login endpoint in `packages/core/src/vault-handler.ts`.
 
 ## Problem
 
@@ -112,6 +127,8 @@ listed in `COATCHECK_PASSTHROUGH_HOSTS`, which disables the rewrite.
 
 ### Step 2: session-bound tickets (`POST /_vault/mint-tokens`)
 
+> **Superseded by roadmap item 20.** `mint-tokens` and session-bound tickets were removed; coatcheck fills the form itself. Kept for historical context.
+
 Body: `{ "secretName": "<name>", "sessionId": "<sid>", "expires_in"?: <seconds> }`.
 
 `handleMintTokens` (`packages/core/src/vault-handler.ts`) first checks that the
@@ -171,6 +188,8 @@ response that commits nothing). Sessions are forgotten on
 
 ### Outbound substitution (agent → browser)
 
+> **Superseded by roadmap item 20.** There is no outbound credential substitution any more; coatcheck never swaps a ticket into a CDP frame. Kept for historical context.
+
 `substituteOutbound` (`packages/core/src/cdp/substitution.ts`):
 
 - Pre-filter: if the raw frame contains no `cct_` substring, forward it
@@ -224,6 +243,8 @@ re-substitutable: filling `[REDACTED:…]` into another field sends the marker
 text literally.
 
 ### Keystroke detector: fail closed for `page.type()`
+
+> **Superseded by roadmap item 20.** The keystroke detector was removed: with no credential tickets in the browser, `page.type()` needs no special handling. Kept for historical context.
 
 `page.fill()` sends the value in one `Input.insertText` frame, which the
 outbound substitutor handles. `page.type()` sends one `Input.dispatchKeyEvent`

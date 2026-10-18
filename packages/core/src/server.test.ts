@@ -284,7 +284,7 @@ describe('coatcheck server: CONNECT', () => {
     expect(body.pages[0]).toMatchObject({ id: 'P1', url: 'https://example.com/login', title: 'Login' });
   });
 
-  it('strips signingKey from a session-create response', async () => {
+  it('strips signingKey and seleniumRemoteUrl from a session-create response', async () => {
     const upstream = await startHttpsUpstream(JSON.stringify({
       id: 's1', connectUrl: 'wss://connect.browserbase.com?signingKey=SK', seleniumRemoteUrl: 'http://connect.browserbase.com/webdriver', signingKey: 'SK',
     }));
@@ -294,7 +294,30 @@ describe('coatcheck server: CONNECT', () => {
     t.write('POST /v1/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n');
     const [res] = await readResponses(t, 1);
     expect(res.body).not.toContain('SK');
-    expect(JSON.parse(res.body)).not.toHaveProperty('signingKey');
+    expect(res.body).not.toContain('webdriver');
+    const parsed = JSON.parse(res.body);
+    expect(parsed).not.toHaveProperty('signingKey');
+    expect(parsed).not.toHaveProperty('seleniumRemoteUrl');
+  });
+
+  // Attack (roadmap item 20): the agent passes a browser extension on
+  // session-create to run its own code in the browser. The adapter strips the
+  // extension params from the request body before it reaches Browserbase.
+  it('strips extensionId from a session-create request body when CDP is enabled', async () => {
+    const upstream = await startHttpsUpstream(JSON.stringify({ id: 's1' }));
+    const { port } = await startProxy({ cdp: { port: 8444, advertiseHost: '127.0.0.1' }, browserbaseApiHost: '127.0.0.1' });
+    const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+    const t = await startTls(socket, proxyCa.caCertPem);
+    const reqBody = JSON.stringify({ projectId: 'p', extensionId: 'ext-1', browserSettings: { extensionId: 'ext-2', viewport: { width: 1280, height: 720 } } });
+    t.write(`POST /v1/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(reqBody)}\r\n\r\n${reqBody}`);
+    await readResponses(t, 1);
+
+    const forwarded = JSON.parse(upstream.received[0].body ?? '') as Record<string, unknown>;
+    expect(forwarded).not.toHaveProperty('extensionId');
+    expect(forwarded.browserSettings).not.toHaveProperty('extensionId');
+    // Non-extension fields are preserved, and the forwarded Content-Length matches.
+    expect(forwarded).toMatchObject({ projectId: 'p', browserSettings: { viewport: { width: 1280, height: 720 } } });
+    expect(Number(upstream.received[0].headers['content-length'] ?? '0')).toBe(Buffer.byteLength(JSON.stringify(forwarded)));
   });
 
   it('uses custom adapters from the library API, matched by wildcard host', async () => {
@@ -541,7 +564,6 @@ describe('coatcheck server: MITM policy', () => {
     const upstream = await startHttpsUpstream();
     const { tokenStore, port } = await startProxy();
     tokenStore.issue('github-token', 'v', { allowedHosts: hosts('api.github.com') });
-    tokenStore.issue('login:password', 'v', { sessionId: 'sid' }); // CDP tickets never swap on HTTPS
     expect(await issuerSeen(port, upstream.port)).toBe('upstream');
   });
 

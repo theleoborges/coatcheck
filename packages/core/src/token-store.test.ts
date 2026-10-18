@@ -26,9 +26,9 @@ describe('TokenStore', () => {
   it('exports one prefix and pattern that match issued tickets', () => {
     store = new TokenStore();
     const { id } = store.issue('my-secret', 'v');
-    const sessionId = store.issue('login:password', 'p', { sessionId: 'sid1' }).id;
+    const other = store.issue('login-password', 'p').id;
     expect(TICKET_PREFIX).toBe('cct_');
-    for (const t of [id, sessionId]) {
+    for (const t of [id, other]) {
       TICKET_PATTERN.lastIndex = 0;
       expect(t.startsWith(TICKET_PREFIX)).toBe(true);
       expect(`x ${t} y`.match(TICKET_PATTERN)).toEqual([t]);
@@ -261,115 +261,50 @@ describe('TokenStore', () => {
       expect(store.replaceAllInBody(plain.id, ANY_HOST, v => v)).toMatchObject({ output: plain.id, denied: [], skipped: [{ secretName: 'plain' }] });
     });
 
-    it('never swaps session-scoped tickets in a body', () => {
-      store = new TokenStore();
-      const t = store.issue('login:password', 'pw', { sessionId: 'sid', swapBody: true });
-      expect(store.replaceAllInBody(t.id, ANY_HOST, v => v)).toMatchObject({ output: t.id, swaps: [], skipped: [] });
-    });
   });
 
-  // --- Session-scoped tokens (CDP credential injection) ---
+  // --- Session redaction values (CDP broker-performed login) ---
+  //
+  // Since broker login (roadmap item 20) coatcheck no longer mints session-bound
+  // tickets. Instead a login window registers the credential's real values for
+  // the session's inbound-redaction set; they never substitute anywhere and are
+  // dropped at teardown.
 
-  describe('session-scoped tokens', () => {
-    it('replaceAllForSession substitutes only its own session tokens', () => {
+  describe('session redaction values', () => {
+    it('registerSessionValues / sessionValues return a session\'s registered values', () => {
       store = new TokenStore();
-      const a = store.issue('site:password', 'pw-a', { sessionId: 'sess-1' });
-      const b = store.issue('site:password', 'pw-b', { sessionId: 'sess-2' });
-
-      const input = `${a.id} ${b.id}`;
-      const r1 = store.replaceAllForSession(input, 'sess-1', ANY_HOST);
-      expect(r1.output).toBe(`pw-a ${b.id}`);
-      expect(r1.swaps.map(s => s.secretName)).toEqual(['site:password']);
+      store.registerSessionValues('sess-1', [{ value: 'alice', secretName: 'site:username' }, { value: 'hunter2', secretName: 'site:password' }]);
+      store.registerSessionValues('sess-2', [{ value: 'nope', secretName: 'other:password' }]);
+      expect(store.sessionValues('sess-1').map(v => v.value).sort()).toEqual(['alice', 'hunter2']);
+      expect(store.sessionValues('sess-2').map(v => v.value)).toEqual(['nope']);
+      expect(store.sessionValues('unknown')).toEqual([]);
     });
 
-    it('replaceAllForSession swaps a bound ticket only when the page origin matches', () => {
+    it('registerSessionValues ignores empty values and appends on repeat', () => {
       store = new TokenStore();
-      const allowedHosts = [parseHostPattern('login.example.com') as HostPattern];
-      const t = store.issue('site:password', 'pw', { sessionId: 'sess-1', allowedHosts });
-      const ok = store.replaceAllForSession(`v=${t.id}`, 'sess-1', { host: 'login.example.com', scheme: 'https' });
-      expect(ok.output).toBe('v=pw');
-      expect(ok.denied).toEqual([]);
-
-      // Attack: same ticket, page on another origin, or a plaintext page for an https-only entry.
-      for (const origin of [{ host: 'attacker.example', scheme: 'https' as const }, { host: 'login.example.com', scheme: 'http' as const }]) {
-        const r = store.replaceAllForSession(`v=${t.id}`, 'sess-1', origin);
-        expect(r.output).toBe(`v=${t.id}`);
-        expect(r.swaps).toEqual([]);
-        expect(r.denied.map(d => d.secretName)).toEqual(['site:password']);
-      }
+      store.registerSessionValues('s', [{ value: '', secretName: 'x' }]);
+      expect(store.sessionValues('s')).toEqual([]);
+      store.registerSessionValues('s', [{ value: 'a', secretName: 'x' }]);
+      store.registerSessionValues('s', [{ value: 'b', secretName: 'y' }]);
+      expect(store.sessionValues('s').map(v => v.value)).toEqual(['a', 'b']);
     });
 
-    it('replaceAllForSession denies every ticket, bound or not, when the origin is unknown', () => {
+    it('registered values never substitute on the HTTP path', () => {
       store = new TokenStore();
-      const unbound = store.issue('site:username', 'alice', { sessionId: 'sess-1' });
-      const r = store.replaceAllForSession(`${unbound.id}`, 'sess-1', null);
-      expect(r.output).toBe(unbound.id);
-      expect(r.denied).toHaveLength(1);
-      // ...while an unbound ticket swaps on any known origin.
-      expect(store.replaceAllForSession(`${unbound.id}`, 'sess-1', ANY_HOST).swaps[0]).toMatchObject({ unbound: true });
-      // Text without tickets is never denied.
-      expect(store.replaceAllForSession('plain', 'sess-1', null).denied).toEqual([]);
-    });
-
-    it('one denied ticket denies the whole frame', () => {
-      store = new TokenStore();
-      const a = store.issue('a', 'va', { sessionId: 's', allowedHosts: [parseHostPattern('a.example') as HostPattern] });
-      const b = store.issue('b', 'vb', { sessionId: 's', allowedHosts: [parseHostPattern('b.example') as HostPattern] });
-      const r = store.replaceAllForSession(`${a.id} ${b.id}`, 's', { host: 'a.example', scheme: 'https' });
-      expect(r.output).toBe(`${a.id} ${b.id}`);
-      expect(r.denied.map(d => d.secretName)).toEqual(['b']);
-    });
-
-    it('replaceAll (HTTP path) never substitutes session-scoped tokens', () => {
-      store = new TokenStore();
-      const scoped = store.issue('site:password', 'pw', { sessionId: 'sess-1' });
+      store.registerSessionValues('s', [{ value: 'hunter2', secretName: 'site:password' }]);
       const unscoped = store.issue('api-key', 'real-key');
-
-      const input = `${scoped.id} and ${unscoped.id}`;
-      const r = store.replaceAll(input, ANY_HOST);
-      // scoped token passes through untouched; only the unscoped one swaps
-      expect(r.output).toBe(`${scoped.id} and real-key`);
-      expect(r.swaps.map(s => s.secretName)).toEqual(['api-key']);
+      const r = store.replaceAll(`hunter2 ${unscoped.id}`, ANY_HOST);
+      // The registered value is not a ticket, so it isn't matched; only the real ticket swaps.
+      expect(r.output).toBe('hunter2 real-key');
     });
 
-    it('sessionValues returns active real values for the session only', () => {
+    it('revokeSession drops a session\'s registered values and returns the count', () => {
       store = new TokenStore();
-      store.issue('site:username', 'alice', { sessionId: 'sess-1' });
-      store.issue('site:password', 'hunter2', { sessionId: 'sess-1' });
-      store.issue('other:password', 'nope', { sessionId: 'sess-2' });
-
-      const values = store.sessionValues('sess-1').map(v => v.value).sort();
-      expect(values).toEqual(['alice', 'hunter2']);
-    });
-
-    it('sessionTokenIds returns active token ids for the session only', () => {
-      store = new TokenStore();
-      const a = store.issue('site:username', 'alice', { sessionId: 'sess-1' });
-      store.issue('other:password', 'nope', { sessionId: 'sess-2' });
-
-      expect(store.sessionTokenIds('sess-1')).toEqual([a.id]);
-    });
-
-    it('revokeSession evicts all of a session\'s tokens', () => {
-      store = new TokenStore();
-      const a = store.issue('site:username', 'alice', { sessionId: 'sess-1' });
-      const b = store.issue('site:password', 'hunter2', { sessionId: 'sess-1' });
-      const other = store.issue('other:password', 'keep', { sessionId: 'sess-2' });
-
-      const revoked = store.revokeSession('sess-1');
-      expect(revoked).toBe(2);
-      expect(store.resolve(a.id)).toBeNull();
-      expect(store.resolve(b.id)).toBeNull();
-      expect(store.resolve(other.id)).toBe('keep');
-    });
-
-    it('does not substitute expired session tokens', async () => {
-      store = new TokenStore();
-      const t = store.issue('site:password', 'pw', { sessionId: 'sess-1', ttlSeconds: 0 });
-      await new Promise(r => setTimeout(r, 10));
-      const r = store.replaceAllForSession(`x ${t.id}`, 'sess-1', ANY_HOST);
-      expect(r.output).toBe(`x ${t.id}`);
+      store.registerSessionValues('sess-1', [{ value: 'alice', secretName: 'u' }, { value: 'hunter2', secretName: 'p' }]);
+      store.registerSessionValues('sess-2', [{ value: 'keep', secretName: 'k' }]);
+      expect(store.revokeSession('sess-1')).toBe(2);
       expect(store.sessionValues('sess-1')).toEqual([]);
+      expect(store.sessionValues('sess-2').map(v => v.value)).toEqual(['keep']);
     });
   });
 });

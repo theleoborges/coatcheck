@@ -11,6 +11,12 @@ export interface BrowserAdapter {
   hosts: string[];
   /** Mutate parsed JSON in place; `register(realWsUrl)` returns the local ws URL. Return true if changed. */
   rewriteJson(body: unknown, register: (realUrl: string) => string): boolean;
+  /**
+   * Strip agent-controlled parameters from a JSON *request* body on the
+   * adapter's hosts (the session-create body can carry browser code). Mutate in
+   * place; return true if changed. Only called for requests with a JSON body.
+   */
+  rewriteRequestJson?(body: unknown): boolean;
 }
 
 export const BROWSERBASE_API_HOST = 'api.browserbase.com';
@@ -52,12 +58,19 @@ function embedsBrowserbaseWs(value: string): boolean {
   return false;
 }
 
+/**
+ * Keys deleted outright regardless of value: the HTTP signing key and
+ * `seleniumRemoteUrl` — an HTTP route to the same browser that would bypass the
+ * CDP proxy (the v1 adapter left `seleniumRemoteUrl` in place).
+ */
+const DELETE_KEYS = new Set(['signingKey', 'seleniumRemoteUrl']);
+/** Hosted DevTools viewer keys: deleted only when their *value* isn't itself a CDP ws URL to rewrite. */
 const VIEWER_KEYS = new Set(['debuggerUrl', 'debuggerFullscreenUrl']);
 
 /**
  * Rewrite Browserbase CDP URLs by value (`connectUrl`, `wsUrl`, debugger
- * URLs, `pages[]`), delete `signingKey`, and delete viewer URLs that would
- * hand the agent a direct route to the browser.
+ * URLs, `pages[]`), and delete the signing key, viewer URLs and
+ * `seleniumRemoteUrl` that would hand the agent a direct route to the browser.
  */
 function rewriteBrowserbase(node: unknown, register: (realUrl: string) => string): boolean {
   if (node === null || typeof node !== 'object') return false;
@@ -65,7 +78,7 @@ function rewriteBrowserbase(node: unknown, register: (realUrl: string) => string
   const record = node as Record<string, unknown>;
   for (const key of Object.keys(record)) {
     const v = record[key];
-    if (key === 'signingKey') {
+    if (DELETE_KEYS.has(key)) {
       delete record[key];
       changed = true;
     } else if (typeof v === 'string') {
@@ -83,9 +96,29 @@ function rewriteBrowserbase(node: unknown, register: (realUrl: string) => string
   return changed;
 }
 
+/**
+ * Strip agent-supplied browser-extension parameters from a session-create
+ * request body: `extensionId` at the top level and inside `browserSettings`
+ * (Browserbase API, verified 2026-10). An uploaded extension can carry
+ * agent-controlled code into the browser, so with CDP injection on it is not
+ * allowed to influence the broker-driven session.
+ */
+function rewriteBrowserbaseRequest(node: unknown): boolean {
+  if (node === null || typeof node !== 'object') return false;
+  const record = node as Record<string, unknown>;
+  let changed = false;
+  if ('extensionId' in record) { delete record.extensionId; changed = true; }
+  const settings = record.browserSettings;
+  if (settings !== null && typeof settings === 'object' && 'extensionId' in (settings as Record<string, unknown>)) {
+    delete (settings as Record<string, unknown>).extensionId;
+    changed = true;
+  }
+  return changed;
+}
+
 /** Browserbase, with an overridable API host (tests point it at a local upstream). */
 export function createBrowserbaseAdapter(apiHost = BROWSERBASE_API_HOST): BrowserAdapter {
-  return { name: 'browserbase', hosts: [apiHost], rewriteJson: rewriteBrowserbase };
+  return { name: 'browserbase', hosts: [apiHost], rewriteJson: rewriteBrowserbase, rewriteRequestJson: rewriteBrowserbaseRequest };
 }
 
 export const browserbaseAdapter: BrowserAdapter = createBrowserbaseAdapter();

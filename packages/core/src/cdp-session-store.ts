@@ -21,8 +21,47 @@ interface CdpSession {
  * to that local URL, the CDP proxy looks the sid up to find the upstream to
  * dial. The sid is opaque so it carries no signing-key material into the agent.
  */
+/**
+ * The per-connection CDP controller the vault handler drives for
+ * `POST /_vault/{name}/login`. Implemented by `CdpConnection` in `cdp/proxy.ts`;
+ * the vault handler only needs this surface. Attached while a client is
+ * connected on the sid, cleared at teardown.
+ */
+export interface CdpController {
+  login(req: LoginRequest): Promise<LoginResult>;
+}
+
+/** A broker-performed login request (design: docs/design/cdp-broker-login.md). */
+export interface LoginRequest {
+  /** Field label (the multi-value secret's field) → CSS selector. */
+  fields: Record<string, string>;
+  /** Real value per field label; never logged. */
+  values: Record<string, string>;
+  /** Fields listed as `_cleartext` on the secret (filled but not redacted). */
+  cleartextFields?: string[];
+  /** Secret name, for logs only. */
+  secretName: string;
+  /** The secret's allowed hosts; the page's committed origin must match. */
+  allowedHosts?: readonly import('./host-matcher.js').HostPattern[];
+  /** Which page target to drive (prefix-matched against committed URLs). */
+  pageUrlPrefix?: string;
+  /** CSS selector to click, or Enter on the last filled field. */
+  submit: { selector: string } | { press: 'Enter' };
+  until: { kind: 'navigation' } | { kind: 'selector'; selector: string } | { kind: 'urlPrefix'; urlPrefix: string };
+  timeoutMs: number;
+}
+
+export type LoginResult =
+  | { status: 200; url: string }
+  | { status: 403; error: string }
+  | { status: 404; field?: string; reason: 'selector-not-found' | 'unknown-sid-or-secret' }
+  | { status: 409; reason: 'no-success' | 'interception-active' | 'busy' | 'page-ambiguous'; cleared?: boolean }
+  | { status: 501 }
+  | { status: 502; reason: 'driver-error' | 'upstream-closed'; cleared?: boolean };
+
 export class CdpSessionStore {
   private sessions = new Map<string, CdpSession>();
+  private controllers = new Map<string, CdpController>();
   private cleanupTimer: NodeJS.Timeout;
 
   constructor() {
@@ -74,9 +113,24 @@ export class CdpSessionStore {
     return this.get(sid) === null ? null : this.sessions.get(sid)!.adapterName;
   }
 
-  /** Drop a session mapping. Called when its WS connection closes. */
+  /**
+   * Attach the live connection's controller for `sid` (decision 1 in the
+   * design): the login handler looks it up here. A sid is "connected" for
+   * `/login` exactly while a controller is attached.
+   */
+  attach(sid: string, controller: CdpController): void {
+    this.controllers.set(sid, controller);
+  }
+
+  /** The attached controller for a connected sid, or null. */
+  controller(sid: string): CdpController | null {
+    return this.controllers.get(sid) ?? null;
+  }
+
+  /** Drop a session mapping and any attached controller. Called when its WS connection closes. */
   revoke(sid: string): void {
     this.sessions.delete(sid);
+    this.controllers.delete(sid);
   }
 
   get size(): number {
