@@ -1,6 +1,6 @@
 {
   "name": "@coatcheck/core",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Credential broker for AI agents: agents hold short-lived tickets, real secrets are swapped in on the wire (HTTPS + browser/CDP).",
   "license": "Apache-2.0",
   "repository": {
