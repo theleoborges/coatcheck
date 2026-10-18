@@ -3,7 +3,10 @@ import { TICKET_PATTERN, TICKET_PREFIX, type SwapInfo } from './token-store.js';
 export interface SwapOutcome {
   swaps: SwapInfo[];
   denied: SwapInfo[];
-  /** Tickets found in a request body whose secret doesn't opt in to body swapping. */
+  /**
+   * Tickets whose secret doesn't opt in to being swapped where they sit: the
+   * body (no `where`), or the request line or a non-default header (`where`).
+   */
   skipped?: SwapInfo[];
   /** Tickets whose value can't be represented where they sit (request refused). */
   invalid?: SwapInfo[];
@@ -14,6 +17,8 @@ export interface SwapOutcome {
  * `result=denied` (host mismatch, request not forwarded), `result=hit` (bound
  * tickets swapped), `result=unbound` (tickets without a host binding swapped),
  * `result=body-skipped` (a body ticket whose secret doesn't enable `swap_body`),
+ * `result=placement-skipped` (a ticket in the request line or a header its
+ * secret isn't swapped in; `where=` names the places, never the values),
  * `result=invalid-value` (a value that can't go in a header; not forwarded).
  * `postSwapText` is the text *after* swaps were applied — any ticket literal (`cct_<hex>`)
  * remaining in it is un-swapped (TTL-expired token, stale tunnel, or a literal
@@ -43,10 +48,19 @@ export function logSwapOutcome(
     console.warn(`[swap] scheme=${scheme} host=${hostname} result=unbound secrets=${names(unbound)} max_age_ms=${maxAge(unbound)}`);
   }
 
-  if (outcome.skipped && outcome.skipped.length > 0) {
+  const bodySkipped = (outcome.skipped ?? []).filter(s => s.where === undefined);
+  const headSkipped = (outcome.skipped ?? []).filter(s => s.where !== undefined);
+  if (bodySkipped.length > 0) {
     console.warn(
-      `[swap] scheme=${scheme} host=${hostname} result=body-skipped secrets=${names(outcome.skipped)} ` +
+      `[swap] scheme=${scheme} host=${hostname} result=body-skipped secrets=${names(bodySkipped)} ` +
       '(ticket in the request body; its secret does not enable swap_body, so it was sent as a literal)'
+    );
+  }
+  if (headSkipped.length > 0) {
+    console.warn(
+      `[swap] scheme=${scheme} host=${hostname} result=placement-skipped secrets=${names(headSkipped)} ` +
+      `where=${[...new Set(headSkipped.map(s => s.where))].join(',')} ` +
+      '(ticket outside Authorization; its secret does not enable swap_url/swap_headers there, so it was sent as a literal)'
     );
   }
 
@@ -56,7 +70,7 @@ export function logSwapOutcome(
   if (unswapped > 0) {
     console.warn(
       `[swap] scheme=${scheme} host=${hostname} result=miss unswapped_ticket_literals=${unswapped} ` +
-      `(TTL expiry, passthrough tunnel, never-issued token, or body-skipped — request reaching upstream with ${TICKET_PREFIX}… intact)`
+      `(TTL expiry, passthrough tunnel, never-issued token, or body/placement-skipped — request reaching upstream with ${TICKET_PREFIX}… intact)`
     );
   }
 }

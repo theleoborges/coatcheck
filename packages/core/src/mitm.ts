@@ -14,7 +14,7 @@ import { ChunkedDecoder, parseRequestHead, type RequestHead } from './http1-fram
 import { swapRequestBody } from './body-swap.js';
 import { headerFieldValue, percentEncodeUnsafe } from './value-encoding.js';
 import { swapBasicFieldLine, type BasicSwapResult } from './basic-auth.js';
-import type { SwapInfo } from './token-store.js';
+import type { SwapInfo, SwapResult } from './token-store.js';
 import { DENIED_HEADER, hostMismatchBody, uninspectableBodyBody, invalidValueBody, logBodyUnscanned, logSwapOutcome, type SwapOutcome } from './swap-log.js';
 
 export interface MitmDeps {
@@ -290,28 +290,39 @@ export function createConnectHandler(deps: MitmDeps) {
 
     /**
      * Swap tickets in a head: in the request line (values percent-encoded, as
-     * on the forward path) and in the header fields (values that can't be a
-     * field value are refused). `Authorization: Basic` credentials are
-     * decoded, swapped and re-encoded first (base64 hides their tickets).
+     * on the forward path) and in each header field's value (values that can't
+     * be a field value are refused). Each ticket swaps only where its secret
+     * allows (`Authorization` by default); a header name is never swapped.
+     * `Authorization: Basic` credentials are decoded, swapped and re-encoded
+     * (base64 hides their tickets).
      */
     function swapHead(head: RequestHead) {
-      const line = tokenStore.replaceAll(head.requestLine, swapTarget, percentEncodeUnsafe);
+      const results: SwapResult[] = [tokenStore.replaceAll(head.requestLine, swapTarget, { kind: 'url' }, percentEncodeUnsafe)];
+      const lines = [results[0].output];
       const basic: BasicSwapResult[] = [];
-      const fieldLines = head.fieldLines.map(l => {
-        const r = swapBasicFieldLine(tokenStore, l, swapTarget);
-        if (!r) return l;
-        basic.push(r);
-        return r.output;
-      });
-      const fields = tokenStore.replaceAll(fieldLines.join('\r\n'), swapTarget, headerFieldValue);
-      const parts = [line, ...basic, fields];
-      const output = head.fieldLines.length > 0 ? `${line.output}\r\n${fields.output}` : line.output;
+      for (const fieldLine of head.fieldLines) {
+        const b = swapBasicFieldLine(tokenStore, fieldLine, swapTarget);
+        if (b) {
+          basic.push(b);
+          results.push(b);
+          lines.push(b.output);
+          continue;
+        }
+        // parseRequestHead accepted the line, so it has a colon with no whitespace before it.
+        const colon = fieldLine.indexOf(':');
+        const name = fieldLine.slice(0, colon);
+        const r = tokenStore.replaceAll(fieldLine.slice(colon + 1), swapTarget, { kind: 'header', name }, headerFieldValue);
+        results.push(r);
+        lines.push(`${name}:${r.output}`);
+      }
+      const output = lines.join('\r\n');
       return {
         output,
         logText: [output, ...basic.map(b => b.userPass)].join('\n'),
-        swaps: parts.flatMap(p => p.swaps),
-        denied: parts.flatMap(p => p.denied),
-        invalid: parts.flatMap(p => p.invalid ?? []),
+        swaps: results.flatMap(r => r.swaps),
+        denied: results.flatMap(r => r.denied),
+        invalid: results.flatMap(r => r.invalid ?? []),
+        skipped: results.flatMap(r => r.skipped ?? []),
       };
     }
 
@@ -377,7 +388,7 @@ export function createConnectHandler(deps: MitmDeps) {
       logSwapOutcome('https', hostname, {
         swaps: [...outcome.swaps, ...(bodySwap?.result.swaps ?? [])],
         denied: deniedSwaps,
-        skipped: bodySwap?.result.skipped,
+        skipped: [...(outcome.skipped ?? []), ...(bodySwap?.result.skipped ?? [])],
       }, bodySwap ? `${outcome.logText}\n${bodySwap.result.output}` : outcome.logText);
       if (deniedSwaps.length > 0) {
         denyForSwaps(deniedSwaps, []);

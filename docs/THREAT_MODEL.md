@@ -142,6 +142,7 @@ the agent can also reach the internet directly.
 | Real values never enter the agent's env, files, or model context via the vault API | `/_vault/*` and `/_secret/*` return tickets, never values (except fields the secret explicitly lists in `_cleartext`) (`packages/core/src/vault-handler.ts`) |
 | A ticket alone is useless outside the broker | 32 random bytes; resolves only inside coatcheck's token store |
 | Tickets are bound to destination hosts | Each ticket snapshots its secret's allowed hosts at mint: the intersection of the operator's policy file and the secret's in-band `_allowed_hosts` (`packages/core/src/secret-binding.ts`). Unbound secrets get no ticket (`403`) unless `COATCHECK_ALLOW_UNBOUND_SECRETS=1`. At swap time the host is the validated `CONNECT` target on HTTPS (upstream TLS verification makes it the real recipient; `Host` and SNI are ignored) and the WHATWG-parsed URL host on plain HTTP, which only matches `http://` entries, so loopback and private listeners never match unless listed. A mismatch is answered `403` (`X-Coatcheck-Denied: host-mismatch`) and nothing is forwarded; one denied ticket denies the whole request (`TokenStore.replaceAll`, `packages/core/src/mitm.ts`, `packages/core/src/forward.ts`) |
+| Tickets swap only where their secret allows | By default only in the value of an `Authorization` or `Proxy-Authorization` header; the URL, other headers and the body are opt-in per secret (`swap_url`, `swap_headers`, `swap_body`), so the agent can't place a ticket where an allowed host would reflect it back (a 404 quoting the path, a stored query parameter, an echoed custom header). A ticket elsewhere is forwarded as the `cct_…` literal; header names are never scanned (`TokenStore.replaceAll`, `packages/core/src/mitm.ts`, `packages/core/src/forward.ts`; attack tests in `packages/core/src/server.test.ts`) |
 | Swapping can't redirect a request | On plain HTTP, tickets are swapped only in the path, query and headers, never in the host or userinfo that decide where the request goes (`packages/core/src/forward.ts`) |
 | OAuth refresh can't send `client_secret` elsewhere | The `token_url` host must be one of the secret's allowed hosts, checked before the token endpoint is called; the refreshed ticket inherits the binding (`packages/core/src/vault-handler.ts`) |
 | Tickets expire | 900 s default (`COATCHECK_TICKET_TTL_SECONDS`) (`packages/core/src/token-store.ts`) |
@@ -239,9 +240,29 @@ target (the actual upstream, verified by upstream TLS), never on `Host` or
 SNI, so a mismatched `Host` can't widen a ticket's reach; it only reaches the
 upstream as a confusing request.
 
+### MEDIUM: responses are not redacted; reflecting allowed hosts
+
+coatcheck redacts real values from browser (CDP) frames, but not from HTTPS
+or plain-HTTP responses. An allowed host that reflects a request back to the
+agent (an echo service such as httpbin, a debug or token-introspection
+endpoint, an error message that quotes the key) hands the agent the real
+value it authenticated with.
+
+Mitigated by swap placement: a ticket is swapped only in `Authorization` by
+default, so the agent can't choose a reflecting spot (the path of a 404, a
+custom header, a query parameter the API stores) unless the operator opted
+the secret in there with `swap_url`, `swap_headers` or `swap_body`. What
+remains is the operator's choice of hosts: binding a secret to a host that
+echoes the header it authenticates with exposes the value. The quickstart
+does this on purpose with httpbin to make the swap visible. A value an API
+stores and later returns in a transformed form (encoded, truncated) is also
+out of reach of any literal redaction.
+
 ### LOW: request bodies are swapped only on opt-in
 
-Headers and URL are rewritten for every ticket (`mitm.ts`, `forward.ts`).
+The `Authorization` header is rewritten for every ticket; the URL and other
+headers only for secrets with `swap_url` / `swap_headers` (see the previous
+section) (`mitm.ts`, `forward.ts`).
 Bodies are rewritten only for secrets with `swap_body` (policy) or
 `_swap_body` (in-band), because a body is where an allowed host is most
 likely to echo input back to the agent (validation errors, created

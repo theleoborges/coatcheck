@@ -5,7 +5,7 @@ import type { CdpSessionStore, LoginRequest, LoginResult } from './cdp-session-s
 import { InvalidSecretNameError, isValidSecretName, type SecretProvider } from './secret-provider.js';
 import { policyRuleFor, type Policy } from './policy.js';
 import { matchesHost, type HostPattern } from './host-matcher.js';
-import { allowedHostsJson, parseSecretValue, resolveBinding, userFields, type Binding, type InBandMetadata } from './secret-binding.js';
+import { allowedHostsJson, parseSecretValue, resolveBinding, userFields, type Binding, type InBandMetadata, type Placement } from './secret-binding.js';
 
 export interface VaultDeps {
   tokenStore: TokenStore;
@@ -156,7 +156,7 @@ export function handleVaultRequest(
       // The allowlist entry always carries hosts, so a shared secret is never unbound.
       const parsed = parseSecretValue(secret.value);
       const rule = deps.policy.shared.get(secretName);
-      const binding = resolveBinding(secretName, rule?.allowedHosts, parsed.inBand, false, rule?.swapBody);
+      const binding = resolveBinding(secretName, rule?.allowedHosts, parsed.inBand, false, rule);
       if (!sendBindingError(res, binding)) return;
       issueTicket(res, deps, `shared:${secretName}`, parsed.kind === 'simple' ? parsed.value : secret.value, binding);
     }).catch(err => {
@@ -196,31 +196,35 @@ export function handleVaultRequest(
   return false;
 }
 
-/** Issue an HTTP(S) ticket and answer with it, its allowed hosts and (when on) body swapping. */
+/** Issue an HTTP(S) ticket and answer with it, its allowed hosts and any opt-in swap placements. */
 function issueTicket(
   res: http.ServerResponse,
   deps: VaultDeps,
   label: string,
   value: string,
-  binding: { allowedHosts: readonly HostPattern[] | undefined; swapBody: boolean },
+  binding: { allowedHosts: readonly HostPattern[] | undefined } & Placement,
   via?: string,
 ): void {
-  const { allowedHosts, swapBody } = binding;
-  const token = deps.tokenStore.issue(label, value, { allowedHosts, swapBody });
-  console.log(`[issue] secret=${label} ttl_s=${token.ttlSeconds}${allowedHosts ? '' : ' unbound=1'}${swapBody ? ' swap_body=1' : ''}${via ? ` via=${via}` : ''}`);
+  const { allowedHosts, swapBody, swapUrl, swapHeaders } = binding;
+  const token = deps.tokenStore.issue(label, value, { allowedHosts, swapBody, swapUrl, swapHeaders });
+  const flags = `${allowedHosts ? '' : ' unbound=1'}${swapBody ? ' swap_body=1' : ''}${swapUrl ? ' swap_url=1' : ''}` +
+    (swapHeaders.length > 0 ? ` swap_headers=${swapHeaders.join(',')}` : '');
+  console.log(`[issue] secret=${label} ttl_s=${token.ttlSeconds}${flags}${via ? ` via=${via}` : ''}`);
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     token: token.id,
     expires_in: token.ttlSeconds,
     allowed_hosts: allowedHostsJson(allowedHosts),
     ...(swapBody ? { swap_body: true } : {}),
+    ...(swapUrl ? { swap_url: true } : {}),
+    ...(swapHeaders.length > 0 ? { swap_headers: swapHeaders } : {}),
   }));
 }
 
 /** A per-agent secret's binding: its policy rule intersected with its in-band hosts. */
 function bindingFor(deps: VaultDeps, secretName: string, inBand: InBandMetadata): Binding {
   const rule = policyRuleFor(deps.policy, secretName);
-  return resolveBinding(secretName, rule?.allowedHosts, inBand, !!deps.allowUnboundSecrets, rule?.swapBody);
+  return resolveBinding(secretName, rule?.allowedHosts, inBand, !!deps.allowUnboundSecrets, rule);
 }
 
 /** Answer a refused binding. Returns true (and sends nothing) when the binding is ok. */

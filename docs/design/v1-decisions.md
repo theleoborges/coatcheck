@@ -232,8 +232,10 @@ by the agent is deferred, and if it is ever added it may only narrow.
 
 - **Off by default, opt-in per secret.** A body is where APIs echo input back
   (validation errors, created resources), so swapping there widens what an
-  allowed host can reflect to the agent. Headers and the URL are swapped for
-  every ticket; the body only for tickets whose secret opts in.
+  allowed host can reflect to the agent. Headers and the URL were swapped for
+  every ticket; the body only for tickets whose secret opts in. (Roadmap
+  item 22 later made the URL and non-`Authorization` headers opt-in too; see
+  "Swap placement".)
 - **Two sources, deny wins.** `"swap_body": true` on a `secrets` or `shared`
   entry in the policy file, or `"_swap_body": true` in a JSON secret. Either
   one enables it; an explicit `false` in either source disables it, as the
@@ -269,6 +271,39 @@ by the agent is deferred, and if it is ever added it may only narrow.
   measured.
 - **Bytes outside tickets are preserved exactly** (the body is handled as
   latin1, so binary bodies round-trip).
+
+### Swap placement (recorded while implementing roadmap item 22)
+
+- **Problem.** A ticket was swapped anywhere in the request line and in any
+  header value, so the agent chose where the real value landed. An allowed
+  host that reflects the path (a 404 quoting it), a parameter, or a custom
+  header hands the value back without any operator misconfiguration. The
+  same reasoning that made body swapping opt-in (item 17) applies to the
+  rest of the request.
+- **Default: `Authorization` and `Proxy-Authorization` values only.** That
+  is where bearer-style credentials go, and where APIs don't echo. Header
+  names are never scanned. On the forward path `Proxy-Authorization` is
+  stripped before forwarding, so only `Authorization` reaches the upstream.
+  CDP is unaffected: it issues no credential tickets.
+- **Opt-ins, two sources, as for the body.** `swap_headers` (a non-empty list
+  of header names, lowercased, `host` refused) and `swap_url` (boolean), on a
+  policy entry or in-band as `_swap_headers` / `_swap_url`. `swap_url`
+  combines like `swap_body` (either enables, an explicit `false` disables).
+  `swap_headers`, being a list like the allowed hosts, is the intersection
+  when both sources set it, so a secret can narrow the operator's list but
+  never widen it. The ticket snapshots both at mint; mint responses carry
+  `swap_url: true` and `swap_headers` when set.
+- **Host binding is checked before placement.** A ticket bound to another
+  host denies the request wherever it sits (`403 host-mismatch`), so an
+  exfiltration attempt stays loud. A bound ticket in a place its secret
+  isn't swapped is forwarded as the literal and logged
+  `result=placement-skipped where=url|header:<name>` (fail closed). Bodies
+  keep item 17's order (a non-opted ticket is skipped before the host check).
+- **Rejected: response redaction as the fix.** Redacting real values from
+  HTTP responses needs streaming de-chunking and decompression and still
+  misses transformed echoes; placement removes the agent's choice instead.
+  Binding a secret to a host that echoes its `Authorization` header is the
+  operator's call, documented in the threat model.
 
 ### Swap-path hardening (recorded while implementing roadmap item 19)
 

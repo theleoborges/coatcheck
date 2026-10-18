@@ -20,7 +20,7 @@ It works like a coat check. You hand over the coat and get a ticket. The ticket 
 │ curl -H "Authorization: Bearer cct_9f2c…" https://api.github.com/…
 │   HTTPS_PROXY ───────┼── CONNECT ───>│ MITM TLS (own CA)        │
 │                      │               │ cct_9f2c… -> real value ─┼──────────> api.github.com
-│                      │               │ in headers / URL         │
+│                      │               │ in Authorization header  │
 │                      │               │                          │
 │ playwright           │  ws://…/cdp/  │ CDP WebSocket proxy      │
 │   POST /_vault/{n}/  │               │ coatcheck fills & submits│
@@ -30,7 +30,7 @@ It works like a coat check. You hand over the coat and get a ticket. The ticket 
 ```
 
 1. **Tickets.** The agent calls `GET /_vault/{name}`. coatcheck fetches the secret from its backend and returns a ticket: `cct_` plus 64 hex characters. Tickets live only in coatcheck's memory and expire after 15 minutes. Each one is bound to the secret's allowed hosts (see [Policy file](#policy-file)); a secret with no allowed hosts gets no ticket.
-2. **HTTPS substitution.** The agent container sets `HTTPS_PROXY` to coatcheck and trusts coatcheck's CA. When the agent opens a tunnel to a host a ticket could be used on, coatcheck intercepts it with a certificate it signs itself, replaces every ticket it finds in the request line and headers, and re-encrypts to the real host with normal certificate verification. A ticket is only replaced when the tunnel's target is one of its allowed hosts; otherwise the request is refused with `403` and never forwarded. Tunnels to every other host pass through untouched. This works with unmodified tools (curl, git, Python `requests`, Node `fetch`) because they only need proxy support and a trusted CA.
+2. **HTTPS substitution.** The agent container sets `HTTPS_PROXY` to coatcheck and trusts coatcheck's CA. When the agent opens a tunnel to a host a ticket could be used on, coatcheck intercepts it with a certificate it signs itself, replaces the ticket in the `Authorization` header (the URL, other headers and the body only for secrets that opt in; see [Swap placement](#swap-placement)), and re-encrypts to the real host with normal certificate verification. A ticket is only replaced when the tunnel's target is one of its allowed hosts; otherwise the request is refused with `403` and never forwarded. Tunnels to every other host pass through untouched. This works with unmodified tools (curl, git, Python `requests`, Node `fetch`) because they only need proxy support and a trusted CA.
 3. **Browser login.** With the CDP proxy enabled, coatcheck rewrites the browser service's connection URLs so the agent's Playwright client connects through coatcheck. The agent navigates to a login page and calls `POST /_vault/{name}/login`; coatcheck fills and submits the form itself, on a freshly reloaded page with the agent paused, so no credential ever enters the agent's reach. It also redacts any real value the page echoes back. See [Browser login (CDP)](#browser-login-cdp).
 4. **OAuth refresh.** `POST /_vault/{name}/refresh` runs the refresh-token exchange inside coatcheck, writes the new tokens back to the backend, and returns a ticket for the new access token.
 
@@ -58,7 +58,7 @@ curl -s --proxy http://coatcheck:$COATCHECK_API_TOKEN@localhost:3128 --cacert /t
   -H "Authorization: Bearer cct_3b1e…" https://httpbin.org/headers
 ```
 
-httpbin echoes the request headers, so step 3 shows the **real** value (`sk-demo-not-a-real-key`) arriving upstream. The demo policy (`examples/policy.example.json`) binds `example-api-key` to `httpbin.org` only. Sent to `postman-echo.com`, a host bound to a different secret, the same ticket is refused:
+httpbin echoes the request headers, so step 3 shows the **real** value (`sk-demo-not-a-real-key`) arriving upstream. The demo binds a secret to httpbin on purpose, to make the swap visible. The echo that shows you the value would show it to an agent too: never bind a real secret to a host that reflects requests back (see [Swap placement](#swap-placement)). The demo policy (`examples/policy.example.json`) binds `example-api-key` to `httpbin.org` only. Sent to `postman-echo.com`, a host bound to a different secret, the same ticket is refused:
 
 ```bash
 curl -s --proxy http://coatcheck:$COATCHECK_API_TOKEN@localhost:3128 --cacert /tmp/coatcheck-ca.crt \
@@ -134,18 +134,21 @@ Unless `COATCHECK_CA_DIR` is set and on persistent storage, each coatcheck resta
 
 coatcheck does a **literal substring replace** of live ticket strings, so the rules follow from where it looks.
 
-**Works.** The ticket appears as plaintext in the request line or a header, or inside a Basic credential:
+**Works.** The ticket appears as plaintext in the `Authorization` header, or inside a Basic credential:
 
 - `Authorization: Bearer cct_…`
 - `Authorization: token cct_…` (GitHub style)
-- `X-API-Key: cct_…`, or any custom header
-- `https://api.example.com/v1/x?api_key=cct_…` (query string)
 - **HTTP Basic auth**: `curl -u user:cct_…`, `https://user:cct_…@host/`, `.netrc`, git credential helpers. coatcheck decodes `Authorization: Basic`, swaps tickets in the user name or password, and re-encodes it.
+- `X-API-Key: cct_…`, or any other header, only for secrets that list it in `swap_headers` (see [Swap placement](#swap-placement)).
+- `https://api.example.com/v1/x?api_key=cct_…` (query string or path), only for secrets that opt in with `swap_url`.
 - In the request body, only for secrets that opt in with `swap_body` (see [Request bodies](#request-bodies)).
+
+(`Proxy-Authorization` is swapped too, on HTTPS only; the plain-HTTP path strips it.)
 
 **Does not work.** The request still goes out, but with the ticket unchanged, and the upstream returns 401/403:
 
-- **Tickets in request bodies** for secrets that don't opt in to `swap_body`.
+- **Tickets outside `Authorization`** (URL, other headers, body) for secrets that don't opt in there.
+- **Ticket in a header name.** Only header values are scanned.
 - **Any client that ignores `HTTPS_PROXY`.** Node's built-in `https` module is the common case: it needs an explicit agent such as `https-proxy-agent`, or `NODE_USE_ENV_PROXY=1` on Node ≥ 24. curl, git, Python `requests` and Node `fetch` honour the variable.
 - **Client-side signing**, such as AWS SigV4, HMAC request signatures, or JWT minting. The client computes a signature over the ticket, not the real secret.
 - **Expired tickets.** After 15 minutes the ticket is forwarded literally.
@@ -159,12 +162,13 @@ If an upstream returns 401 while you are using a ticket, assume the swap did not
 | `unbound secrets=…` | An unbound ticket was swapped (only with `COATCHECK_ALLOW_UNBOUND_SECRETS=1`). |
 | `invalid-value secrets=…` | A value contains a control character and can't go in a header (or a `:`, in a Basic auth user name). The request was not forwarded. |
 | `body-skipped secrets=…` | A ticket appeared in a body, but its secret doesn't enable `swap_body`. |
+| `placement-skipped secrets=… where=…` | A ticket appeared in the URL (`where=url`) or a header (`where=header:<name>`) its secret isn't swapped in. It was sent as a literal. |
 | `body-unscanned` | The body was larger than `COATCHECK_MAX_SWAP_BODY_BYTES` and streamed through unscanned. |
 | `miss unswapped_ticket_literals=N` | A `cct_<64 hex>` string reached the upstream intact (unknown or expired ticket). |
 
 `[connect] host=… mode=mitm|passthrough reason=…` lines show which tunnels coatcheck intercepted.
 
-On the plain-HTTP proxy path, tickets are swapped in the path, query, headers and (for `swap_body` secrets) body, never in the host or userinfo, and `Proxy-Authorization` and hop-by-hop headers are not forwarded.
+On the plain-HTTP proxy path the same placement rules apply to the path and query, headers and body; tickets are never swapped in the host or userinfo, and `Proxy-Authorization` and hop-by-hop headers are not forwarded.
 
 ## Policy file
 
@@ -177,7 +181,7 @@ On the plain-HTTP proxy path, tickets are swapped in the path, query, headers an
     "google-*":     { "allowed_hosts": ["*.googleapis.com", "oauth2.googleapis.com"] }
   },
   "shared": {
-    "browserbase-api-key": { "allowed_hosts": ["api.browserbase.com"] }
+    "browserbase-api-key": { "allowed_hosts": ["api.browserbase.com"], "swap_headers": ["X-BB-API-Key"] }
   }
 }
 ```
@@ -185,8 +189,9 @@ On the plain-HTTP proxy path, tickets are swapped in the path, query, headers an
 - `secrets` keys are exact secret names or a prefix ending in `*`. An exact name wins over a prefix, and a longer prefix wins over a shorter one.
 - `shared` keys are exact names. Listing a shared secret here is what allowlists it for `/_secret/{name}`.
 - `allowed_hosts` entries are exact hostnames, or `*.example.com`, which matches any subdomain but not `example.com` itself. Entries are case-insensitive and IDNs are converted to punycode. IP addresses match exactly. HTTPS is implied; write `http://host` to also allow plaintext HTTP. Ports and paths are not allowed. A bare `*` and wildcards over a single label (`*.com`) are rejected.
+- `swap_headers` (optional, a list of header names) and `swap_url` (optional, `true`/`false`) let the secret's tickets be swapped outside `Authorization`; see [Swap placement](#swap-placement).
 - `swap_body` (optional, `true`/`false`) turns on request body substitution for the secret; see [Request bodies](#request-bodies).
-- The schema is strict: unknown keys, empty `allowed_hosts` lists, a non-boolean `swap_body` and invalid entries all stop startup.
+- The schema is strict: unknown keys, empty `allowed_hosts` or `swap_headers` lists, a non-boolean `swap_body` or `swap_url`, and invalid entries all stop startup.
 
 ### Allowed hosts
 
@@ -203,17 +208,28 @@ At swap time the host checked is the `CONNECT` target on HTTPS (never the `Host`
 
 In the default `COATCHECK_MITM=bound` mode, coatcheck intercepts a `CONNECT` only when the target is a host in the policy file, an allowed host of a live ticket, or the browser service's API host (with CDP enabled). Everything else is a blind TCP tunnel. `COATCHECK_MITM=always` intercepts every tunnel. Hosts in `COATCHECK_PASSTHROUGH_HOSTS` are never intercepted, for clients that pin certificates. Intercepted tunnels negotiate HTTP/1.1; a WebSocket upgrade becomes a raw pipe after `101 Switching Protocols`.
 
+### Swap placement
+
+By default a ticket is swapped only in the value of an `Authorization` (or `Proxy-Authorization`) header. Anywhere else is opt-in per secret, because the agent chooses where to put its ticket, and many APIs echo parts of the request back: a 404 that quotes the path, an error that quotes a parameter, a query parameter stored in a created object. Wherever the agent can get an allowed host to reflect the real value, the agent can read it.
+
+- `"swap_headers": ["X-Api-Key"]` on the policy entry (or `"_swap_headers"` in a JSON secret) adds header names, case-insensitive. Use it for APIs that take their key in a custom header (Anthropic's `x-api-key`, Browserbase's `X-BB-API-Key`). `Host` is refused. If both sources list headers, the effective list is their intersection.
+- `"swap_url": true` (or `"_swap_url"`) also swaps tickets in the request line (path and query), for APIs that take a key as a query parameter. As with `swap_body`, either source enables it and an explicit `false` in either disables it.
+- Mint responses include `"swap_headers": […]` and `"swap_url": true` when these are set.
+- A ticket somewhere its secret isn't swapped is sent as the `cct_…` literal and logged as `result=placement-skipped`. Host binding still applies first: a ticket bound to another host gets the request refused with `403` wherever it sits.
+
+Placement narrows what the agent can choose; it doesn't make a reflecting host safe. coatcheck does not redact responses on the HTTPS path, so a host that echoes the header it authenticates with (httpbin, postman-echo, debug endpoints) hands the real value back. Only bind secrets to hosts that don't.
+
 ### Request bodies
 
-Tickets are swapped in the request line and headers for every secret, but in the request **body** only for secrets that opt in, because APIs often echo request bodies back (validation errors, created objects), which would hand the real value to the agent. Opt in with `"swap_body": true` on the secret's policy entry, or `"_swap_body": true` inside a JSON secret. Either one enables it, and an explicit `false` in either disables it. Mint responses then include `"swap_body": true`.
+Tickets are swapped in the request **body** only for secrets that opt in, because APIs often echo request bodies back (validation errors, created objects), which would hand the real value to the agent. Opt in with `"swap_body": true` on the secret's policy entry, or `"_swap_body": true` inside a JSON secret. Either one enables it, and an explicit `false` in either disables it. Mint responses then include `"swap_body": true`.
 
 - A body is only held and scanned when a live `swap_body` ticket could be swapped for the request's host. Every other body streams through untouched, as do bodies larger than `COATCHECK_MAX_SWAP_BODY_BYTES` (default 1 MiB): coatcheck forwards what it held and streams the rest unscanned. In an unscanned body a ticket stays a literal, so the request fails closed. (The browser service's API host is the exception when CDP is enabled: its bodies are never streamed unscanned; see [Browser login](#browser-login-cdp).)
-- In a scanned body, host binding applies as in headers: a body ticket bound to another host gets the whole request refused with `403`.
+- In a scanned body, host binding applies as in the head: a body ticket bound to another host gets the whole request refused with `403`.
 - The value is escaped for the body's `Content-Type`: JSON-string-escaped for `application/json` and `*/*+json`, percent-encoded for `application/x-www-form-urlencoded`, raw UTF-8 for anything else (including multipart).
 - `Content-Length` is rewritten. A chunked HTTPS body is re-sent as a single chunk; on plain HTTP the body is always sent with `Content-Length`.
 - Bodies with a `Content-Encoding` (gzip, br, …) are not scanned.
 
-In headers, a value containing a control character (CR, LF, NUL, …) can't be sent: the request is refused with `403` and `X-Coatcheck-Denied: invalid-value`. In the request line (URL), a value's spaces, control and non-ASCII characters are percent-encoded.
+In a header, a value containing a control character (CR, LF, NUL, …) can't be sent: the request is refused with `403` and `X-Coatcheck-Denied: invalid-value`. In the request line (URL), a value's spaces, control and non-ASCII characters are percent-encoded.
 
 ## Browser login (CDP)
 
@@ -376,6 +392,7 @@ Earlier variable names (`AGENT_LABEL`, `PROXY_PORT`, `PROXY_BIND_HOST`, `CA_DIR`
 
 coatcheck is **pre-1.0**. The HTTP API, ticket format (`cct_…`), and configuration may change. Known gaps, roughly in priority order (the full list with severities is in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)):
 
+- **Responses are not redacted on the HTTPS path.** If an allowed host reflects a credential back (an echo service, a debug endpoint, an error that quotes the key), the agent reads the real value. Tickets are swapped only in `Authorization` unless the operator opts a secret in to more places ([Swap placement](#swap-placement)), so the agent can't choose a reflecting spot on its own; but bind secrets only to hosts that don't echo what they authenticate with.
 - **Host binding stops redirection, not misuse.** A ticket only works on its secret's allowed hosts, so an agent can't send it to an attacker's server. It can still use the credential maliciously against an allowed host, and an operator who sets `COATCHECK_ALLOW_UNBOUND_SECRETS=1` gives up the protection for unbound secrets.
 - **`HTTPS_PROXY` is advisory.** A process that ignores it bypasses coatcheck, which means no substitution and also no protection. Pair coatcheck with egress enforcement so the agent can reach the internet only through the proxy.
 - **Request bodies are substituted only on opt-in** (`swap_body`, see [Request bodies](#request-bodies)), and never when content-encoded. On the MITM path, request framing is strict: ambiguous framing (for example both `Content-Length` and `Transfer-Encoding`, or a coding other than `chunked`) gets `400` with `X-Coatcheck-Denied: bad-framing` and the tunnel is closed. A header section over 64 KiB gets `431`. Request trailers pass through unswapped.

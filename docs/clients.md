@@ -70,8 +70,9 @@ persists across restarts. If it is regenerated, clients must re-fetch it.
 Ticket responses also carry `allowed_hosts`: the only hosts the ticket will be
 swapped for. Sending it anywhere else gets `403` with
 `X-Coatcheck-Denied: host-mismatch`, and the request is not forwarded. They
-carry `"swap_body": true` when the secret allows its ticket in request bodies
-(section 3).
+carry `"swap_body": true` when the secret allows its ticket in request bodies,
+`"swap_url": true` when it allows it in the URL, and `"swap_headers": […]`
+for headers besides `Authorization` it may go in (section 3).
 
 Errors: 404 when the secret is missing (with `vault_url` when the operator set
 `COATCHECK_MISSING_SECRET_URL`), 400 for an unknown field or an invalid secret
@@ -91,18 +92,21 @@ workflows rather than caching.
 
 ## 3. Use the ticket: the literal-substring rule
 
-coatcheck replaces tickets wherever they appear **verbatim** in the request
-line (URL, including query string) or headers. Request bodies are inspected
-only for secrets that opt in (below).
+coatcheck replaces tickets where they appear **verbatim** in the value of the
+`Authorization` header. Other headers, the request line (URL, including query
+string) and the request body are swapped only for secrets the operator opted
+in there (`swap_headers`, `swap_url`, `swap_body`; the ticket response lists
+them), because an API that echoes those parts back would hand the agent the
+real value.
 
 Works:
 
 ```bash
 curl -H "Authorization: Bearer $TOK" https://api.example.com/v1/items
 curl -H "Authorization: token $TOK"  https://api.example.com/v1/items
-curl -H "X-API-Key: $TOK"            https://api.example.com/v1/items
-curl "https://api.example.com/v1/items?api_key=$TOK"
-curl -u "me@example.com:$TOK"        https://api.example.com/v1/items   # Basic: decoded, swapped, re-encoded
+curl -H "X-API-Key: $TOK"            https://api.example.com/v1/items  # "swap_headers": ["x-api-key"]
+curl "https://api.example.com/v1/items?api_key=$TOK"                  # "swap_url": true
+curl -u "me@example.com:$TOK"        https://api.example.com/v1/items  # Basic: decoded, swapped, re-encoded
 ```
 
 A ticket in `Authorization: Basic` (`curl -u`, `https://user:$TOK@host/`,
@@ -112,6 +116,9 @@ refused with `403 invalid-value`.
 
 Fails silently (the upstream receives `cct_…` and returns 401/403):
 
+- **Ticket outside `Authorization`** (another header, the URL), unless the
+  secret opts in there. The request is forwarded with the literal and
+  coatcheck logs `result=placement-skipped where=…`.
 - **Ticket in the request body**, unless the secret opts in (`swap_body` in
   the policy file or `_swap_body: true` in the secret; the ticket response
   then shows `"swap_body": true`). Without it, the body is forwarded
@@ -205,6 +212,7 @@ its secret name, with allowed hosts like any other secret.
    ```js
    const COATCHECK = 'http://127.0.0.1:3128';
    const apiTok = (await getJson(`${COATCHECK}/_secret/browser-api-key`)).token;
+   // The policy entry lists the vendor's key header: "swap_headers": ["x-api-key"].
    const session = await postViaProxy('https://api.browser-vendor.example/v1/sessions',
                                       { 'x-api-key': apiTok }, { /* session options */ });
    const sid = session.connectUrl.match(/\/cdp\/([a-f0-9]+)/)?.[1];
@@ -336,5 +344,5 @@ esac
 ```
 
 Pipe the output straight into the consuming command (`KEY=$(get-secret.sh x)
-curl -H "X-API-Key: $KEY" …`). Tickets are not secrets, but treating them as
+curl -H "Authorization: Bearer $KEY" …`). Tickets are not secrets, but treating them as
 opaque and short-lived keeps agent prompts and logs clean.
