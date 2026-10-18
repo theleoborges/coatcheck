@@ -1,0 +1,55 @@
+name: Release
+
+# Publishes @coatcheck/* to npm when a v* tag is pushed, with provenance,
+# through npm trusted publishing (OIDC): no npm token is stored in the repo.
+# Each package must list this workflow as a trusted publisher on npmjs.com.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run lint
+      - run: npm run type-check
+      - run: npm test
+      - run: npm run build
+
+      - name: Check that the tag matches every package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          for p in core provider-env provider-aws; do
+            V=$(node -p "require('./packages/$p/package.json').version")
+            if [ "$V" != "$TAG" ]; then
+              echo "packages/$p is $V but the tag is $TAG" >&2
+              exit 1
+            fi
+          done
+
+      # Dependency order: providers peer-depend on core. A version that is
+      # already on the registry is skipped, so re-running the workflow (or
+      # tagging a release that was first published by hand) doesn't fail.
+      - name: Publish
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          for pkg in @coatcheck/core @coatcheck/provider-env @coatcheck/provider-aws; do
+            if npm view "$pkg@$TAG" version >/dev/null 2>&1; then
+              echo "$pkg@$TAG is already published, skipping"
+              continue
+            fi
+            npm publish -w "$pkg" --provenance --access public
+          done
