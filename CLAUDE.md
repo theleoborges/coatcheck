@@ -77,7 +77,7 @@ docker compose -f examples/docker-compose.localstack.yml up --build   # LocalSta
 
 ## Conventions
 
-- TypeScript strict, ESM, Node16 resolution, Node ≥ 20. vitest for tests (one project per package, root `vitest.config.ts`), colocated `*.test.ts`. Move files with `git mv`.
+- TypeScript strict, ESM, Node16 resolution, Node ≥ 24 (CI: 24 LTS + 26). vitest for tests (one project per package, root `vitest.config.ts`), colocated `*.test.ts`. Move files with `git mv`.
 - Never log secret values, ticket IDs, or request bodies — only secret names, counts, ages.
 - Only `packages/core/src/config.ts` and `cli.ts` read `process.env` (eslint `no-restricted-properties`); providers get env via `ProviderContext`.
 - When catching AWS SDK errors, check `err.name` **and** `err.Code` (newer `@aws-sdk/core` puts the code on `Code`; varies by service).
