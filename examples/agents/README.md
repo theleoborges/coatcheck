@@ -98,7 +98,7 @@ Set `VERCEL_TEAM_ID` for a project under a team. Create the token at [vercel.com
 - IAM user `coatcheck-demo-reporter` with one inline policy: `s3:PutObject`/`s3:GetObject` on `reports/*` and `s3:ListBucket` on the `reports/` prefix, nothing else.
 - One access key for it, saved to `.aws-reporter-key` (git-ignored, mode 0600) with the bucket and region.
 
-It is safe to re-run (an existing key file is kept). `teardown-aws.sh` deletes the key, the user, the bucket's objects and the bucket, and `.aws-reporter-key`.
+It is safe to re-run (an existing key file is kept). To rotate, delete `.aws-reporter-key` and re-run: the user's old keys are deleted before the new one is created. `teardown-aws.sh` deletes the key, the user, the bucket's objects and the bucket, and `.aws-reporter-key`.
 
 `run.sh` and `smoke.sh` need no AWS profile: they pass the reporter key to the coatcheck container only (`COATCHECK_SECRET_AWS_REPORTS`, env provider) and render `policy.json` from `policy.template.json` (`<bucket>.s3.<region>.amazonaws.com` and `sts.<region>.amazonaws.com`, `signing: aws-sigv4`). The agent image is built with the AWS CLI (`INSTALL_AWS_CLI=1`). `COATCHECK_MITM=always` makes coatcheck intercept every tunnel, so a request to another bucket is refused by coatcheck (`403 host-mismatch`) instead of reaching S3 as a literal.
 

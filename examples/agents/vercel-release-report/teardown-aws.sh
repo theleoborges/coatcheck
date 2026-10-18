@@ -5,7 +5,8 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 : "${AWS_PROFILE:?set AWS_PROFILE}"
-REGION="${AWS_REGION:-$(aws configure get region)}"
+REGION="${AWS_REGION:-$(aws configure get region || true)}"
+: "${REGION:?set AWS_REGION or a default region on the profile}"
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 BUCKET="coatcheck-demo-reports-${ACCOUNT}"
 USER_NAME=coatcheck-demo-reporter

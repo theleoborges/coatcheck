@@ -7,12 +7,13 @@
 #     on reports/*, s3:ListBucket with the reports/ prefix condition, nothing else
 #   - one access key for it, written to .aws-reporter-key (git-ignored, mode 0600)
 #     together with the bucket and region; run.sh hands it to coatcheck only
-# Safe to re-run (an existing key file is kept). Remove everything with ./teardown-aws.sh.
+# Safe to re-run (an existing key file is kept; delete it and re-run to rotate:
+# the user's old keys are deleted first). Remove everything with ./teardown-aws.sh.
 # Usage: AWS_PROFILE=… [AWS_REGION=…] ./setup-aws.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 : "${AWS_PROFILE:?set AWS_PROFILE}"
-REGION="${AWS_REGION:-$(aws configure get region)}"
+REGION="${AWS_REGION:-$(aws configure get region || true)}"
 : "${REGION:?set AWS_REGION or a default region on the profile}"
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 BUCKET="coatcheck-demo-reports-${ACCOUNT}"
@@ -54,11 +55,18 @@ echo "iam: inline policy reports-only (reports/* only)"
 if [ -s "$KEY_FILE" ]; then
   echo "key: $KEY_FILE exists, kept (delete it and re-run to rotate)"
 else
+  # No local copy: any key the user still has is unaccounted for, so revoke it
+  # (this is also how a rotation retires the old key, and keeps under IAM's 2-key limit).
+  for old in $(aws iam list-access-keys --user-name "$USER_NAME" --query 'AccessKeyMetadata[].AccessKeyId' --output text); do
+    aws iam delete-access-key --user-name "$USER_NAME" --access-key-id "$old"
+    echo "key: deleted old access key $old"
+  done
   umask 077
+  # Write to a temp file first, so a failed run never leaves an empty key file.
   aws iam create-access-key --user-name "$USER_NAME" --output json \
     | jq --arg bucket "$BUCKET" --arg region "$REGION" \
         '{access_key_id: .AccessKey.AccessKeyId, secret_access_key: .AccessKey.SecretAccessKey, bucket: $bucket, region: $region}' \
-    > "$KEY_FILE"
-  chmod 600 "$KEY_FILE"
+    > "$KEY_FILE.tmp"
+  mv "$KEY_FILE.tmp" "$KEY_FILE"
   echo "key: new access key for $USER_NAME in $KEY_FILE (mode 0600)"
 fi

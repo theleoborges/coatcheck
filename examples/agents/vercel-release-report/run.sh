@@ -7,8 +7,12 @@ cd "$(dirname "$0")"
 . ./env.sh
 export TASK="${1:-task.md}"
 mkdir -p out
+# Print the swap log and stop the stack even when the agent run fails.
+finish() {
+  echo; echo "--- coatcheck swap log"
+  docker compose logs coatcheck | grep -E '\[swap\]|\[connect\]|\[issue\]' || true
+  docker compose down
+}
+trap finish EXIT
 docker compose up --build -d coatcheck
 docker compose run --rm --build agent
-echo; echo "--- coatcheck swap log"
-docker compose logs coatcheck | grep -E '\[swap\]|\[connect\]|\[issue\]' || true
-docker compose down
