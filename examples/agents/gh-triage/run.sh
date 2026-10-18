@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run the gh-triage agent. Usage: ./run.sh [task.md]
+# Run the gh-triage agent. GITHUB_TOKEN defaults to `gh auth token`.
+# Usage: ANTHROPIC_API_KEY=… [GH_REPO=owner/repo] ./run.sh [task.md|attack.md]
 set -euo pipefail
 cd "$(dirname "$0")"
 export COATCHECK_API_TOKEN="$(openssl rand -hex 32)"

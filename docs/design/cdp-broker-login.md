@@ -1,9 +1,17 @@
 # Broker-performed browser login
 
-Status: **proposed** (roadmap item 20). Replaces steps 2–3 of
-`cdp-injection.md` (`mint-tokens`, outbound `Input.insertText` substitution,
-the keystroke detector). The connectUrl rewrite, the CDP proxy connection,
-origin tracking, inbound redaction and teardown stay.
+Status: **implemented** (roadmap item 20, merged in PR #8). Replaces step 2
+of `cdp-injection.md` and its outbound substitution and keystroke detector
+(`mint-tokens`, outbound `Input.insertText` substitution, the keystroke
+detector). The connectUrl rewrite, the CDP proxy connection, origin tracking,
+inbound redaction and teardown stay. The spec below matches the code; where
+the build settled something the design left open, it is under
+"Implementation decisions" and "Implementation notes".
+
+Code: `packages/core/src/cdp/login-driver.ts` (the window),
+`cdp/proxy.ts` (`CdpConnection`: state, id multiplexing, agent queue),
+`vault-handler.ts` (`handleLogin`), `cdp-session-store.ts` (`LoginRequest`,
+`LoginResult`, `CdpController`).
 
 ## Problem
 
@@ -54,22 +62,28 @@ protected like every vault route.
 
 | Field | Meaning |
 |---|---|
-| `sessionId` | A live, **connected** sid (`CdpSessionStore`); `404` otherwise. |
-| `page` | Which attached page target to drive. Optional when exactly one page target has a committed origin; otherwise `url` is a prefix matched against the targets' committed main-frame URLs, which `OriginTracker` already records. No match or several: `409 {"status":"page-ambiguous"}`. |
-| `fields` | Secret field → CSS selector, resolved in the main document. Only fields of the multi-value secret (`400` otherwise); `_cleartext` fields may be filled too. |
-| `submit` | A CSS selector to click, or `{"press":"Enter"}` on the last filled field. |
-| `until` | Success condition: `"navigation"` (default: a main-frame `Page.frameNavigated` with a new `loaderId`), `{"selector":"…"}` (element appears) or `{"urlPrefix":"…"}`. Covers full-page and SPA logins. |
-| `timeoutMs` | Default 15 000, max 60 000. |
+| `sessionId` | Required. A live, **connected** sid (`CdpSessionStore`); `404` otherwise. |
+| `page` | Optional. Which attached page target to drive. Without it there must be exactly one page target with a committed main-frame URL (any scheme, so an extra `about:blank` tab counts). With it, `url` is a prefix matched against the targets' committed main-frame URLs, which `OriginTracker` already records. No match or several: `409 {"status":"page-ambiguous"}`. |
+| `fields` | Required, non-empty. Secret field → CSS selector, resolved in the main document. Only fields of the multi-value secret (`501` otherwise); `_cleartext` fields may be filled too. A non-string or empty selector is `400`. |
+| `submit` | Required. A CSS selector to click, or `{"press":"Enter"}` on the last filled field. Anything else is `400`. |
+| `until` | Success condition: `"navigation"` (default: a main-frame `Page.frameNavigated` whose `loaderId` differs from the one committed before the submit), `{"selector":"…"}` (element appears; polled every 250 ms) or `{"urlPrefix":"…"}` (the committed main-frame URL starts with it). Covers full-page and SPA logins. Anything else is `400`. |
+| `timeoutMs` | Default 15 000, max 60 000 (larger values are clamped; a missing or non-positive value gets the default). One budget covers the reload, the fill and the wait. |
 
 | Status | Body | When |
 |---|---|---|
 | `200` | `{"status":"ok","url":"https://…"}` | Success condition held. |
-| `409` | `{"status":"no-success","cleared":true}` | Timeout. The fields coatcheck filled were emptied before the agent resumed. |
+| `400` | `{"error":"…"}` | Invalid request body (see the field table). |
+| `409` | `{"status":"no-success","cleared":true}` | Timeout (also when the reload doesn't finish, before anything is filled). The fields coatcheck filled were emptied before the agent resumed. |
 | `409` | `{"status":"interception-active"}` | The agent has request interception enabled on that page (see preconditions). |
 | `409` | `{"status":"busy"}` | A login is already in progress on this connection. |
-| `403` | `{"error":"credential-origin violation: …"}` | The page's committed origin isn't in the secret's allowed hosts, or is unknown / navigating. Same rule as v1 origin binding. |
-| `404` | `{"status":"selector-not-found","field":"…"}` | A selector matched nothing. Also for unknown secret or sid. |
-| `501` | | The secret isn't a multi-value secret with the requested fields. |
+| `409` | `{"status":"page-ambiguous"}` | No page target, or more than one, matches (see `page`). |
+| `403` | `{"error":"credential-origin violation: …"}` | The page's committed origin isn't in the secret's allowed hosts, or is unknown / navigating / not http(s). Checked before the reload and again after it. Same rule as v1 origin binding. |
+| `403` | `{"error":"…"}` | The secret is unbound (no policy rule and no `_allowed_hosts`) and `COATCHECK_ALLOW_UNBOUND_SECRETS` is off, or its host sources don't intersect. Same mint-time rule as `/_vault/{name}`. |
+| `404` | `{"status":"selector-not-found","field":"…"}` | A field selector matched nothing. Every selector is checked before any value is typed, so nothing was filled (a field that vanishes mid-fill is emptied first; #11). |
+| `404` | `{"status":"unknown-sid-or-secret","error":"…"}` | Unknown or not-connected sid, or no secret under that name. |
+| `501` | `{"error":"…"}` | The secret isn't a multi-value secret, or lacks a requested field. |
+| `502` | `{"status":"driver-error","cleared":true}` | One of coatcheck's own CDP commands failed (decision 8), including a `submit` selector that matches nothing. |
+| `502` | `{"status":"upstream-closed"}` | The connection closed mid-window, including an agent-queue overflow (decision 4). |
 
 Agent flow: create the session, connect with Playwright, `page.goto(login)`,
 call `/login`, carry on with the logged-in page. Outside the login window
@@ -127,28 +141,36 @@ than silently disabling the agent's interception); no other login in flight.
    clear in step 3), then answer `409 no-success`. On success answer `200`.
 7. **Release the queue.**
 
-If the upstream connection closes mid-window, the login fails (`502`) and
-teardown runs as today. The `sid`'s tickets no longer exist, so there is
-nothing to revoke; teardown keeps revoking any plain tickets bound to the sid
-for backward compatibility of the store.
+If the upstream connection closes mid-window, the login fails
+(`502 upstream-closed`) and teardown runs as today. There are no session
+tickets to revoke any more; teardown (`TokenStore.revokeSession`) drops the
+sid's redaction values.
 
 **Inbound redaction** stays and is extended to the small, fixed set of
 encodings the *browser* applies to values it reports: percent-encoding (form
 bodies), HTML entities and JSON string escaping. These are finite and
 knowable, unlike agent transforms. The real values to match are the login
 secret's field values for the duration of the connection (registered with the
-`TokenStore`'s session value set at the start of the window, revoked at
-teardown).
+`TokenStore`'s session value set before the window, dropped at teardown; see
+decision 9).
 
 ## Browser adapter addition
 
 The Browserbase session-create request can carry agent-controlled browser
 code (an extension). With CDP enabled, the adapter strips such parameters
-from `POST /v1/sessions` **request** bodies (the MITM already buffers request
-bodies for `swap_body`, so a request-side JSON transform hook on adapter hosts
-is a small addition). Verify the exact field names against the current API in
-that PR. The adapter also removes `seleniumRemoteUrl` from session responses,
-which the v1 adapter leaves in place.
+from **request** bodies (the MITM already buffers request bodies for
+`swap_body`, so a request-side JSON transform hook on adapter hosts is a small
+addition). The adapter also removes `seleniumRemoteUrl` from session
+responses, which the v1 adapter left in place.
+
+As built (`BrowserAdapter.rewriteRequestJson`, wired in `mitm.ts`): the
+Browserbase adapter deletes `extensionId` at the top level and inside
+`browserSettings` (field names checked against the Browserbase API,
+2026-10). It runs on every request to an adapter host whose `Content-Type` is
+JSON (`application/json`, `*/*+json`), not only `POST /v1/sessions`. The body
+is buffered under the same `COATCHECK_MAX_SWAP_BODY_BYTES` cap as `swap_body`;
+a body past the cap, a non-JSON content type, or a body that doesn't parse
+(for example one with a `Content-Encoding`) is forwarded unchanged.
 
 ## What this removes
 
@@ -165,7 +187,7 @@ which the v1 adapter leaves in place.
 
 - **Site JS and the vendor see the password.** Already accepted as upstream
   trust; the site must receive the password to authenticate.
-- **Cross-origin iframe logins** are refused: selectors resolve in the main
+- **Cross-origin iframe logins** fail with `404 selector-not-found`: selectors resolve in the main
   document only. Embedded auth widgets need the login page itself to be the
   identity provider's page (navigate there first).
 - **Client-side hashing / challenge logins** need the page's JS to see the
@@ -176,9 +198,12 @@ which the v1 adapter leaves in place.
 ## Tests
 
 - `cdp/proxy.test.ts` (fake upstream): the id multiplexing swallows coatcheck's
-  responses and relays the agent's; agent frames sent during the window arrive
-  upstream only after it, in order; `busy`, `interception-active`,
-  `page-ambiguous`, origin `403`, `selector-not-found`.
+  responses and relays the agent's; a reserved-range agent id is refused;
+  agent frames sent during the window arrive upstream only after it, in order;
+  target, new-document-script and interception tracking.
+- `cdp/login-driver.test.ts` (fake browser): the full sequence, SPA
+  `until.selector`, timeout clears the fields, `busy`, `interception-active`,
+  origin `403`, `selector-not-found`.
 - `cdp/e2e.test.ts` (real Chromium): the login succeeds via `/login` for a
   full-page form and for an SPA-style form (`until.selector`); after success
   the password field is gone or empty; on a wrong-selector timeout the fields
@@ -186,7 +211,8 @@ which the v1 adapter leaves in place.
   call sees nothing (reload) and a new-document script it registered is gone;
   **the four `attack-transform.md` reads return nothing derived from the
   password**; interception enabled → `409`.
-- `vault-handler.test.ts`: request validation, `mint-tokens` removed (`404`).
+- `vault-handler.test.ts`: request validation, the `LoginResult` → HTTP table
+  (including `page-ambiguous`), host binding, `mint-tokens` removed (`404`).
 - The example agents: `examples/agents/browser-login/task.md` rewritten for
   `/login`; `attack.md` and `attack-transform.md` re-run against the new build
   must report no password material.
@@ -232,13 +258,38 @@ Choices the design above leaves open, settled before implementing.
    the filled fields are emptied and the answer is
    `502 {"status":"driver-error","cleared":true}`. The CDP error text isn't
    echoed back, and no value is ever echoed.
-9. **Values for inbound redaction.** At the start of the window the login's
-   field values (non-`_cleartext`) are registered in `TokenStore` under the sid
-   (`registerSessionValues`). They are not tickets and never substitute
+9. **Values for inbound redaction.** The login's field values
+   (non-`_cleartext`) are registered in `TokenStore` under the sid
+   (`registerSessionValues`). As built, `vault-handler.ts` registers them once
+   the request and binding are valid, just before handing the login to the
+   connection, so they are registered even if the driver then refuses
+   (`busy`, `page-ambiguous`, …). They are not tickets and never substitute
    anywhere. `revokeSession` drops them at teardown.
 10. **Logging.** The window logs `[cdp] sid=… login secret=… window open` and
     `[cdp] sid=… login secret=… window closed outcome=… ms=… queued=…`: names,
     outcome, counts and duration only.
+
+## Implementation notes
+
+Behaviour the spec above doesn't spell out, as built.
+
+- **Order of checks.** The vault handler validates the body, then the sid
+  (`404` before the provider is called), then the secret and its fields, then
+  the host binding. The connection then checks `busy`; the driver resolves
+  the page and checks interception before opening the window, and checks the
+  origin inside the window before sending anything upstream.
+- **Unbound secrets.** With `COATCHECK_ALLOW_UNBOUND_SECRETS=1` an unbound
+  login secret is accepted and the origin check only requires a committed
+  http(s) page, on any host.
+- **`until: {"urlPrefix"}`** holds at once if the committed URL already starts
+  with the prefix, and otherwise waits for a main-frame `Page.frameNavigated`
+  to a matching URL. A client-side route change (`history.pushState`) doesn't
+  fire that event; use `{"selector"}` for SPAs.
+- **Submit by click** uses the centre of the element's content box
+  (`DOM.getBoxModel`); `{"press":"Enter"}` sends `keyDown`/`keyUp` Enter to the
+  focused (last filled) field.
+- **Clearing** sets the node's `value` to `""` through coatcheck's own
+  `Runtime.callFunctionOn`, before each fill and on the clear steps.
 
 ## Later: network mode
 

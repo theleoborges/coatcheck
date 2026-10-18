@@ -1,26 +1,35 @@
 # Browser credential injection via CDP substitution
 
 Status: **superseded in part by broker-performed login** (roadmap item 20,
-`docs/design/cdp-broker-login.md`), behind `COATCHECK_CDP_ENABLED=1`.
+implemented; `docs/design/cdp-broker-login.md`), behind
+`COATCHECK_CDP_ENABLED=1`.
 
 > **Superseded sections.** The v1 flow handed the agent session-bound tickets
 > to fill with `page.fill()` and swapped them inside `Input.insertText`. Item 20
 > removed that: coatcheck now performs the fill and submit itself (see
-> `cdp-broker-login.md`). The following sections describe code that no longer
-> exists and are kept only to explain what was removed and why:
-> **Step 2: session-bound tickets (`POST /_vault/mint-tokens`)**,
-> **Outbound substitution**, and **Keystroke detector**. What remains in force:
-> the connectUrl rewrite and browser adapters (Step 1, now also stripping
-> request extension params and `seleniumRemoteUrl`), the CDP proxy connection
-> (Step 3), origin tracking (reused for the login origin check and page
-> selection), inbound redaction (extended to browser-applied encodings), and
-> teardown/revocation.
+> `cdp-broker-login.md`, which also has the login endpoint, its status codes
+> and the current residual risks). Sections marked **(history)** describe code
+> that no longer exists, or reasoning item 20 overturned, and are kept only to
+> explain what was removed and why:
+> **Problem** (the v1 approach), **Why substitution**,
+> **Step 2: session-bound tickets**, **Outbound substitution**,
+> **Keystroke detector** and **Known gaps (v1)**.
+>
+> **In force** (updated to match the code): **Architecture**, **Step 1:
+> connectUrl rewrite** (now also stripping request extension params and
+> `seleniumRemoteUrl`), **Step 3: CDP proxy connection**, **Origin tracking**
+> (reused for the login origin check and page selection), **Inbound
+> redaction** (extended to browser-applied encodings), **Teardown**,
+> **Failure modes**, **Browser adapters**, **Configuration** and **Logging**.
 
 Code: `packages/core/src/cdp/proxy.ts`, `packages/core/src/cdp/login-driver.ts`, `packages/core/src/cdp/substitution.ts`,
 `packages/core/src/cdp-session-store.ts`, `packages/core/src/browser-adapters.ts`, `packages/core/src/json-response-rewriter.ts`, wiring in `packages/core/src/mitm.ts` and `packages/core/src/start.ts`,
 login endpoint in `packages/core/src/vault-handler.ts`.
 
-## Problem
+## Problem (history)
+
+> The first paragraph still describes the problem. The rest describes the v1
+> answer, replaced by broker-performed login.
 
 coatcheck's HTTPS path swaps tickets (`cct_*`) for real values in request
 headers and URLs. Logging into a website from a remote browser is different:
@@ -39,7 +48,12 @@ and never sees the password.
 Scope: ordinary HTML login forms. Sites that require 2FA/OTP at login are out
 of scope.
 
-## Why substitution, not session handover or per-site adapters
+## Why substitution, not session handover or per-site adapters (history)
+
+> **Overturned by roadmap item 20.** The red-team run showed substitution
+> leaves the real value in a page the agent can script. coatcheck now drives
+> the login itself, but generically: the agent supplies the selectors per call,
+> so there are still no per-site adapters to maintain.
 
 Two alternatives were considered and rejected.
 
@@ -67,13 +81,18 @@ agent ── HTTPS POST /v1/sessions (x-api-key: cct_…) ──▶ coatcheck :3
                                                     browser vendor REST API
 
 agent ── ws://127.0.0.1:8444/cdp/{sid} ──▶ coatcheck :8444 (CDP proxy)
-                                            │ outbound: cct_* → real value
+                                            │ outbound: relayed unchanged (queued during a login)
+                                            │ login:    coatcheck's own fill + submit
                                             │ inbound:  real value → [REDACTED:…] or drop
                                             ▼
                                         vendor CDP endpoint (real connectUrl)
+
+agent ── POST /_vault/{name}/login {sessionId, fields, submit, …} ──▶ coatcheck :3128 (vault API)
 ```
 
-Both listeners run in one process and share the `TokenStore`. The CDP
+Both listeners run in one process and share the `TokenStore` and the
+`CdpSessionStore`; the login endpoint drives the connection through the
+controller the CDP proxy attaches to its sid. The CDP
 listener binds to the same host as the HTTP listener (`COATCHECK_BIND_HOST`,
 default `127.0.0.1`), port `COATCHECK_CDP_PORT` (default 8444)
 (`packages/core/src/start.ts`). If the CDP listener fails to bind,
@@ -86,7 +105,7 @@ A remote-browser session is created over the vendor's REST API. The response
 carries a `connectUrl` (a `wss://` URL with a signing key embedded), and other
 endpoints (Browserbase's `GET /v1/sessions/{id}/debug`) return more CDP and
 live-view URLs. If the agent received any of them it could connect directly
-and bypass substitution and redaction.
+and bypass the proxy, and with it the login window and redaction.
 
 When the CDP proxy is enabled and the CONNECT target is one of a browser
 adapter's REST hosts, coatcheck replaces the plain response pipe with a
@@ -107,12 +126,17 @@ The Browserbase adapter (`packages/core/src/browser-adapters.ts`):
   or a subdomain (parsed hostname, so `evilbrowserbase.com` doesn't match),
   whatever its key: `connectUrl`, `wsUrl`, and WebSocket `debuggerUrl`s,
   including `pages[]`; plus any `ws(s)` `connectUrl` on any host;
-- deletes `signingKey`;
+- deletes `signingKey` and `seleniumRemoteUrl` (an HTTP route to the same
+  browser; removed since item 20);
 - deletes values it can't point at the local proxy but that would be a direct
   route to the browser: http(s) viewer URLs whose query embeds a Browserbase
   WebSocket target (`…inspector.html?wss=connect.browserbase.com/…`) and any
   non-WebSocket `debuggerUrl`/`debuggerFullscreenUrl`. Browserbase live view
-  is therefore unavailable through coatcheck while CDP is enabled.
+  is therefore unavailable through coatcheck while CDP is enabled;
+- on requests (item 20): deletes `extensionId`, top-level and in
+  `browserSettings`, from JSON request bodies to the API host, so the agent
+  can't load its own extension into the browser (details in
+  `cdp-broker-login.md`, "Browser adapter addition").
 
 Each replacement is produced by `CdpSessionStore.register(realUrl, adapterName)`
 (`packages/core/src/cdp-session-store.ts`), which stores the real URL under a random
@@ -125,7 +149,7 @@ browser service's API host is always intercepted in the default
 `COATCHECK_MITM=bound` mode, as an adapter host (`packages/core/src/mitm.ts`); unless it is
 listed in `COATCHECK_PASSTHROUGH_HOSTS`, which disables the rewrite.
 
-### Step 2: session-bound tickets (`POST /_vault/mint-tokens`)
+### Step 2: session-bound tickets (`POST /_vault/mint-tokens`) (history)
 
 > **Superseded by roadmap item 20.** `mint-tokens` and session-bound tickets were removed; coatcheck fills the form itself. Kept for historical context.
 
@@ -155,19 +179,23 @@ between a credential and the site it belongs to (see Known gaps).
 
 ### Step 3: CDP proxy connection
 
-`startCdpProxy` (`packages/core/src/cdp/proxy.ts:37`) accepts `ws://…/cdp/{sid}`:
+`startCdpProxy` (`packages/core/src/cdp/proxy.ts`) accepts `ws://…/cdp/{sid}`:
 
-1. Parse the sid from the path (`/^\/cdp\/([a-f0-9]+)\/?$/`, `:201-204`) and
-   resolve it in `CdpSessionStore`. Unknown or expired sid: close 1008
-   (`:54-58`).
-2. Enforce `MAX_CONCURRENT = 1` (`:11`, `:59-63`). A second concurrent
-   connection is closed with 1013 "CDP proxy busy". v1 assumes one agent
-   drives one browser at a time.
-3. Dial the real `connectUrl`. Frames that arrive before the upstream opens are
+1. Parse the sid from the path (`/^\/cdp\/([a-f0-9]+)\/?$/`) and resolve it
+   in `CdpSessionStore`. Unknown or expired sid: close 1008.
+2. Enforce `MAX_CONCURRENT = 1`. A second concurrent connection is closed with
+   1013 "CDP proxy busy". v1 assumes one agent drives one browser at a time.
+3. Mark the sid connected (it stays live until teardown), create a
+   `CdpConnection` and attach it to the sid as its login controller.
+4. Dial the real `connectUrl`. Frames that arrive before the upstream opens are
    queued, capped at 256 (`pendingFrameCap`). Overflow sends a CDP error and
-   tears down (`:139-144`). The upstream must open within 10 s or the
-   connection is torn down (`:74-80`).
-4. Relay frames in both directions through the substitution layer.
+   tears down. The upstream must open within 10 s or the connection is torn
+   down.
+5. Relay agent frames upstream unchanged, tracking the state a login needs
+   (page targets, new-document scripts, interception). Agent frames with an
+   id ≥ 2³⁰ are refused (coatcheck's own range). During a login window agent
+   frames are queued and released afterwards. Inbound frames go through
+   inbound redaction; responses to coatcheck's own commands are swallowed.
 
 There is no authentication on the WebSocket upgrade beyond knowledge of the
 sid. The sid is unguessable and only delivered to the agent in the rewritten
@@ -186,7 +214,7 @@ or an inbound main-frame `Page.frameStartedLoading`, until the next main-frame
 response that commits nothing). Sessions are forgotten on
 `Target.detachedFromTarget`.
 
-### Outbound substitution (agent → browser)
+### Outbound substitution (agent → browser) (history)
 
 > **Superseded by roadmap item 20.** There is no outbound credential substitution any more; coatcheck never swaps a ticket into a CDP frame. Kept for historical context.
 
@@ -217,32 +245,35 @@ response that commits nothing). Sessions are forgotten on
 
 ### Inbound redaction (browser → agent)
 
-If a page (or the agent) reads back a field's value, for example
-`Runtime.evaluate("document.querySelector('#pw').value")`, the real password
-would arrive in the response frame. `substituteInbound`
-(`packages/core/src/cdp/substitution.ts:98-137`) defends this:
+If the browser reports a real value back, for example a field read, a form
+POST body in a `Network` event, or site console output, it would arrive in an
+inbound frame. Since item 20 this is a backstop for browser-produced data:
+no agent script runs while the value is in the page. `substituteInbound`
+(`packages/core/src/cdp/substitution.ts`) defends it:
 
-1. Collect the session's active real values (`TokenStore.sessionValues`,
-   `packages/core/src/token-store.ts:174`). None: forward as-is.
-2. Byte-level floor: if no value occurs as a substring of the raw frame,
-   forward as-is (`:106-114`).
-3. Otherwise parse. Unparseable: **drop the frame** (`:117-123`).
-4. Walk the JSON tree and replace each occurrence in string values with
-   `[REDACTED:<secretName>]`, for example `[REDACTED:example-login:password]`
-   (`:139-171`).
-5. Re-serialize. If any real value still occurs in the output, drop the frame
-   (`:130-134`).
+1. Collect the session's real values (`TokenStore.sessionValues`). A login
+   registers its non-`_cleartext` field values under the sid; they stay until
+   teardown. None: forward as-is.
+2. Match each value and the encodings the browser applies: percent-encoding
+   (`encodeURIComponent`), HTML entities and JSON string escaping.
+3. Byte-level floor: if no form occurs as a substring of the raw frame,
+   forward as-is.
+4. Otherwise parse. Unparseable: **drop the frame**.
+5. Walk the JSON tree and replace each occurrence in string values with
+   `[REDACTED:<secretName>:<field>]`, for example
+   `[REDACTED:example-login:password]`.
+6. Re-serialize. If any form still occurs in the output, drop the frame.
 
 A dropped frame is never forwarded, so the Playwright call that was waiting
 for it hangs or times out rather than returning the secret
-(`packages/core/src/cdp/proxy.ts:168-171`). Binary inbound frames are forwarded without
-inspection (`:163-166`).
+(`packages/core/src/cdp/proxy.ts`). Binary inbound frames are forwarded
+without inspection.
 
 The redaction marker carries the secret name, not the ticket id, and is not
 re-substitutable: filling `[REDACTED:…]` into another field sends the marker
 text literally.
 
-### Keystroke detector: fail closed for `page.type()`
+### Keystroke detector: fail closed for `page.type()` (history)
 
 > **Superseded by roadmap item 20.** The keystroke detector was removed: with no credential tickets in the browser, `page.type()` needs no special handling. Kept for historical context.
 
@@ -271,15 +302,17 @@ so this leaks no secret, but the page has seen most of a ticket string.
 
 ### Teardown and revocation
 
-`teardown()` (`packages/core/src/cdp/proxy.ts:82-92`) runs once on client close, client
-error, upstream close, upstream error, upstream connect timeout, or pending
-buffer overflow. It:
+`teardown()` (`packages/core/src/cdp/proxy.ts`) runs once on client close,
+client error, upstream close, upstream error, upstream connect timeout,
+pending buffer overflow, or agent-queue overflow during a login. It:
 
+- fails any coatcheck command or event wait in flight (a login in progress
+  answers `502 upstream-closed`),
 - decrements the concurrency counter,
-- revokes every ticket bound to the sid (`TokenStore.revokeSession`,
-  `packages/core/src/token-store.ts:204`),
-- revokes the sid in `CdpSessionStore`, so a sid is single-use: reconnecting
-  to the same `connectUrl` after close fails with 1008,
+- drops the sid's redaction values (`TokenStore.revokeSession`),
+- revokes the sid in `CdpSessionStore` and detaches its controller, so a sid
+  is single-use: reconnecting to the same `connectUrl` after close fails with
+  1008, and `/login` on it answers `404`,
 - closes both sockets.
 
 It does not end the remote browser session at the vendor. Releasing that
@@ -289,27 +322,28 @@ session remains the client's job.
 
 | Condition | Behaviour |
 |---|---|
-| `COATCHECK_CDP_ENABLED` unset | No CDP listener; `connectUrl` not rewritten; agent receives the real vendor URL (`packages/core/src/mitm.ts`, `packages/core/src/start.ts`). Credential injection unavailable. |
-| Token store empty at CONNECT time | Tunnel is passthrough; `connectUrl` not rewritten for that connection (`packages/core/src/mitm.ts`). |
-| sid unknown or expired (10 min) | WebSocket closed 1008. |
-| `mint-tokens` for an unknown, expired or closed sid | `404`, no ticket issued, provider not called. |
+| `COATCHECK_CDP_ENABLED` unset | No CDP listener; `connectUrl` not rewritten; agent receives the real vendor URL (`packages/core/src/mitm.ts`, `packages/core/src/start.ts`). Browser login unavailable. |
+| Adapter host in `COATCHECK_PASSTHROUGH_HOSTS` | Tunnel is passthrough; `connectUrl` not rewritten. Otherwise an adapter host is always MITM'd while CDP is enabled (`packages/core/src/mitm.ts`). |
+| sid unknown or expired (10 min, unconnected) | WebSocket closed 1008. |
+| `/login` for an unknown or not-connected sid | `404 unknown-sid-or-secret`, provider not called. |
 | Second concurrent CDP connection | Closed 1013. |
-| Upstream does not open within 10 s | Torn down; session tickets revoked. |
+| Upstream does not open within 10 s | Torn down. |
 | >256 frames queued before upstream opens | CDP error to client, torn down. |
-| Ticket expired before use | Literal `cct_…` reaches the page; login fails visibly. |
-| `page.type()` with a ticket | Last keystroke frame dropped, CDP error returned. |
+| Agent frame with an id ≥ 2³⁰ | Refused with a CDP error, never forwarded. |
+| >4096 agent frames queued during a login | Torn down; the login answers `502`. |
+| Login refused or failed | See the status table in `cdp-broker-login.md`. |
 | Real value echoed in an inbound frame that cannot be cleaned | Frame dropped; the awaiting client call stalls. |
-| Ticket in an unsupported CDP method | Forwarded unsubstituted, logged. |
-| `Input.insertText` with a ticket on a disallowed or unknown origin | Frame dropped, CDP error (`credential-origin violation`) with the request's `id` and `sessionId`; Playwright retries until its action timeout. |
 | CDP listener bind failure | Process exits. |
 
-## Known gaps
+## Known gaps (v1) (history)
 
-> The first and fourth gaps below were confirmed against a real Browserbase
-> session (`examples/agents/browser-login/attack-transform.md`) and are what
-> `cdp-broker-login.md` (roadmap item 20) replaces this flow to close. Until
-> then, this flow protects against accidental exposure of the password, not
-> against an agent that is trying to read it.
+> These are the gaps of the v1 ticket flow. The first and fourth were
+> confirmed against a real Browserbase session
+> (`examples/agents/browser-login/attack-transform.md`) and are what
+> `cdp-broker-login.md` (roadmap item 20) closed. Current residual risks are
+> in `cdp-broker-login.md` ("Residual risk after this change") and
+> `docs/THREAT_MODEL.md`. Binary frames, other routes to the browser,
+> authenticated-action abuse and vendor trust still apply as written.
 
 - **Script on an allowed origin can read the filled value.** Origin binding
   (roadmap item 15) stops a fill on another site and closes direct
@@ -361,11 +395,13 @@ interface BrowserAdapter {
   hosts: string[];
   /** Mutate parsed JSON in place; register(realWsUrl) returns the local ws URL. Return true if changed. */
   rewriteJson(body: unknown, register: (realUrl: string) => string): boolean;
+  /** Optional (item 20): strip agent-controlled parameters from a JSON request body in place. Return true if changed. */
+  rewriteRequestJson?(body: unknown): boolean;
 }
 ```
 
-Everything else (HTTP framing, the CDP proxy, substitution, redaction,
-keystroke detection, session store) is vendor-neutral. Built-ins are chosen
+Everything else (HTTP framing, the CDP proxy, the login driver, redaction,
+session store) is vendor-neutral. Built-ins are chosen
 with `COATCHECK_BROWSER_ADAPTERS` (default `browserbase`); custom adapters go
 through `startCoatcheck({ config, provider, adapters })`, which then uses
 exactly the adapters given. A local `--remote-debugging-port` browser needs a
@@ -383,6 +419,7 @@ rewrite hook on the plain-HTTP forward path and is out of v1.
 
 ## Logging
 
-The CDP proxy logs sids, counts (substitutions, redactions, revoked tickets),
-method names for unsupported-method warnings, and fail-closed events. It does
-not log frame bodies or real values. Tickets are opaque and safe to log.
+The CDP proxy logs sids, adapter names, counts (redactions, dropped
+redaction values), fail-closed events, and per login the secret name,
+outcome, duration and number of queued agent frames. It does not log frame
+bodies or real values.

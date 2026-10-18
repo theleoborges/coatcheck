@@ -69,11 +69,14 @@ persists across restarts. If it is regenerated, clients must re-fetch it.
 
 Ticket responses also carry `allowed_hosts`: the only hosts the ticket will be
 swapped for. Sending it anywhere else gets `403` with
-`X-Coatcheck-Denied: host-mismatch`, and the request is not forwarded.
+`X-Coatcheck-Denied: host-mismatch`, and the request is not forwarded. They
+carry `"swap_body": true` when the secret allows its ticket in request bodies
+(section 3).
 
-Errors: 404 when the secret is missing, 400 for an unknown field, 403 for a
-shared secret outside the allowlist or a secret with no allowed hosts, 401
-without the API token when one is configured.
+Errors: 404 when the secret is missing (with `vault_url` when the operator set
+`COATCHECK_MISSING_SECRET_URL`), 400 for an unknown field or an invalid secret
+name, 403 for a shared secret outside the allowlist or a secret with no allowed
+hosts, 401 without the API token when one is configured.
 
 ```bash
 TOK=$(curl -sf http://127.0.0.1:3128/_vault/example-api-key | jq -er .token)
@@ -89,7 +92,8 @@ workflows rather than caching.
 ## 3. Use the ticket: the literal-substring rule
 
 coatcheck replaces tickets wherever they appear **verbatim** in the request
-line (URL, including query string) or headers. Nothing else is inspected.
+line (URL, including query string) or headers. Request bodies are inspected
+only for secrets that opt in (below).
 
 Works:
 
@@ -105,9 +109,16 @@ Fails silently (the upstream receives `cct_…` and returns 401/403):
 - **HTTP Basic auth.** `curl -u user:$TOK`, `https://user:$TOK@host/`,
   `.netrc`, credential helpers. The client base64-encodes `user:cct_…` into
   `Authorization: Basic …`, which hides the literal.
-- **Ticket in the request body** (JSON, form-encoded, multipart). Bodies are
-  forwarded unchanged.
-- **Any transform of the ticket**: hashing, HMAC signing with it, URL- or
+- **Ticket in the request body**, unless the secret opts in (`swap_body` in
+  the policy file or `_swap_body: true` in the secret; the ticket response
+  then shows `"swap_body": true`). Without it, the body is forwarded
+  unchanged and coatcheck logs `result=body-skipped`. With it, coatcheck
+  swaps body tickets (JSON-escaped for `application/json`, percent-encoded
+  for form bodies, raw otherwise), but not in compressed bodies
+  (`Content-Encoding` other than `identity`) or bodies larger than
+  `COATCHECK_MAX_SWAP_BODY_BYTES` (default 1 MiB; logged as
+  `result=body-unscanned`).
+- **Any transform of the ticket**: hashing, HMAC signing with it,
   base64-encoding it, splitting it.
 - **Traffic that bypasses the proxy** (section 4).
 - **A connection opened before any ticket existed** (section 5).
@@ -116,9 +127,6 @@ A 401/403 when using a ticket almost always means the swap did not happen.
 Debug the call path; the stored secret is usually fine. coatcheck logs
 `[swap] … result=miss unswapped_ticket_literals=N` when a `cct_` literal reaches
 an upstream unswapped.
-
-Also avoid `Transfer-Encoding: chunked` request bodies (send a
-`Content-Length`; `curl -d` and most clients do).
 
 ## 4. Make sure the request goes through coatcheck
 
@@ -157,32 +165,42 @@ Put in `NO_PROXY` everything that must **not** be intercepted:
   not proxied to itself;
 - cloud metadata and credential endpoints (`169.254.169.254`, `169.254.170.2`);
 - internal services that never need a ticket;
-- hosts you reach with non-HTTP/1.1 protocols over CONNECT (WebSocket
-  endpoints, gRPC/HTTP2-only services). Once any ticket exists, coatcheck
-  MITMs every CONNECT and parses it as HTTP/1.1; an upgraded or non-HTTP
-  stream will stall.
+- hosts you reach with non-HTTP/1.1 protocols over CONNECT (gRPC or other
+  HTTP/2-only services, raw TCP). coatcheck MITMs a CONNECT when a ticket
+  could be swapped for its host (`COATCHECK_MITM=bound`, the default) or
+  always (`COATCHECK_MITM=always`), and speaks only HTTP/1.1 on intercepted
+  tunnels. WebSocket upgrades work: after `101` the tunnel is a raw pipe.
 
 Never put a host in `NO_PROXY` that you need a ticket swapped for.
 
 ## 5. Connection reuse
 
-coatcheck decides at CONNECT time whether to intercept a tunnel. If no ticket
-exists yet, the tunnel is a raw passthrough for its whole lifetime. A
-long-running process with a keep-alive pool that connected to `api.example.com`
-before fetching a ticket will send the ticket down an uninspected tunnel.
-Fetch the ticket first, or open a fresh connection after fetching it.
+coatcheck decides at CONNECT time whether to intercept a tunnel, and the
+decision lasts for the tunnel's lifetime. Hosts in the operator's policy file
+are always intercepted. A host allowed only by a secret's own
+`_allowed_hosts` is intercepted only once a live ticket names it, so a
+long-running process with a keep-alive pool that connected to
+`api.example.com` before fetching that ticket sends it down an uninspected
+tunnel (the upstream sees `cct_…` and rejects it). Fetch the ticket first, or
+open a fresh connection after fetching it.
 
 ## 6. Browser logins (CDP injection)
 
 Requires `COATCHECK_CDP_ENABLED=1` on coatcheck. The credential is a JSON secret
-with `username` and `password` fields, addressed by its secret name.
+with one field per form input (usually `username` and `password`), addressed by
+its secret name, with allowed hosts like any other secret.
 
 1. Create the remote-browser session **through the proxy**, with the vendor
    API key as a ticket. coatcheck injects the real key and rewrites the
-   response's `connectUrl` to `ws://127.0.0.1:8444/cdp/{sid}`:
+   response's `connectUrl` to `ws://127.0.0.1:8444/cdp/{sid}` (host and port
+   from `COATCHECK_CDP_ADVERTISE_HOST` and `COATCHECK_CDP_PORT`). For
+   Browserbase it also removes `signingKey`, `seleniumRemoteUrl` and live-view
+   URLs from responses, and strips `extensionId` from the session-create
+   body:
 
    ```js
-   const apiTok = (await getJson('http://127.0.0.1:3128/_secret/browser-api-key')).token;
+   const COATCHECK = 'http://127.0.0.1:3128';
+   const apiTok = (await getJson(`${COATCHECK}/_secret/browser-api-key`)).token;
    const session = await postViaProxy('https://api.browser-vendor.example/v1/sessions',
                                       { 'x-api-key': apiTok }, { /* session options */ });
    const sid = session.connectUrl.match(/\/cdp\/([a-f0-9]+)/)?.[1];
@@ -201,7 +219,8 @@ with `username` and `password` fields, addressed by its secret name.
    const page = browser.contexts()[0]?.pages()[0] ?? await browser.newPage();
    await page.goto('https://site.example/login');
 
-   const res = await postViaProxy(`${COATCHECK_URL}/_vault/example-login/login`, {}, {
+   // Direct to coatcheck, not through the proxy.
+   const res = await postJson(`${COATCHECK}/_vault/example-login/login`, {
      sessionId: sid,
      fields: { username: 'input[name=email]', password: 'input[name=password]' },
      submit: 'button[type=submit]',
@@ -214,20 +233,39 @@ with `username` and `password` fields, addressed by its secret name.
    the main document. `submit` is a selector to click or `{"press":"Enter"}`.
    `until` is `"navigation"` (default), `{"selector":"…"}` or `{"urlPrefix":"…"}`
    — the last two cover SPA logins. `timeoutMs` defaults to 15 000 (max 60 000).
+   If more than one page is open, add `page: {"url": "<url prefix>"}` to pick
+   the one to log in on.
+
+   Responses:
+
+   | Status | Body | Meaning |
+   |---|---|---|
+   | 200 | `{"status":"ok","url":…}` | logged in; `url` is the page's URL after login |
+   | 400 | `{"error":…}` | malformed request body |
+   | 403 | `{"error":"credential-origin violation: …"}` | page origin unknown, navigating, not http(s), or not an allowed host (or the secret has no allowed hosts); nothing filled |
+   | 404 | `{"status":"unknown-sid-or-secret"}` | no live CDP connection for `sessionId`, or no such secret |
+   | 404 | `{"status":"selector-not-found","field":…}` | a field selector matched nothing |
+   | 409 | `{"status":"page-ambiguous"}` | zero or several matching pages |
+   | 409 | `{"status":"interception-active"}` | request interception is on for the page |
+   | 409 | `{"status":"no-success","cleared":true}` | `until` not met in time; filled fields were emptied |
+   | 501 | `{"error":…}` | the secret is not a JSON login secret with the requested fields |
+   | 502 | `{"status":"upstream-closed"}` or `{"status":"driver-error","cleared":true}` | the browser connection dropped, or a CDP command failed |
 
 Rules:
 
 - **Navigate to the login page and let it load before calling `/login`.** The
   page's committed main-frame origin must be one of the login secret's allowed
-  hosts, or the login is refused with `403`. coatcheck reloads the page to a
-  fresh document before filling, so remove nothing you need afterwards.
+  hosts, or the login is refused with `403`. Before filling, coatcheck removes
+  any scripts you added with `addInitScript` (`Page.addScriptToEvaluateOnNewDocument`)
+  and reloads the page, so in-page state and init scripts do not survive the
+  login. Re-add them afterwards if you need them.
 - **Don't enable request interception on the login page** (`page.route(...)`,
   `Fetch.enable`): coatcheck refuses the login with `409 interception-active`
   rather than silently disabling your interception. Turn it off, log in, turn
   it back on.
 - **Outside the login call there are no credential tickets in the browser**, so
   `page.type()`, `page.evaluate()` and screenshots are all fine. On a timeout
-  coatcheck empties the fields it filled before returning (`409`, `cleared`).
+  coatcheck empties the fields it filled before returning (`409 no-success`).
 - **Never connect to the vendor's raw `connectUrl`** or any debug/live-view
   URL; the login driver and inbound redaction only apply on coatcheck's listener.
 - **One CDP connection at a time.** A second concurrent connection is refused
@@ -235,8 +273,9 @@ Rules:
 - A sid is single-use: after the WebSocket closes, create a new session.
 - Close the browser and release the vendor session when done; coatcheck does
   not release it.
-- Logins inside a cross-origin iframe are refused (navigate to the identity
-  provider's own page first). Sites that require 2FA/OTP are not supported.
+- Logins inside a cross-origin iframe don't work: selectors resolve in the
+  main document only, so the fields aren't found (`404 selector-not-found`).
+  Navigate to the identity provider's own page first. Sites that require 2FA/OTP are not supported.
 
 ## 7. git over HTTPS
 

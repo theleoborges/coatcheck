@@ -8,8 +8,10 @@ property 2 there: **the agent's own AWS identity can't read the secrets**,
 only coatcheck's can.
 
 Values in angle brackets and the account `123456789012` / region `us-east-1`
-are placeholders. Build the image from this repo and push it to your own ECR
-repository.
+are placeholders. Build the image from this repo's `Dockerfile` and push it
+to your own ECR repository. It is based on `node:24-slim` (coatcheck needs
+Node 24), runs as the `node` user (UID 1000), listens on `3128` (proxy and
+vault API) and, with CDP enabled, `8444`.
 
 ## Choose a shape
 
@@ -54,7 +56,7 @@ open them up:
       "Sid": "DenySecretStores",
       "Effect": "Deny",
       "Action": [
-        "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath",
+        "ssm:GetParameter", "ssm:GetParameters",
         "ssm:PutParameter", "secretsmanager:GetSecretValue"
       ],
       "Resource": [
@@ -62,6 +64,12 @@ open them up:
         "arn:aws:secretsmanager:us-east-1:123456789012:secret:coatcheck/*",
         "arn:aws:secretsmanager:us-east-1:123456789012:secret:coatcheck-infra/*"
       ]
+    },
+    {
+      "Sid": "DenyParameterPathReads",
+      "Effect": "Deny",
+      "Action": ["ssm:GetParametersByPath"],
+      "Resource": "*"
     },
     {
       "Sid": "DenyExecIntoTheSidecar",
@@ -81,6 +89,10 @@ open them up:
 
 - `coatcheck-infra/*` holds the `ExternalId` (below). Denying it here means
   the agent can't fetch it with the task role.
+- `ssm:GetParametersByPath` is denied everywhere, not just under the prefix.
+  A recursive read of a parent path (`/coatcheck`, or `/`) returns the
+  parameters below it even when they are denied by name. coatcheck makes
+  that call with the broker's identity, never the task role's.
 - The `sts:AssumeRole` allow is what the sidecar needs. The agent has it too,
   which is why the broker's trust policy also demands the `ExternalId`.
 - In shape B this role belongs to the agent alone. Keep the deny statements
@@ -97,8 +109,13 @@ Permissions:
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["ssm:GetParameter", "ssm:GetParametersByPath", "ssm:PutParameter"],
+      "Action": ["ssm:GetParameter", "ssm:PutParameter"],
       "Resource": "arn:aws:ssm:us-east-1:123456789012:parameter/coatcheck/secrets/<agent-id>/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "ssm:GetParametersByPath",
+      "Resource": "arn:aws:ssm:us-east-1:123456789012:parameter/coatcheck/secrets/<agent-id>"
     },
     {
       "Effect": "Allow",
@@ -113,7 +130,10 @@ Permissions:
 
 Add `kms:Decrypt` on the key if the parameters or secrets use a customer
 managed KMS key. `ssm:PutParameter` is only needed for OAuth refresh, which
-writes rotated tokens back.
+writes rotated tokens back. `ssm:GetParametersByPath` is checked against the
+path itself (no trailing `/*`); coatcheck uses it to list secret names
+(`GET /_vault`). The Secrets Manager entry lists each shared secret by name;
+the `-*` covers the random suffix AWS adds to secret ARNs.
 
 Trust policy: the task role may assume it **only with the `ExternalId`**:
 
@@ -242,8 +262,24 @@ Notes:
 - **Don't enable ECS Exec** on these services. Exec into the coatcheck
   container reads its environment. The task role above also denies
   `ecs:ExecuteCommand`.
-- **Policy file.** Fargate has no host bind mounts, so bake the policy into a
-  thin image of your own:
+- **Policy file.** Every secret needs allowed hosts, from the policy or from
+  an `_allowed_hosts` key in the secret's JSON, or coatcheck refuses to mint a
+  ticket for it (403). Shared secrets (`/_secret/*`) must be listed
+  under `shared`:
+
+  ```json
+  {
+    "secrets": {
+      "example-api-key": { "allowed_hosts": ["api.example.com"] }
+    },
+    "shared": {
+      "browserbase-api-key": { "allowed_hosts": ["api.browserbase.com"] }
+    }
+  }
+  ```
+
+  Fargate has no host bind mounts, so bake the policy into a thin image of
+  your own:
 
   ```dockerfile
   FROM 123456789012.dkr.ecr.us-east-1.amazonaws.com/coatcheck:<tag>
@@ -253,8 +289,14 @@ Notes:
 - **Bind address.** The sidecar keeps the default `127.0.0.1`, which the agent
   reaches through the shared network namespace. Nothing outside the task can
   connect, so `COATCHECK_API_TOKEN` is optional here.
-- **CDP injection.** Add `COATCHECK_CDP_ENABLED=1`; the agent connects to the
-  rewritten `ws://127.0.0.1:8444/cdp/…` URLs.
+- **Browser logins (CDP).** Add `COATCHECK_CDP_ENABLED=1`. Browserbase
+  session responses are rewritten so the agent connects to
+  `ws://127.0.0.1:8444/cdp/…`, and the agent asks coatcheck to fill and
+  submit a login form with `POST /_vault/{name}/login`. The login secret is a
+  multi-field JSON parameter (`{"username":…,"password":…}`) in the agent's
+  SSM prefix, and its allowed hosts are the login page's origin. In shape B,
+  also set `COATCHECK_CDP_ADVERTISE_HOST` to the address the agent uses for
+  coatcheck.
 
 ## CA trust in the agent entrypoint
 
@@ -374,10 +416,16 @@ aws sts assume-role --role-arn arn:aws:iam::123456789012:role/coatcheck-broker-<
 aws secretsmanager get-secret-value --secret-id coatcheck-infra/<agent-id>/external-id     # AccessDenied
 
 # The broker works: mint a ticket and use it at an allowed host.
+# (Shape B: add -H "Authorization: Bearer $COATCHECK_API_TOKEN" to the first curl.)
 TICKET=$(curl -s "$COATCHECK_URL/_vault/example-api-key" | sed 's/.*"token":"\([^"]*\)".*/\1/')
 curl -s -H "Authorization: Bearer $TICKET" https://<allowed host>/…                       # real value swapped in
-curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TICKET" https://example.org/   # 403
+# A host bound to a different secret refuses it (403 host-mismatch).
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TICKET" https://<host bound to another secret>/   # 403
 ```
+
+A host no secret is bound to (`https://example.org/`, say) is tunnelled
+untouched in the default `COATCHECK_MITM=bound` mode: it answers normally, and
+all it receives is the literal `cct_…` ticket.
 
 In coatcheck's logs, look for `[swap] … result=hit` and no `WARNING:
 COATCHECK_AWS_ROLE_ARN is set without COATCHECK_AWS_EXTERNAL_ID` line.
