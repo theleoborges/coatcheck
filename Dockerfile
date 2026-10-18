@@ -1,4 +1,4 @@
-FROM node:24-slim AS build
+FROM node:26-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.json tsconfig.base.json ./
 COPY packages/core/package.json packages/core/tsconfig.json ./packages/core/
@@ -10,7 +10,7 @@ COPY packages/provider-aws/src/ ./packages/provider-aws/src/
 COPY packages/provider-env/src/ ./packages/provider-env/src/
 RUN npm run build
 
-FROM node:24-slim
+FROM node:26-slim
 # No system packages: certificates are generated in-process (core/src/ca.ts) and
 # Node verifies upstream TLS against its bundled root store.
 WORKDIR /app
