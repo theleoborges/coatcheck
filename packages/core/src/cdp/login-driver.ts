@@ -36,6 +36,11 @@ export async function runLogin(conn: CdpConnection, req: LoginRequest): Promise<
   // --- Precondition: request interception must be off on that page ---
   if (conn.interception.has(page)) return { status: 409, reason: 'interception-active' };
 
+  // --- Precondition: every field has a value (before touching the page) ---
+  for (const field of Object.keys(req.fields)) {
+    if (typeof req.values[field] !== 'string') return { status: 501 };
+  }
+
   const started = Date.now();
   const deadline = started + req.timeoutMs;
   const remaining = () => Math.max(0, deadline - Date.now());
@@ -61,22 +66,31 @@ export async function runLogin(conn: CdpConnection, req: LoginRequest): Promise<
     if (afterReload) { outcome = 'denied'; return afterReload; }
 
     // --- Fill ---
-    // Resolve every field before typing any value, so a refusal (missing
-    // value, unmatched selector) leaves no real value in the page.
+    // Check every selector before typing any value, so an unmatched selector
+    // leaves no real value in the page.
     const rootNodeId = await documentNodeId(conn, page);
-    const targets: { selector: string; nodeId: number; value: string }[] = [];
     for (const [field, selector] of Object.entries(req.fields)) {
-      const value = req.values[field];
-      if (typeof value !== 'string') return { status: 501 };
-      const nodeId = await querySelector(conn, page, rootNodeId, selector);
-      if (nodeId === 0) { outcome = 'selector-not-found'; return { status: 404, reason: 'selector-not-found', field }; }
-      targets.push({ selector, nodeId, value });
+      if (await querySelector(conn, page, rootNodeId, selector) === 0) {
+        outcome = 'selector-not-found';
+        return { status: 404, reason: 'selector-not-found', field };
+      }
     }
-    for (const { selector, nodeId, value } of targets) {
+    for (const [field, selector] of Object.entries(req.fields)) {
+      const value = req.values[field] as string; // checked before the window opened
+      // Resolve again right before typing: the page may have re-rendered the
+      // form while earlier fields were filled, invalidating older node ids.
+      const nodeId = await querySelector(conn, page, rootNodeId, selector);
+      if (nodeId === 0) {
+        await clearFields(conn, page, filled);
+        outcome = 'selector-not-found';
+        return { status: 404, reason: 'selector-not-found', field };
+      }
       await conn.sendCommand('DOM.focus', { nodeId }, page);
       await clearNode(conn, page, nodeId);
-      await conn.sendCommand('Input.insertText', { text: value }, page);
+      // Record before typing: if insertText rejects after the browser applied
+      // it, the error path must still empty this field.
       filled.push(selector);
+      await conn.sendCommand('Input.insertText', { text: value }, page);
     }
 
     // --- Submit ---

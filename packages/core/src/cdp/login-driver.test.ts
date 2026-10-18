@@ -36,6 +36,8 @@ function fakeBrowser() {
     selectors: new Map<string, number>([['#user', 11], ['#pass', 12], ['#go', 20], ['#done', 0]]),
     /** A selector to "appear" after submit (for until.selector). */
     appearAfterSubmit: null as string | null,
+    /** A selector that stops matching once anything was typed (form re-rendered). */
+    vanishAfterInsert: null as string | null,
   };
 
   function send(f: Frame) { conn?.send(JSON.stringify(f)); }
@@ -61,6 +63,7 @@ function fakeBrowser() {
         const sel = (f.params as { selector: string }).selector;
         let nodeId = opts.selectors.get(sel) ?? 0;
         if (opts.appearAfterSubmit === sel && received.some(r => r.method === 'Input.dispatchMouseEvent')) nodeId = 99;
+        if (opts.vanishAfterInsert === sel && received.some(r => r.method === 'Input.insertText')) nodeId = 0;
         return reply({ nodeId });
       }
       case 'DOM.focus': return reply({});
@@ -221,6 +224,25 @@ describe('login driver', () => {
     expect(result).toEqual({ status: 404, reason: 'selector-not-found', field: 'username' });
     expect(browser.filledText).toEqual([]);
     expect(browser.received.some(f => f.method === 'Input.insertText')).toBe(false);
+  });
+
+  it('empties what it filled when a field disappears mid-fill (form re-rendered)', async () => {
+    const { conn } = await connect();
+    browser.opts.vanishAfterInsert = '#user';
+    const result = await conn.login(baseReq({ fields: { password: '#pass', username: '#user' } }));
+    expect(result).toEqual({ status: 404, reason: 'selector-not-found', field: 'username' });
+    expect(browser.filledText).toEqual(['hunter2-real-pw']);
+    // The password field was emptied after it was typed into.
+    const methods = browser.received.map(f => f.method);
+    expect(methods.lastIndexOf('Runtime.callFunctionOn')).toBeGreaterThan(methods.indexOf('Input.insertText'));
+  });
+
+  it('returns 501 without reloading or filling when a field has no value', async () => {
+    const { conn } = await connect();
+    const result = await conn.login(baseReq({ values: { password: 'hunter2-real-pw' } }));
+    expect(result).toEqual({ status: 501 });
+    expect(browser.filledText).toEqual([]);
+    expect(browser.received.some(f => f.method === 'Page.reload')).toBe(false);
   });
 
   it('returns 409 interception-active when request interception is on', async () => {
