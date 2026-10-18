@@ -28,6 +28,21 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  harness:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/agents/harness
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: examples/agents/harness/package-lock.json
+      - run: npm ci
+      - run: npm run type-check
+
   docker:
     runs-on: ubuntu-latest
     steps:
