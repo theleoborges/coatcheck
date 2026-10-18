@@ -1,0 +1,16 @@
+{
+  "secrets": {
+    "anthropic-api-key": { "allowed_hosts": ["api.anthropic.com"], "swap_headers": ["x-api-key"] },
+    "ledger": {
+      "allowed_hosts": ["ledger"],
+      "signing": {
+        "type": "hmac",
+        "hash": "sha256",
+        "key_header": "X-Ledger-Key",
+        "signature_header": "X-Ledger-Signature",
+        "encoding": "base64",
+        "message": ["header:X-Ledger-Timestamp", "method", "path_query", "body"]
+      }
+    }
+  }
+}

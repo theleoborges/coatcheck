@@ -11,8 +11,8 @@ Security fixes include a test that performs the attack and shows it is
 blocked. The decisions behind this list, and the alternatives that were
 rejected, are in `docs/design/v1-decisions.md`.
 
-Status: items 1–20 and 22–25 are done. What remains is item 21, item 26
-and the "After 1.0" list.
+Status: items 1–20 and 22–26 are done. What remains is item 21 and the
+"After 1.0" list.
 
 ## Phase 1: shell injection (HIGH)
 
@@ -344,6 +344,15 @@ Design and implementation plan: `docs/design/signing-processors.md`.
     commands with no model, then the negative checks. The shared agent image
     gains `INSTALL_AWS_CLI`; `harness/system.md` describes signing tickets. The
     live run needs AWS and Vercel credentials and is the operator's.
+
+26. **[Done]** **`examples/agents/ledger-reconcile`** (design §7.2). An
+    HMAC-protected ledger API in a container (`service/`: `node:https`,
+    `node:crypto`, seeded data with planted anomalies; auditor and operator
+    keys, ±30 s timestamps). coatcheck holds only the read-only auditor key;
+    the agent writes a client from the recipe in the mint response and signs
+    with the ticket. `smoke.sh` verifies the stack with no model (one signed
+    GET, the negative checks, `result=signed signing=hmac`); fully runnable
+    with Docker alone.
 
 ## After 1.0
 

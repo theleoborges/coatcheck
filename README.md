@@ -93,6 +93,7 @@ Node ≥ 24. There is no published container image yet: build one from this repo
 
 - **gh-triage** triages GitHub issues with unmodified `gh` and `curl` through the HTTPS swap.
 - **browser-login** logs into a practice site through Browserbase using broker-performed login, with secrets in AWS (SSM and Secrets Manager via an assumed role).
+- **ledger-reconcile** reconciles accounts on an HMAC-signed API that runs in the same compose stack (no third-party account beyond the model); the agent writes its own signing client from the recipe coatcheck returns, signing with the ticket.
 - **vercel-release-report** runs off AWS, reads Vercel with a bearer ticket and uploads a report to S3 with the unmodified `aws` CLI and a SigV4 [signing ticket](#signed-requests): the IAM key never leaves coatcheck.
 
 Each comes with a red-team task that tells the agent to try to extract the real secret. See [examples/agents/README.md](examples/agents/README.md).
