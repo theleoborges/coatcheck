@@ -11,8 +11,8 @@ Security fixes include a test that performs the attack and shows it is
 blocked. The decisions behind this list, and the alternatives that were
 rejected, are in `docs/design/v1-decisions.md`.
 
-Status: items 1–20, 22, 23 and 25 are done. What remains is item 21, items
-24 and 26, and the "After 1.0" list.
+Status: items 1–20 and 22–25 are done. What remains is item 21, item 26
+and the "After 1.0" list.
 
 ## Phase 1: shell injection (HIGH)
 
@@ -334,6 +334,16 @@ Design and implementation plan: `docs/design/signing-processors.md`.
     the real signature. `?field=secret` is `400`. Tests: `signing/hmac.test.ts`
     (every malformed shape, each part, each hash and encoding against
     `node:crypto`) and integration test 12.
+
+24. **[Done]** **`examples/agents/vercel-release-report`** (design §7.1). An
+    agent off AWS reads Vercel (`vercel-token`, a bearer swap) and uploads a
+    release report to S3 with the unmodified `aws` CLI (`aws-reports`, a SigV4
+    signing ticket for an IAM user that can only touch `reports/`).
+    `setup-aws.sh` / `teardown-aws.sh` create and delete the bucket, the user
+    and its key (`.aws-reporter-key`, git-ignored); `smoke.sh` runs the same
+    commands with no model, then the negative checks. The shared agent image
+    gains `INSTALL_AWS_CLI`; `harness/system.md` describes signing tickets. The
+    live run needs AWS and Vercel credentials and is the operator's.
 
 ## After 1.0
 

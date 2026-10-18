@@ -1,0 +1,58 @@
+# vercel-release-report: an agent off AWS that reads Vercel (a literal bearer
+# swap) and writes to S3 (a SigV4 signing ticket), secrets from the env
+# provider. See ../README.md.
+#
+# The agent sits on an internal network: its only route out is coatcheck.
+name: coatcheck-vercel-release-report
+services:
+  coatcheck:
+    build: { context: ../../.., dockerfile: Dockerfile }
+    environment:
+      - COATCHECK_PROVIDER=env
+      - COATCHECK_AGENT_ID=vercel-release-report
+      - COATCHECK_BIND_HOST=0.0.0.0
+      - COATCHECK_API_TOKEN=${COATCHECK_API_TOKEN:?run via ./run.sh}
+      - COATCHECK_POLICY_FILE=/etc/coatcheck/policy.json
+      # Intercept every tunnel, so a request to another bucket is refused by
+      # coatcheck (403 host-mismatch) rather than leaving as a literal.
+      - COATCHECK_MITM=always
+      - COATCHECK_SECRET_ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY}
+      - COATCHECK_SECRET_VERCEL_TOKEN=${VERCEL_TOKEN:?set VERCEL_TOKEN}
+      # The IAM user's access key (from .aws-reporter-key), only in this container.
+      - COATCHECK_SECRET_AWS_REPORTS=${COATCHECK_SECRET_AWS_REPORTS:?run via ./run.sh}
+    volumes:
+      - ./policy.json:/etc/coatcheck/policy.json:ro
+    networks: [agentnet, egress]
+
+  agent:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args: { INSTALL_AWS_CLI: "1" }
+    depends_on: [coatcheck]
+    environment:
+      - COATCHECK_URL=http://coatcheck:3128
+      - COATCHECK_API_TOKEN=${COATCHECK_API_TOKEN}
+      - HTTPS_PROXY=http://coatcheck:${COATCHECK_API_TOKEN}@coatcheck:3128
+      - HTTP_PROXY=http://coatcheck:${COATCHECK_API_TOKEN}@coatcheck:3128
+      - NO_PROXY=coatcheck,localhost,127.0.0.1
+      - NODE_USE_ENV_PROXY=1
+      # The AWS CLI bundles its own CA store; point it at coatcheck's CA (the entrypoint writes it).
+      - AWS_CA_BUNDLE=/usr/local/share/ca-certificates/coatcheck-ca.crt
+      - AWS_REGION=${REGION:?run via ./run.sh}
+      - AWS_S3_US_EAST_1_REGIONAL_ENDPOINT=regional
+      - AWS_STS_REGIONAL_ENDPOINTS=regional
+      - AWS_EC2_METADATA_DISABLED=true
+      - REPORTS_BUCKET=${BUCKET:?run via ./run.sh}
+      - VERCEL_PROJECT=${VERCEL_PROJECT:?set VERCEL_PROJECT}
+      - VERCEL_TEAM_ID=${VERCEL_TEAM_ID:-}
+      - AGENT_MAX_TURNS=${AGENT_MAX_TURNS:-30}
+      - AGENT_TRANSCRIPT=/out/transcript.json
+    volumes:
+      - ./${TASK:-task.md}:/task.md:ro
+      - ./out:/out
+    networks: [agentnet]
+
+networks:
+  agentnet: { internal: true }
+  egress: {}
