@@ -1,12 +1,12 @@
 import 'reflect-metadata';
 import * as x509 from '@peculiar/x509';
-import { createPrivateKey, randomBytes, webcrypto } from 'node:crypto';
+import { createPrivateKey, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { isValidHostname } from './connect-target.js';
 
-x509.cryptoProvider.set(webcrypto as unknown as Crypto);
+x509.cryptoProvider.set(crypto);
 
 const KEY_ALGORITHM = { name: 'ECDSA', namedCurve: 'P-256' } as const;
 const SIGNING_ALGORITHM = { name: 'ECDSA', hash: 'SHA-256' } as const;
@@ -67,7 +67,7 @@ export class CertAuthority {
     }
 
     const { key, cert } = await generateCa(subject);
-    const pkcs8 = await webcrypto.subtle.exportKey('pkcs8', key);
+    const pkcs8 = await crypto.subtle.exportKey('pkcs8', key);
     fs.writeFileSync(keyPath, x509.PemConverter.encode(pkcs8, 'PRIVATE KEY'), { mode: 0o600 });
     fs.writeFileSync(certPath, cert.toString('pem'));
     console.log('Generated new CA certificate');
@@ -111,7 +111,7 @@ export class CertAuthority {
   }
 
   private async mintLeaf(hostname: string): Promise<HostCert> {
-    const keys = await webcrypto.subtle.generateKey(KEY_ALGORITHM, true, ['sign', 'verify']) as CryptoKeyPair;
+    const keys = await crypto.subtle.generateKey(KEY_ALGORITHM, true, ['sign', 'verify']) as CryptoKeyPair;
     const now = Date.now();
     const notAfter = Math.min(now + LEAF_VALIDITY_DAYS * DAY_MS, this.caCert.notAfter.getTime());
     const isIp = net.isIP(hostname) !== 0;
@@ -135,7 +135,7 @@ export class CertAuthority {
       ],
     });
 
-    const pkcs8 = await webcrypto.subtle.exportKey('pkcs8', keys.privateKey);
+    const pkcs8 = await crypto.subtle.exportKey('pkcs8', keys.privateKey);
     return {
       key: x509.PemConverter.encode(pkcs8, 'PRIVATE KEY'),
       cert: cert.toString('pem'),
@@ -144,7 +144,7 @@ export class CertAuthority {
 }
 
 async function generateCa(subject: string): Promise<{ key: CryptoKey; cert: x509.X509Certificate }> {
-  const keys = await webcrypto.subtle.generateKey(KEY_ALGORITHM, true, ['sign', 'verify']) as CryptoKeyPair;
+  const keys = await crypto.subtle.generateKey(KEY_ALGORITHM, true, ['sign', 'verify']) as CryptoKeyPair;
   const now = Date.now();
   const cert = await x509.X509CertificateGenerator.createSelfSigned({
     serialNumber: serialNumber(),
@@ -178,7 +178,7 @@ async function importCaKey(pem: string, keyPath: string): Promise<CryptoKey> {
     );
   }
   const der = createPrivateKey(pem).export({ type: 'pkcs8', format: 'der' });
-  return webcrypto.subtle.importKey('pkcs8', der, KEY_ALGORITHM, false, ['sign']);
+  return crypto.subtle.importKey('pkcs8', der, KEY_ALGORITHM, false, ['sign']);
 }
 
 /** Random positive 128-bit serial number (hex). */
