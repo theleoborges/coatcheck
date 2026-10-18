@@ -352,6 +352,11 @@ describe('coatcheck server: CONNECT', () => {
       ['gzip-encoded JSON', frame('Content-Type: application/json\r\nContent-Encoding: gzip\r\n', gzipSync(ext))],
       ['malformed JSON', frame('Content-Type: application/json\r\n', "{projectId: 'p', extensionId: 'ext-1'}")],
       ['JSON padded past COATCHECK_MAX_SWAP_BODY_BYTES', frame('Content-Type: application/json\r\n', JSON.stringify({ pad: 'x'.repeat(2000), extensionId: 'ext-1' }))],
+      // Declared past the cap: refused from the head, before any body arrives.
+      ['Content-Length past COATCHECK_MAX_SWAP_BODY_BYTES', Buffer.from('POST /v1/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 5000000\r\n\r\n')],
+      // The multipart exemption keys on Content-Type; a repeated field lets an
+      // upstream that honours the last one read the body as JSON.
+      ['JSON behind a repeated Content-Type (multipart first)', frame('Content-Type: multipart/form-data; boundary=b\r\nContent-Type: application/json\r\n', ext)],
     ])('%s is refused with 403 uninspectable-body and never forwarded', async (_name, request) => {
       const upstream = await startHttpsUpstream(JSON.stringify({ id: 's1' }));
       const { port } = await startProxy({ ...cdp, maxSwapBodyBytes: 1024 });
@@ -365,6 +370,29 @@ describe('coatcheck server: CONNECT', () => {
       expect(JSON.parse(res.body)).toMatchObject({ reason: 'uninspectable-body', host: '127.0.0.1' });
       await closed;
       expect(upstream.received).toEqual([]);
+    });
+
+    it('forwards an empty chunked body: nothing to inspect', async () => {
+      const upstream = await startHttpsUpstream(JSON.stringify({ ok: true }));
+      const { port } = await startProxy(cdp);
+      const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+      const t = await startTls(socket, proxyCa.caCertPem);
+      t.write('POST /v1/sessions/s1/stop HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n');
+      const [res] = await readResponses(t, 1);
+      expect(res.head).toMatch(/^HTTP\/1\.1 200 /);
+      expect(upstream.received[0].url).toBe('/v1/sessions/s1/stop');
+      expect(upstream.received[0].body).toBe('');
+    });
+
+    it('inspects a JSON body sent with Content-Encoding: identity', async () => {
+      const upstream = await startHttpsUpstream(JSON.stringify({ id: 's1' }));
+      const { port } = await startProxy(cdp);
+      const { socket } = await connect(port, `127.0.0.1:${upstream.port}`);
+      const t = await startTls(socket, proxyCa.caCertPem);
+      t.write(frame('Content-Type: application/json\r\nContent-Encoding: identity\r\n', ext));
+      const [res] = await readResponses(t, 1);
+      expect(res.head).toMatch(/^HTTP\/1\.1 200 /);
+      expect(JSON.parse(upstream.received[0].body ?? '')).toEqual({ projectId: 'p' });
     });
 
     it('forwards a multipart upload unchanged: no JSON config to inspect', async () => {

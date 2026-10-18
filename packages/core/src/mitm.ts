@@ -52,6 +52,9 @@ function isMultipartContentType(ct: string | undefined): boolean {
   return ct !== undefined && /^multipart\/form-data\s*(;|$)/i.test(ct.trim());
 }
 
+/** A `Content-Type` field line (RFC 9112 §5: name, optional whitespace, colon). */
+const CONTENT_TYPE_LINE = /^content-type[ \t]*:/i;
+
 /** The body of the request being read, after its head. */
 type BodyState =
   /** Forwarded as it arrives. */
@@ -205,6 +208,10 @@ export function createConnectHandler(deps: MitmDeps) {
     // The binding key is the validated CONNECT target (upstream TLS proves it
     // is the recipient), never Host or SNI.
     const swapTarget = { host: hostname, scheme: 'https' as const };
+    // Browser-adapter request-body rewrite for this tunnel's host (CDP on):
+    // fixed per CONNECT, so resolved once rather than per keep-alive request.
+    const reqAdapter = adapterFor(hostname);
+    const adapterReq = reqAdapter?.rewriteRequestJson?.bind(reqAdapter);
 
     /**
      * Process buffered client data request by request (HTTP keep-alive: every
@@ -259,8 +266,13 @@ export function createConnectHandler(deps: MitmDeps) {
         // its Content-Type: one it can't inspect is refused in sendBuffered,
         // never streamed (a JSON config under another content type, encoded,
         // or padded past the cap would otherwise carry the params through).
-        const reqAdapter = cdp ? adapterFor(hostname) : undefined;
-        const adapterReq = reqAdapter?.rewriteRequestJson?.bind(reqAdapter);
+        // A declared length past the cap is known uninspectable from the head,
+        // so it is refused here rather than after holding a cap's worth of it.
+        if (adapterReq && framing.kind === 'length' && framing.length > maxSwapBodyBytes) {
+          logSwapOutcome('https', hostname, swapped, swapped.output);
+          denyUninspectable(`larger than ${maxSwapBodyBytes} bytes`);
+          return;
+        }
         if (hasBody && (tokenStore.hasLiveBodyTicketFor(swapTarget) || adapterReq)) {
           body = { mode: 'buffer', remaining, decoder, head, headOutcome: swapped, raw: [], rawBytes: 0, data: [], adapterReq };
           continue;
@@ -318,6 +330,7 @@ export function createConnectHandler(deps: MitmDeps) {
         if (state.rawBytes > maxSwapBodyBytes) {
           if (state.adapterReq) {
             // An adapter-host body past the cap can't be inspected: refuse it.
+            logSwapOutcome('https', hostname, state.headOutcome, state.headOutcome.output);
             denyUninspectable(`larger than ${maxSwapBodyBytes} bytes`);
             return true;
           }
@@ -370,9 +383,19 @@ export function createConnectHandler(deps: MitmDeps) {
       // Browser-adapter request rewrite: strip extension params from the JSON.
       // Fail closed: a body the adapter can't read as JSON is refused, whatever
       // its Content-Type says, except a multipart upload (never a session config).
-      if (state.adapterReq && effective !== null) {
-        if (state.head.header('content-encoding') !== undefined) {
+      // An empty body carries no parameters and is forwarded as it is.
+      if (state.adapterReq && effective !== null && effective.length > 0) {
+        // `identity` is no encoding (as body-swap.ts reads it); anything else is.
+        const encoding = state.head.header('content-encoding')?.trim().toLowerCase();
+        if (encoding !== undefined && encoding !== 'identity') {
           denyUninspectable('content-encoded');
+          return;
+        }
+        // The multipart exemption keys on Content-Type, so the upstream must
+        // read the same one: with the field repeated, servers differ on which
+        // (first, last, joined) they honour, and the body is refused instead.
+        if (state.head.fieldLines.filter(l => CONTENT_TYPE_LINE.test(l)).length > 1) {
+          denyUninspectable('repeated Content-Type');
           return;
         }
         if (!isMultipartContentType(state.head.header('content-type'))) {
