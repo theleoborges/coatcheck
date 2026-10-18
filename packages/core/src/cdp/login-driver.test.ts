@@ -211,6 +211,18 @@ describe('login driver', () => {
     expect(result).toEqual({ status: 404, reason: 'selector-not-found', field: 'password' });
   });
 
+  it('fills nothing when a later field selector matches nothing (password must not stay in the page)', async () => {
+    // Attack: list the password first and point a later field at nothing, so a
+    // fill-as-you-go driver would leave the real password in the DOM for agent
+    // script to read once its frames are released.
+    const { conn } = await connect();
+    browser.opts.selectors.set('#missing', 0);
+    const result = await conn.login(baseReq({ fields: { password: '#pass', username: '#missing' } }));
+    expect(result).toEqual({ status: 404, reason: 'selector-not-found', field: 'username' });
+    expect(browser.filledText).toEqual([]);
+    expect(browser.received.some(f => f.method === 'Input.insertText')).toBe(false);
+  });
+
   it('returns 409 interception-active when request interception is on', async () => {
     const { conn } = await connect();
     client.send(JSON.stringify({ id: 500, sessionId: 'P1', method: 'Fetch.enable', params: { patterns: [{ urlPattern: '*' }] } }));

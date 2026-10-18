@@ -61,12 +61,18 @@ export async function runLogin(conn: CdpConnection, req: LoginRequest): Promise<
     if (afterReload) { outcome = 'denied'; return afterReload; }
 
     // --- Fill ---
+    // Resolve every field before typing any value, so a refusal (missing
+    // value, unmatched selector) leaves no real value in the page.
     const rootNodeId = await documentNodeId(conn, page);
+    const targets: { selector: string; nodeId: number; value: string }[] = [];
     for (const [field, selector] of Object.entries(req.fields)) {
       const value = req.values[field];
       if (typeof value !== 'string') return { status: 501 };
       const nodeId = await querySelector(conn, page, rootNodeId, selector);
       if (nodeId === 0) { outcome = 'selector-not-found'; return { status: 404, reason: 'selector-not-found', field }; }
+      targets.push({ selector, nodeId, value });
+    }
+    for (const { selector, nodeId, value } of targets) {
       await conn.sendCommand('DOM.focus', { nodeId }, page);
       await clearNode(conn, page, nodeId);
       await conn.sendCommand('Input.insertText', { text: value }, page);
