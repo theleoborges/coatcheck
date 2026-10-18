@@ -29,6 +29,10 @@ describe('parseHmacRecipe', () => {
     ['key_header host', { ...LEDGER, key_header: 'Host' }],
     ['missing signature_header', { ...LEDGER, signature_header: undefined }],
     ['signature_header host', { ...LEDGER, signature_header: 'host' }],
+    ['signature_header Content-Length (would reframe the request)', { ...LEDGER, signature_header: 'Content-Length' }],
+    ['signature_header transfer-encoding', { ...LEDGER, signature_header: 'transfer-encoding' }],
+    ['key_header connection', { ...LEDGER, key_header: 'Connection' }],
+    ['key_header proxy-authorization', { ...LEDGER, key_header: 'Proxy-Authorization' }],
     ['same header twice', { ...LEDGER, signature_header: 'x-ledger-key' }],
     ['bad encoding', { ...LEDGER, encoding: 'base32' }],
     ['bad key_encoding', { ...LEDGER, key_encoding: 'latin1', verify: false }],
@@ -105,6 +109,9 @@ describe('decodeHmacKey', () => {
     expect(decodeHmacKey('AP8Q', 'base64')).toEqual(Buffer.from([0, 255, 16]));
     expect(decodeHmacKey('AP8Q==', 'base64')).toEqual(Buffer.from([0, 255, 16]));
     expect(decodeHmacKey('not base64!', 'base64')).toBeNull();
+    // A dangling character (Node would drop it silently) is refused, not a shortened key.
+    expect(decodeHmacKey('AP8QA', 'base64')).toBeNull();
+    expect(decodeHmacKey('AP8QA=', 'base64')).toBeNull();
   });
 });
 
@@ -145,6 +152,15 @@ describe('finalizeHmac', () => {
     expect(finalizeHmac(TICKET, cred, { request: unsigned }, { request: unsigned })).toEqual({ ok: false, reason: 'signature-mismatch' });
     const twice: SignableRequest = { ...req, headers: [...req.headers, req.headers[req.headers.length - 1]] };
     expect(finalizeHmac(TICKET, cred, { request: twice }, { request: twice })).toEqual({ ok: false, reason: 'signature-mismatch' });
+  });
+
+  it('accepts an upper-case hex signature (hex is case-insensitive)', () => {
+    const r = recipe({ encoding: 'hex' });
+    const req = base(r);
+    const sig = hmacSignature(r, TICKET, hmacMessage(r, { request: req })).toUpperCase();
+    const signedReq: SignableRequest = { ...req, headers: [...req.headers, [r.written.signatureHeader, ` ${sig}`]] };
+    const cred: HmacCredential = { scheme: 'hmac', recipe: r, key, keyId: 'k' };
+    expect(finalizeHmac(TICKET, cred, { request: signedReq }, { request: signedReq }).ok).toBe(true);
   });
 
   it('with verify: false signs without checking (non-utf8 key)', () => {

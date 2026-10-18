@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { rawHeaderValues, type SignableRequest, type SigningView } from './request.js';
+import { headerValues, type SignableRequest, type SigningView } from './request.js';
 import type { FinalizeResult } from './sigv4.js';
 
 /**
@@ -42,6 +42,12 @@ const HASHES: readonly HmacHash[] = ['sha256', 'sha384', 'sha512', 'sha1'];
 // RFC 9110 §5.6.2 token.
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const SIMPLE_PARTS = ['method', 'path', 'query', 'path_query', 'body'] as const;
+// Headers that frame the message or the connection: a recipe writing or
+// removing one would change how the upstream reads the request.
+const RESERVED_HEADERS = new Set([
+  'host', 'content-length', 'transfer-encoding', 'connection', 'keep-alive', 'te', 'trailer', 'upgrade',
+  'proxy-authenticate', 'proxy-authorization', 'proxy-connection',
+]);
 
 /** Parse and validate a recipe (strict schema). Returns an error message when invalid. */
 export function parseHmacRecipe(v: unknown): HmacRecipe | string {
@@ -56,7 +62,7 @@ export function parseHmacRecipe(v: unknown): HmacRecipe | string {
   const header = (key: string): string | { error: string } => {
     const h = r[key];
     if (typeof h !== 'string' || !HEADER_NAME.test(h)) return { error: `${key} must be a header name` };
-    if (h.toLowerCase() === 'host') return { error: `${key} can't be "host"` };
+    if (RESERVED_HEADERS.has(h.toLowerCase())) return { error: `${key} can't be "${h.toLowerCase()}" (a framing or hop-by-hop header)` };
     return h;
   };
   const keyHeader = header('key_header');
@@ -113,7 +119,9 @@ export function decodeHmacKey(secret: string, encoding: HmacRecipe['keyEncoding'
   if (encoding === 'utf8') return Buffer.from(secret, 'utf8');
   if (encoding === 'hex') return /^(?:[0-9a-fA-F]{2})+$/.test(secret) ? Buffer.from(secret, 'hex') : null;
   // Standard or URL-safe alphabet, padding optional; anything else isn't a key.
+  // Node drops a dangling sextet silently, so a truncated key is refused instead.
   if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(secret)) return null;
+  if (secret.replace(/=+$/, '').length % 4 === 1) return null;
   const b = Buffer.from(secret, 'base64');
   return b.length > 0 ? b : null;
 }
@@ -134,7 +142,7 @@ export function hmacMessage(recipe: HmacRecipe, view: SigningView): Buffer {
       case 'query': return Buffer.from(q === -1 ? '' : req.target.slice(q + 1), 'utf8');
       case 'path_query': return Buffer.from(req.target, 'utf8');
       case 'body': return view.body ?? Buffer.alloc(0);
-      case 'header': return Buffer.from(rawHeaderValues(req, part.name).map(v => v.replace(/^[ \t]+|[ \t]+$/g, '')).join(','), 'latin1');
+      case 'header': return Buffer.from(headerValues(req, part.name).join(','), 'latin1');
       case 'literal': return Buffer.from(part.text, 'utf8');
     }
   });
@@ -156,19 +164,21 @@ export function hmacSignature(recipe: HmacRecipe, key: Buffer | string, message:
 export function finalizeHmac(ticketId: string, credential: HmacCredential, received: SigningView, outgoing: SigningView): FinalizeResult {
   const { recipe } = credential;
   if (recipe.verify) {
-    const sent = rawHeaderValues(received.request, recipe.signatureHeader).map(v => v.trim());
+    const sent = headerValues(received.request, recipe.signatureHeader);
     const expected = hmacSignature(recipe, ticketId, hmacMessage(recipe, received));
-    if (sent.length !== 1 || !equal(sent[0], expected)) return { ok: false, reason: 'signature-mismatch' };
+    // Hex is case-insensitive (some clients send upper case); base64 is not.
+    const ours = recipe.encoding === 'hex' ? sent.map(v => v.toLowerCase()) : sent;
+    if (ours.length !== 1 || !equal(ours[0], expected)) return { ok: false, reason: 'signature-mismatch' };
   }
 
   const headers: Array<[string, string]> = [];
-  let keyAt = -1;
+  let keySeen = false;
   for (const [name, value] of outgoing.request.headers) {
     const lower = name.toLowerCase();
     if (lower === recipe.signatureHeader) continue;
     if (lower === recipe.keyHeader) {
-      if (keyAt !== -1 || credential.keyId === undefined) continue;
-      keyAt = headers.length;
+      if (keySeen || credential.keyId === undefined) continue;
+      keySeen = true;
       headers.push([name, ` ${credential.keyId}`]);
       continue;
     }

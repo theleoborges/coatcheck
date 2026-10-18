@@ -67,11 +67,12 @@ export function planSigning(store: TokenStore, req: SignableRequest, target: Mat
     if (name.toLowerCase() !== carrier) continue;
     const info = infoOf(ticket);
     if (ticket.allowedHosts && !matchesHost(ticket.allowedHosts, target)) return { kind: 'denied', denied: [info] };
-    const repeated = headerValues(req, carrier).length > 1;
+    const carried = headerValues(req, carrier);
+    const repeated = carried.length > 1;
 
     if (credential.scheme === 'hmac') {
       const { recipe } = credential;
-      if (repeated || value.trim() !== ticketId) return { kind: 'unsignable', reason: 'malformed-key-header', info };
+      if (repeated || carried[0] !== ticketId) return { kind: 'unsignable', reason: 'malformed-key-header', info };
       return {
         kind: 'plan',
         scheme: 'hmac',
