@@ -29,4 +29,11 @@ The package layout and the role of each file are in the [README](README.md#devel
 
 ## Releases
 
-Maintainers: bump the version in all three `packages/*/package.json`, merge, tag `vX.Y.Z`, push the tag. [`release.yml`](.github/workflows/release.yml) publishes to npm with provenance. Release notes live on GitHub Releases.
+Maintainers:
+
+1. `npm version X.Y.Z --workspaces --no-git-tag-version` (all three packages move together), open a PR, merge.
+2. `git tag vX.Y.Z && git push origin vX.Y.Z`. [`release.yml`](.github/workflows/release.yml) runs the checks and **stages** each package on npm with provenance, via a stage-only trusted publisher. Nothing is live yet.
+3. Review and approve each staged version with 2FA, core first (the providers peer-depend on it): `npx npm@latest stage list`, then `npx npm@latest stage approve <id>` — or the Staged Packages tab on npmjs.com.
+4. Publish the release notes on GitHub Releases.
+
+Tokens can't publish `@coatcheck/*` (publishing access is "require 2FA and disallow tokens"); a release always ends with a maintainer's approval.

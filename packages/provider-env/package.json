@@ -1,6 +1,6 @@
 {
   "name": "@coatcheck/provider-env",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "coatcheck secret providers with no cloud dependency: environment variables (`.`) and a JSON file (`./file`).",
   "license": "Apache-2.0",
   "repository": {
