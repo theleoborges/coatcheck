@@ -317,7 +317,7 @@ export function createConnectHandler(deps: MitmDeps) {
         let outHead = swapped.output;
         if (signing) {
           const empty = signing.needsBody ? Buffer.alloc(0) : undefined;
-          const signed = signHead(head, outHead, signing, empty, empty);
+          const signed = signHead(outHead, signing, empty, empty);
           if (signed === null) return;
           outHead = signed;
         }
@@ -415,7 +415,7 @@ export function createConnectHandler(deps: MitmDeps) {
           // (a signature that doesn't cover the body is still applied).
           let outHead = state.headOutcome.output;
           if (state.signing) {
-            const signed = signHead(state.head, outHead, state.signing);
+            const signed = signHead(outHead, state.signing);
             if (signed === null) return true;
             outHead = signed;
           }
@@ -518,7 +518,7 @@ export function createConnectHandler(deps: MitmDeps) {
       // Signed last, over the head that leaves (Content-Length included: some
       // SDKs sign it) and the body after any swap.
       if (state.signing) {
-        const signed = signHead(state.head, head, state.signing, decoded, effective ?? decoded);
+        const signed = signHead(head, state.signing, decoded, effective ?? decoded);
         if (signed === null) return;
         head = signed;
         logSwapOutcome('https', hostname, { ...combined, ...signedOutcome(state.signing) }, `${head}\n${outcome.basicText}${bodyText}`);
@@ -531,11 +531,11 @@ export function createConnectHandler(deps: MitmDeps) {
      * `outHead` (the head after swaps). Returns the signed head, or null
      * after refusing the request (`403 signature-mismatch`).
      */
-    function signHead(received: RequestHead, outHead: string, plan: SigningPlan, receivedBody?: Buffer, outgoingBody?: Buffer): string | null {
+    function signHead(outHead: string, plan: SigningPlan, receivedBody?: Buffer, outgoingBody?: Buffer): string | null {
       // Swapped values can't hold CR/LF, so the head splits back into its lines.
       const [requestLine, ...fieldLines] = outHead.split('\r\n');
       const result = plan.finalize(
-        { request: signableFromRequestHead(received), body: receivedBody },
+        { request: plan.received, body: receivedBody },
         { request: signableFromHead(requestLine, fieldLines), body: outgoingBody },
       );
       if (!result.ok) {

@@ -448,6 +448,21 @@ describe('Vault Handler', () => {
       const refused = await postJSON(port, '/_vault/other-login/login', body);
       expect(refused.status).toBe(403);
     });
+
+    it('refuses to fill a signing secret\'s key field into a page (400, never reaches the driver)', async () => {
+      const policy = parsePolicy(JSON.stringify({
+        secrets: { 'aws-console': { allowed_hosts: ['signin.aws.amazon.com'], signing: 'aws-sigv4' } },
+      }), []);
+      await setup({ 'aws-console': JSON.stringify({ access_key_id: 'AKIAREAL', secret_access_key: 'real-key', SecretAccessKey: 'real-key' }) }, {}, { policy });
+      let calls = 0;
+      cdpSessionStore.attach(sid, { login: async () => { calls++; return { status: 200, url: 'https://signin.aws.amazon.com/' }; } });
+      for (const field of ['secret_access_key', 'SecretAccessKey']) {
+        const res = await postJSON(port, '/_vault/aws-console/login', { sessionId: sid, fields: { access_key_id: '#u', [field]: '#p' }, submit: '#go', until: 'navigation' });
+        expect(res.status, field).toBe(400);
+        expect(res.body.error).toContain('signing key');
+      }
+      expect(calls).toBe(0);
+    });
   });
 
   // --- Shared secrets (/_secret/{name}) ---

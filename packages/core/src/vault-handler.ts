@@ -410,6 +410,12 @@ function handleLogin(
 
     const binding = bindingFor(deps, secretName, parsedSecret.inBand);
     if (!sendBindingError(res, binding)) return;
+    // A signing key is only ever used to re-sign, never typed into a page
+    // (the same refusal as `?field=` on it).
+    const keyField = binding.signing ? Object.keys(selectors).find(f => keyFields(binding.signing!).includes(f)) : undefined;
+    if (keyField !== undefined) {
+      return send(res, 400, { error: `Field '${keyField}' is the signing key of '${secretName}': it can't be filled into a page` });
+    }
 
     // Register the sensitive field values (not `_cleartext`) for inbound
     // redaction for the life of the window; dropped at session teardown.

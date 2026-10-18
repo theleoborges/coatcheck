@@ -16,6 +16,8 @@ export interface SigningPlan {
   kind: 'plan';
   scheme: SigningScheme;
   info: SwapInfo;
+  /** The request head as received, which the agent's signature is verified over. */
+  received: SignableRequest;
   /** The body must be buffered (and hashed); past the cap the request is refused. */
   needsBody: boolean;
   /** Header names (lowercase) the scheme writes; the literal head swap skips them. */
@@ -75,6 +77,7 @@ export function planSigning(store: TokenStore, req: SignableRequest, target: Mat
       kind: 'plan',
       scheme: credential.scheme,
       info,
+      received: req,
       needsBody: mode.kind === 'body',
       ownedHeaders: SIGV4_OWNED,
       finalize: (received, outgoing) => finalizeSigV4(auth, ticketId, credential, received, outgoing),
