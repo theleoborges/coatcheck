@@ -5,7 +5,8 @@ import type { CdpSessionStore, LoginRequest, LoginResult } from './cdp-session-s
 import { InvalidSecretNameError, isValidSecretName, type SecretProvider } from './secret-provider.js';
 import { policyRuleFor, type Policy } from './policy.js';
 import { matchesHost, type HostPattern } from './host-matcher.js';
-import { allowedHostsJson, parseSecretValue, resolveBinding, userFields, type Binding, type InBandMetadata, type Placement } from './secret-binding.js';
+import { allowedHostsJson, parseSecretValue, resolveBinding, userFields, type Binding, type InBandMetadata, type Placement, type SecretValue } from './secret-binding.js';
+import { keyFields, signingCredentialFrom, signingSpecJson } from './signing/spec.js';
 
 export interface VaultDeps {
   tokenStore: TokenStore;
@@ -86,6 +87,13 @@ export function handleVaultRequest(
       }
       const parsed = parseSecretValue(secret.value);
 
+      // A signing secret mints one credential ticket (docs/design/signing-processors.md §3).
+      const rule = policyRuleFor(deps.policy, secretName);
+      if (rule?.signing || ('signing' in parsed.inBand && parsed.inBand.signing)) {
+        mintSigning(res, deps, secretName, parsed, bindingFor(deps, secretName, parsed.inBand), field);
+        return;
+      }
+
       if (parsed.kind === 'multi') {
         // Multi-value secret
         // _cleartext lists fields that are safe to return as raw values (URLs, domains, IDs)
@@ -157,6 +165,10 @@ export function handleVaultRequest(
       const parsed = parseSecretValue(secret.value);
       const rule = deps.policy.shared.get(secretName);
       const binding = resolveBinding(secretName, rule?.allowedHosts, parsed.inBand, false, rule);
+      if (binding.ok && binding.signing) {
+        mintSigning(res, deps, `shared:${secretName}`, parsed, binding, null);
+        return;
+      }
       if (!sendBindingError(res, binding)) return;
       issueTicket(res, deps, `shared:${secretName}`, parsed.kind === 'simple' ? parsed.value : secret.value, binding);
     }).catch(err => {
@@ -219,6 +231,49 @@ function issueTicket(
     ...(swapUrl ? { swap_url: true } : {}),
     ...(swapHeaders.length > 0 ? { swap_headers: swapHeaders } : {}),
   }));
+}
+
+/**
+ * Mint for a signing secret: without `?field=`, one credential ticket (used
+ * as a key, re-signed on the wire, never swapped) and the public recipe.
+ * `?field=` on the key field is refused (a literal ticket would be a copy of
+ * the key); `_cleartext` fields return values, other fields get ordinary
+ * literal tickets with the secret's binding and placement. A secret missing
+ * its key fails with 500 whatever is asked, so no partial ticket is issued.
+ */
+function mintSigning(res: http.ServerResponse, deps: VaultDeps, label: string, parsed: SecretValue, binding: Binding, field: string | null): void {
+  if (!sendBindingError(res, binding)) return;
+  const spec = binding.signing!;
+  const fields = parsed.kind === 'multi' ? parsed.fields : null;
+  const credential = signingCredentialFrom(spec, fields);
+  if (typeof credential === 'string') {
+    console.warn(`[issue] secret=${label} result=refused (invalid ${spec.type} secret)`);
+    return send(res, 500, { error: `Secret '${label}' is not a valid ${spec.type} signing secret: ${credential}` });
+  }
+
+  if (field) {
+    if (keyFields(spec).includes(field)) {
+      return send(res, 400, { error: `Field '${field}' is the signing key: use the credential ticket (GET without ?field=)` });
+    }
+    const names = fields ? userFields(fields) : [];
+    if (!fields || !names.includes(field)) {
+      return send(res, 400, { error: `Field '${field}' not found. Available: ${names.join(', ')}` });
+    }
+    const cleartext: unknown[] = Array.isArray(fields._cleartext) ? fields._cleartext : [];
+    if (cleartext.includes(field)) return send(res, 200, { value: fields[field], cleartext: true });
+    issueTicket(res, deps, `${label}:${field}`, String(fields[field]), binding);
+    return;
+  }
+
+  const { allowedHosts } = binding;
+  const token = deps.tokenStore.issue(label, '', { allowedHosts, signing: credential });
+  console.log(`[issue] secret=${label} ttl_s=${token.ttlSeconds}${allowedHosts ? '' : ' unbound=1'} signing=${spec.type}`);
+  send(res, 200, {
+    token: token.id,
+    expires_in: token.ttlSeconds,
+    allowed_hosts: allowedHostsJson(allowedHosts),
+    signing: signingSpecJson(spec),
+  });
 }
 
 /** A per-agent secret's binding: its policy rule intersected with its in-band hosts. */

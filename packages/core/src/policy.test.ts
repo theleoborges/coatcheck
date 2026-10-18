@@ -132,3 +132,24 @@ describe('policyHostsFor', () => {
     expect(hosts('slack')).toBeUndefined();
   });
 });
+
+describe('parsePolicy: signing', () => {
+  it('parses signing on secrets and shared entries', () => {
+    const problems: string[] = [];
+    const p = parsePolicy(JSON.stringify({
+      secrets: { 'aws-reports': { allowed_hosts: ['bucket.s3.us-east-1.amazonaws.com'], signing: 'aws-sigv4' } },
+      shared: { 'aws-shared': { allowed_hosts: ['sts.us-east-1.amazonaws.com'], signing: 'aws-sigv4' } },
+    }), problems);
+    expect(problems).toEqual([]);
+    expect(p.secrets[0].signing).toEqual({ type: 'aws-sigv4' });
+    expect(p.shared.get('aws-shared')?.signing).toEqual({ type: 'aws-sigv4' });
+  });
+
+  it('fails startup on an invalid signing value', () => {
+    for (const signing of ['sigv4', true, {}, { type: 'aws-sigv4' }]) {
+      const problems: string[] = [];
+      parsePolicy(JSON.stringify({ secrets: { x: { allowed_hosts: ['a.example'], signing } } }), problems);
+      expect(problems, JSON.stringify(signing)).toEqual([expect.stringContaining('secrets["x"].signing')]);
+    }
+  });
+});

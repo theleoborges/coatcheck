@@ -342,3 +342,59 @@ describe('TokenStore', () => {
     });
   });
 });
+
+describe('TokenStore: signing tickets', () => {
+  let store: TokenStore;
+  afterEach(() => store?.destroy());
+  const credential = { scheme: 'aws-sigv4' as const, accessKeyId: 'AKIAREAL', secretAccessKey: 'real-secret-key' };
+  const target = { host: 'bucket.s3.us-east-1.amazonaws.com', scheme: 'https' as const };
+
+  it('never substitutes a signing ticket as a literal: signing-skipped in a head, in a body, with every placement on', () => {
+    store = new TokenStore();
+    const { id } = store.issue('aws', '', { allowedHosts: hosts('bucket.s3.us-east-1.amazonaws.com'), signing: credential, swapBody: true, swapUrl: true, swapHeaders: ['x-key'] });
+    for (const location of [AUTH, { kind: 'url' } as const, { kind: 'header', name: 'X-Key' } as const]) {
+      const r = store.replaceAll(`Bearer ${id}`, target, location);
+      expect(r.output).toBe(`Bearer ${id}`);
+      expect(r.swaps).toEqual([]);
+      expect(r.skipped).toEqual([expect.objectContaining({ secretName: 'aws', where: 'signing' })]);
+    }
+    const body = store.replaceAllInBody(`{"k":"${id}"}`, target, v => v);
+    expect(body.output).toBe(`{"k":"${id}"}`);
+    expect(body.skipped).toEqual([expect.objectContaining({ secretName: 'aws', where: 'signing' })]);
+    expect(store.resolve(id)).toBeNull();
+    expect(JSON.stringify([body, store.signingTicket(id)?.secretName])).not.toContain('real-secret-key');
+  });
+
+  it('still denies a signing ticket met as a literal for another host', () => {
+    store = new TokenStore();
+    const { id } = store.issue('aws', '', { allowedHosts: hosts('bucket.s3.us-east-1.amazonaws.com'), signing: credential });
+    const r = store.replaceAll(`Bearer ${id}`, { host: 'attacker.example', scheme: 'https' }, AUTH);
+    expect(r.denied).toEqual([expect.objectContaining({ secretName: 'aws' })]);
+  });
+
+  it('counts for hasLiveTicketFor (the MITM decision) but never makes a body buffered', () => {
+    store = new TokenStore();
+    store.issue('aws', '', { allowedHosts: hosts('bucket.s3.us-east-1.amazonaws.com'), signing: credential, swapBody: true });
+    expect(store.hasLiveTicketFor(target)).toBe(true);
+    expect(store.hasLiveTicketFor({ host: 'other.example', scheme: 'https' })).toBe(false);
+    expect(store.hasLiveBodyTicketFor(target)).toBe(false);
+  });
+
+  it('looks up a live signing ticket by id, and only a signing ticket', () => {
+    store = new TokenStore();
+    const { id } = store.issue('aws', '', { allowedHosts: hosts('bucket.s3.us-east-1.amazonaws.com'), signing: credential });
+    const literal = store.issue('github', 'ghp_x').id;
+    expect(store.signingTicket(id)).toEqual(expect.objectContaining({ secretName: 'aws', credential }));
+    expect(store.signingTicket(literal)).toBeNull();
+    expect(store.signingTicket(`${TICKET_PREFIX}${'0'.repeat(64)}`)).toBeNull();
+  });
+
+  it('expires like any ticket', () => {
+    store = new TokenStore();
+    const { id } = store.issue('aws', '', { ttlSeconds: 0, allowedHosts: hosts('bucket.s3.us-east-1.amazonaws.com'), signing: credential });
+    const later = Date.now() + 5;
+    while (Date.now() < later) { /* let the 0 s TTL pass */ }
+    expect(store.signingTicket(id)).toBeNull();
+    expect(store.hasLiveTicketFor(target)).toBe(false);
+  });
+});

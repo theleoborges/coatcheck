@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { matchesHost, type HostPattern, type MatchTarget } from './host-matcher.js';
 import { DEFAULT_SWAP_HEADERS } from './secret-binding.js';
+import type { SigningCredential } from './signing/types.js';
 
 /**
  * Prefix of every ticket id ("coatcheck ticket"). Distinctive so tickets are
@@ -33,6 +34,8 @@ interface TokenEntry {
   swapUrl: boolean;
   /** Header names (lowercase) whose values it is swapped in: the defaults plus opt-ins. */
   swapHeaders: ReadonlySet<string>;
+  /** Set for a signing ticket: the credential it re-signs with. Never literal-substituted. */
+  signing?: SigningCredential;
 }
 
 export interface IssueOptions {
@@ -46,6 +49,20 @@ export interface IssueOptions {
   swapUrl?: boolean;
   /** Header names to substitute in besides `Authorization` and `Proxy-Authorization`. */
   swapHeaders?: readonly string[];
+  /**
+   * Issue a signing ticket for this credential (design:
+   * docs/design/signing-processors.md §3). `realValue` should be empty: the
+   * ticket is never swapped as a literal, only used as a key and re-signed.
+   */
+  signing?: SigningCredential;
+}
+
+/** A live signing ticket found by id (`TokenStore.signingTicket`). */
+export interface SigningTicket {
+  secretName: string;
+  ageMs: number;
+  allowedHosts?: readonly HostPattern[];
+  credential: SigningCredential;
 }
 
 /**
@@ -72,7 +89,10 @@ export interface SwapInfo {
   ageMs: number;
   /** Set when the ticket carries no host binding (swapped for any host). */
   unbound?: true;
-  /** For a ticket skipped in a request head: where it sat (`url` or `header:<name>`). */
+  /**
+   * For a ticket skipped in a request head: where it sat (`url` or
+   * `header:<name>`); `signing` for a signing ticket met as a literal.
+   */
   where?: string;
 }
 
@@ -154,23 +174,42 @@ export class TokenStore {
       createdAt: now,
       expiresAt: now + ttlSeconds * 1000,
       allowedHosts: opts.allowedHosts,
-      swapBody: opts.swapBody ?? false,
+      // A signing ticket is never a literal, so it never needs a body buffered.
+      swapBody: opts.signing ? false : opts.swapBody ?? false,
       swapUrl: opts.swapUrl ?? false,
       swapHeaders: new Set([...DEFAULT_SWAP_HEADERS, ...(opts.swapHeaders ?? []).map(h => h.toLowerCase())]),
+      ...(opts.signing ? { signing: opts.signing } : {}),
     });
 
     return { id, ttlSeconds };
   }
 
-  /** Resolve a token to its real value, or null if expired/unknown */
+  /** Resolve a token to its real value, or null if expired/unknown (or a signing ticket, which has none). */
   resolve(tokenId: string): string | null {
+    const entry = this.live(tokenId);
+    return entry && !entry.signing ? entry.realValue : null;
+  }
+
+  /** A live signing ticket by id, or null (unknown, expired, or not a signing ticket). */
+  signingTicket(tokenId: string): SigningTicket | null {
+    const entry = this.live(tokenId);
+    if (!entry?.signing) return null;
+    return {
+      secretName: entry.secretName,
+      ageMs: Date.now() - entry.createdAt,
+      ...(entry.allowedHosts ? { allowedHosts: entry.allowedHosts } : {}),
+      credential: entry.signing,
+    };
+  }
+
+  private live(tokenId: string): TokenEntry | null {
     const entry = this.tokens.get(tokenId);
     if (!entry) return null;
     if (Date.now() > entry.expiresAt) {
       this.tokens.delete(tokenId);
       return null;
     }
-    return entry.realValue;
+    return entry;
   }
 
   /**
@@ -186,6 +225,8 @@ export class TokenStore {
    * `encode` adapts each real value to where it lands (percent-encoding in a
    * URL); when it returns null the value can't be represented there, nothing
    * is swapped, and the ticket is reported in `invalid`.
+   * A signing ticket is never substituted: it is reported in `skipped` with
+   * `where: 'signing'` (after the host check, which still denies).
    */
   replaceAll(input: string, target: MatchTarget, location: HeadLocation, encode: ValueEncoder = v => v): SwapResult {
     return this.replaceHttp(input, target, location, encode);
@@ -213,7 +254,7 @@ export class TokenStore {
     for (const [tokenId, entry] of this.ticketsIn(input, now)) {
       const info: SwapInfo = { secretName: entry.secretName, ageMs: now - entry.createdAt };
       if (body && !entry.swapBody) {
-        skipped.push(info);
+        skipped.push(entry.signing ? { ...info, where: 'signing' } : info);
         continue;
       }
       if (entry.allowedHosts === undefined) {
@@ -224,6 +265,10 @@ export class TokenStore {
       }
       if (!body && !swappedAt(entry, location)) {
         skipped.push({ ...info, where: location.kind === 'url' ? 'url' : `header:${location.name.toLowerCase()}` });
+        continue;
+      }
+      if (entry.signing) {
+        skipped.push({ ...info, where: 'signing' });
         continue;
       }
       const value = encode(entry.realValue);
@@ -242,8 +287,8 @@ export class TokenStore {
 
   /**
    * True when a live HTTP(S) ticket could be swapped for `target`: one bound to
-   * it, or any unbound ticket. Session-bound tickets don't count (they never
-   * swap on HTTP(S)). Drives the `COATCHECK_MITM=bound` decision.
+   * it, or any unbound ticket. Signing tickets count (they are re-signed on a
+   * MITM'd tunnel). Drives the `COATCHECK_MITM=bound` decision.
    */
   hasLiveTicketFor(target: MatchTarget): boolean {
     return this.hasLiveHttpTicket(target, false);

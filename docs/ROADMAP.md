@@ -11,8 +11,8 @@ Security fixes include a test that performs the attack and shows it is
 blocked. The decisions behind this list, and the alternatives that were
 rejected, are in `docs/design/v1-decisions.md`.
 
-Status: items 1–20 are done. What remains is item 21 and the "After 1.0"
-list, none of it scheduled yet.
+Status: items 1–20, 22 and 23 are done. What remains is item 21, items
+24–26 and the "After 1.0" list.
 
 ## Phase 1: shell injection (HIGH)
 
@@ -302,6 +302,27 @@ Done: the unused `http-proxy` dependency was removed during extraction.
     host's echo of the path, a parameter or a custom header. Example policies
     opt in `x-api-key` (Anthropic) and `X-BB-API-Key` (Browserbase).
 
+## Phase 8: signing processors
+
+Design and implementation plan: `docs/design/signing-processors.md`.
+
+23. **[Done]** **Signing framework + AWS SigV4** (design §3, §4, §6, §8). A
+    secret with `signing: "aws-sigv4"` (policy) or `_signing` (in-band) mints
+    one credential ticket; the agent's unmodified SDK signs with it as both
+    halves of the key. coatcheck checks the host binding, verifies the agent's
+    signature over the request it received, applies the ordinary swaps, and
+    re-signs with the real key (and session token) on the MITM and forward
+    paths. Signing tickets are never literal-substituted (`signing-skipped`);
+    a request whose body must be hashed is refused past
+    `COATCHECK_MAX_SWAP_BODY_BYTES` (`403 unsignable reason=body-too-large`),
+    never streamed; S3 uploads stream on their payload-hash header. SigV4a and
+    per-chunk signed streaming payloads get `403 unsignable`; presigned URLs
+    leave as literals. New `[swap]` outcomes `signed`, `signature-mismatch`,
+    `unsignable`, `signing-skipped`. Tests: the published SigV4 test-suite
+    vectors, a property check against `@smithy/signature-v4`, and the
+    integration cases in `signing.server.test.ts` (real `@aws-sdk/client-s3`
+    through the proxy).
+
 ## After 1.0
 
 - Single-use tickets, opt-in per secret.
@@ -314,6 +335,12 @@ Done: the unused `http-proxy` dependency was removed during extraction.
   on the forward path.
 - Providers for HashiCorp Vault and Vercel.
 - A ticket checksum suffix, so tickets can be registered with secret scanners.
+- Signing follow-ups (`docs/design/signing-processors.md` §9): SigV4
+  query-string re-signing (presigned URLs); streaming signed payloads
+  (`aws-chunked` per-chunk re-signing); SigV4a; HMAC signature in the query
+  (Binance); nested-hash recipes (Kraken); coatcheck-generated timestamps;
+  derived-credential flows (JWT bearer, client credentials, GitHub App) via the
+  `refresh` endpoint.
 
 ## Documented, not planned
 
