@@ -133,6 +133,7 @@ const UNSIGNABLE_HINTS: Record<string, string> = {
   'streaming-signed-payload': 'per-chunk signed payloads (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) are not re-signed; use UNSIGNED-PAYLOAD',
   'malformed-authorization': 'the Authorization header does not parse, or carries the ticket somewhere other than the access key id',
   'repeated-payload-hash': 'x-amz-content-sha256 is repeated',
+  'malformed-key-header': "the recipe's key header is repeated, or holds more than the ticket",
 };
 
 /** JSON body of the `403` sent when a signing request has a shape coatcheck doesn't re-sign. */

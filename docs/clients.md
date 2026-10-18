@@ -134,7 +134,7 @@ Fails silently (the upstream receives `cct_…` and returns 401/403):
 - **Traffic that bypasses the proxy** (section 4).
 - **A connection opened before any ticket existed** (section 5).
 
-### Signing tickets (AWS SigV4)
+### Signing tickets (AWS SigV4, HMAC)
 
 A mint response with `"signing": "aws-sigv4"` is a **signing ticket**: use it
 as both `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (or the SDK's
@@ -173,10 +173,33 @@ AWS_ACCESS_KEY_ID=$TOK AWS_SECRET_ACCESS_KEY=$TOK aws s3 cp report.md s3://repor
 
 | `[swap] result=` | Meaning |
 |---|---|
-| `signed signing=aws-sigv4 secrets=…` | Verified and re-signed; forwarded. |
+| `signed signing=aws-sigv4\|hmac secrets=…` | Verified and re-signed; forwarded. |
 | `signature-mismatch secrets=…` | `403`, not forwarded. |
 | `unsignable secrets=… reason=…` | `403`, not forwarded. |
 | `signing-skipped secrets=…` | The signing ticket was used as a literal; forwarded as is. |
+
+**HMAC.** A mint response with `"signing": {"type": "hmac", …}` carries the
+operator's recipe: `hash`, `encoding`, `key_header`, `signature_header` and
+`message`, the parts concatenated in order (`method` as sent, `path`, `query`
+without `?`, `path_query`, `body` bytes as sent, `header:<name>` trimmed with
+repeats joined by `,`, `literal:<text>`). The ticket is both the API key and
+the HMAC secret: send it as the whole value of `key_header` and sign the
+message with it as a UTF-8 key. With no SDK, a few lines of bash do:
+
+```bash
+TOK=$(curl -s "$COATCHECK_URL/_vault/ledger" | jq -r .token)
+TS=$(date +%s); PQ='/v1/accounts'
+SIG=$(printf '%s' "${TS}GET${PQ}" | openssl dgst -sha256 -hmac "$TOK" -binary | base64)
+curl -H "X-Ledger-Key: $TOK" -H "X-Ledger-Timestamp: $TS" -H "X-Ledger-Signature: $SIG" "https://ledger:8443$PQ"
+```
+
+coatcheck verifies that signature (unless the recipe says `"verify": false`),
+replaces `key_header` with the real `key_id` (or removes it when there is
+none), and overwrites `signature_header`. A key header that is repeated or
+holds more than the ticket is `403 unsignable reason=malformed-key-header`;
+`?field=secret` is `400`. A recipe that signs the key header sees the ticket
+on your side and the `key_id` upstream; you don't need to do anything about
+that. Timestamps and nonces are yours to set; replay windows are the API's.
 
 A 401/403 when using a ticket almost always means the swap did not happen.
 Debug the call path; the stored secret is usually fine. coatcheck logs

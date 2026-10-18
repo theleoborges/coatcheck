@@ -1,6 +1,7 @@
 import { matchesHost, type MatchTarget } from '../host-matcher.js';
 import { TICKET_PATTERN, type SigningTicket, type SwapInfo, type TokenStore } from '../token-store.js';
 import { headerValues, type SignableRequest, type SigningView } from './request.js';
+import { finalizeHmac } from './hmac.js';
 import { finalizeSigV4, parseSigV4Authorization, payloadMode, type FinalizeResult } from './sigv4.js';
 import type { SigningScheme } from './types.js';
 
@@ -48,34 +49,51 @@ function signingTicketIn(store: TokenStore, text: string): [string, SigningTicke
 }
 
 /**
- * Plan signing for a request head as received. `null`: no signing ticket is
- * used as a key (the request takes the ordinary swap path). `denied`: the
+ * Plan signing for a request head as received: a SigV4 ticket as the access
+ * key id in `Authorization`, an HMAC ticket as the whole value of its
+ * recipe's `key_header`. `null`: no signing ticket is used as a key (the request takes the ordinary swap path). `denied`: the
  * ticket is bound to other hosts (`403 host-mismatch`). `unsignable`: a shape
  * coatcheck doesn't re-sign (`403 unsignable`).
  */
 export function planSigning(store: TokenStore, req: SignableRequest, target: MatchTarget): PlanResult {
-  const authorizations = headerValues(req, 'authorization');
-  for (const value of authorizations) {
+  for (const [name, value] of req.headers) {
     const found = signingTicketIn(store, value);
     if (!found) continue;
     const [ticketId, ticket] = found;
+    const { credential } = ticket;
+    // Each scheme carries the ticket in one header; anywhere else it is a
+    // literal, left to the swap path (`signing-skipped`, or a host denial).
+    const carrier = credential.scheme === 'aws-sigv4' ? 'authorization' : credential.recipe.keyHeader;
+    if (name.toLowerCase() !== carrier) continue;
     const info = infoOf(ticket);
     if (ticket.allowedHosts && !matchesHost(ticket.allowedHosts, target)) return { kind: 'denied', denied: [info] };
+    const repeated = headerValues(req, carrier).length > 1;
+
+    if (credential.scheme === 'hmac') {
+      const { recipe } = credential;
+      if (repeated || value.trim() !== ticketId) return { kind: 'unsignable', reason: 'malformed-key-header', info };
+      return {
+        kind: 'plan',
+        scheme: 'hmac',
+        info,
+        received: req,
+        needsBody: recipe.message.some(p => p.kind === 'body'),
+        ownedHeaders: new Set([recipe.keyHeader, recipe.signatureHeader]),
+        finalize: (received, outgoing) => finalizeHmac(ticketId, credential, received, outgoing),
+      };
+    }
 
     const auth = parseSigV4Authorization(value);
-    // Another scheme (`Bearer cct_…`): the ticket is a literal, left to the swap path (`signing-skipped`).
+    // Another scheme (`Bearer cct_…`): a literal.
     if (auth === null) continue;
     if (typeof auth === 'string') return { kind: 'unsignable', reason: auth, info };
-    // The ticket sits somewhere other than the access key id.
-    if (auth.accessKeyId !== ticketId) return { kind: 'unsignable', reason: 'malformed-authorization', info };
-    if (authorizations.length > 1) return { kind: 'unsignable', reason: 'malformed-authorization', info };
+    // Repeated, or the ticket somewhere other than the access key id.
+    if (repeated || auth.accessKeyId !== ticketId) return { kind: 'unsignable', reason: 'malformed-authorization', info };
     const mode = payloadMode(req);
     if (mode.kind === 'unsignable') return { kind: 'unsignable', reason: mode.reason, info };
-
-    const credential = ticket.credential;
     return {
       kind: 'plan',
-      scheme: credential.scheme,
+      scheme: 'aws-sigv4',
       info,
       received: req,
       needsBody: mode.kind === 'body',

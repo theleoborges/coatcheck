@@ -558,6 +558,47 @@ describe('Vault Handler', () => {
       expect(tokenStore.size).toBe(0);
     });
 
+    const LEDGER_RECIPE = { type: 'hmac', hash: 'sha256', key_header: 'X-Ledger-Key', signature_header: 'X-Ledger-Signature', encoding: 'base64', message: ['header:X-Ledger-Timestamp', 'method', 'path_query', 'body'] };
+    const HMAC_POLICY = parsePolicy(JSON.stringify({ secrets: { ledger: { allowed_hosts: ['ledger'], signing: LEDGER_RECIPE }, 'plain-hmac': { allowed_hosts: ['ledger'], signing: { ...LEDGER_RECIPE, key_header: 'X-Coatcheck-Key' } } } }), []);
+
+    it('HMAC: mints one ticket and returns the public recipe, never the key or key_id', async () => {
+      await setup({ ledger: JSON.stringify({ key_id: 'auditor-7', secret: 'ledger-real-secret', passphrase: 'pp-real' }) }, {}, { policy: HMAC_POLICY });
+      const log = captureLog();
+      const { status, body } = await fetchJSON(port, '/_vault/ledger');
+      log.restore();
+      expect(status).toBe(200);
+      expect(body.signing).toEqual(LEDGER_RECIPE);
+      expect(JSON.stringify(body)).not.toMatch(/auditor-7|ledger-real-secret/);
+      const credential = tokenStore.signingTicket(body.token as string)?.credential;
+      expect(credential).toEqual(expect.objectContaining({ scheme: 'hmac', keyId: 'auditor-7', key: Buffer.from('ledger-real-secret') }));
+      expect(log.lines).toEqual(['[issue] secret=ledger ttl_s=900 signing=hmac']);
+    });
+
+    it('HMAC: ?field=secret is 400; ?field=passphrase is a normal literal ticket', async () => {
+      await setup({ ledger: JSON.stringify({ key_id: 'auditor-7', secret: 'ledger-real-secret', passphrase: 'pp-real' }) }, {}, { policy: HMAC_POLICY });
+      const key = await fetchJSON(port, '/_vault/ledger?field=secret');
+      expect(key.status).toBe(400);
+      expect(key.body.error).toContain('use the credential ticket');
+      const pp = await fetchJSON(port, '/_vault/ledger?field=passphrase');
+      expect(pp.status).toBe(200);
+      expect(tokenStore.resolve(pp.body.token as string)).toBe('pp-real');
+    });
+
+    it('HMAC: a simple secret is the key, with no key_id', async () => {
+      await setup({ 'plain-hmac': 'just-the-secret' }, {}, { policy: HMAC_POLICY });
+      const { status, body } = await fetchJSON(port, '/_vault/plain-hmac');
+      expect(status).toBe(200);
+      const credential = tokenStore.signingTicket(body.token as string)?.credential;
+      expect(credential).toEqual(expect.objectContaining({ scheme: 'hmac', key: Buffer.from('just-the-secret') }));
+      expect(credential).not.toHaveProperty('keyId');
+    });
+
+    it('HMAC: a multi-value secret without `secret` is 500, no ticket', async () => {
+      await setup({ ledger: JSON.stringify({ key_id: 'auditor-7', passphrase: 'pp' }) }, {}, { policy: HMAC_POLICY });
+      expect((await fetchJSON(port, '/_vault/ledger')).status).toBe(500);
+      expect(tokenStore.size).toBe(0);
+    });
+
     it('mints a signing ticket for an allowlisted shared secret', async () => {
       await setup({}, { 'aws-shared': snake }, { policy: SIGNING_POLICY });
       const { status, body } = await fetchJSON(port, '/_secret/aws-shared');

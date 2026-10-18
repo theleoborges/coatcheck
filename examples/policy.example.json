@@ -7,6 +7,17 @@
     "example-aws-reports": {
       "allowed_hosts": ["example-reports-bucket.s3.us-east-1.amazonaws.com", "sts.us-east-1.amazonaws.com"],
       "signing": "aws-sigv4"
+    },
+    "example-ledger": {
+      "allowed_hosts": ["ledger"],
+      "signing": {
+        "type": "hmac",
+        "hash": "sha256",
+        "key_header": "X-Ledger-Key",
+        "signature_header": "X-Ledger-Signature",
+        "encoding": "base64",
+        "message": ["header:X-Ledger-Timestamp", "method", "path_query", "body"]
+      }
     }
   },
   "shared": {

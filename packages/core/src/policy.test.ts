@@ -153,3 +153,30 @@ describe('parsePolicy: signing', () => {
     }
   });
 });
+
+describe('parsePolicy: HMAC recipes', () => {
+  const ledger = { type: 'hmac', hash: 'sha256', key_header: 'X-Ledger-Key', signature_header: 'X-Ledger-Signature', encoding: 'base64', message: ['header:X-Ledger-Timestamp', 'method', 'path_query', 'body'] };
+
+  it('parses the ledger recipe', () => {
+    const { policy, problems } = parse({ secrets: { ledger: { allowed_hosts: ['ledger'], signing: ledger } } });
+    expect(problems).toEqual([]);
+    expect(policy.secrets[0].signing).toEqual(expect.objectContaining({ type: 'hmac', keyHeader: 'x-ledger-key', encoding: 'base64' }));
+  });
+
+  it.each([
+    ['unknown key', { ...ledger, nonce: true }],
+    ['missing key_header', { ...ledger, key_header: undefined }],
+    ['key_header host', { ...ledger, key_header: 'host' }],
+    ['missing signature_header', { ...ledger, signature_header: undefined }],
+    ['bad hash', { ...ledger, hash: 'md5' }],
+    ['bad encoding', { ...ledger, encoding: 'hex64' }],
+    ['base64 key with verify', { ...ledger, key_encoding: 'base64' }],
+    ['empty message', { ...ledger, message: [] }],
+    ['bad part', { ...ledger, message: ['headers'] }],
+    ['verify not boolean', { ...ledger, verify: 1 }],
+    ['wrong type', { ...ledger, type: 'hmac-sha256' }],
+  ])('fails startup on a malformed recipe: %s', (_label, signing) => {
+    const { problems } = parse({ secrets: { ledger: { allowed_hosts: ['ledger'], signing: JSON.parse(JSON.stringify(signing)) } } });
+    expect(problems).toEqual([expect.stringContaining('secrets["ledger"].signing (hmac recipe)')]);
+  });
+});
