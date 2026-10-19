@@ -45,7 +45,10 @@ async function ticket(name: string): Promise<string> {
 /** Run one command in a fresh bash shell, in the container's /work directory. */
 function runBash(command: string): Promise<{ output: string; isError: boolean }> {
   return new Promise((resolve) => {
-    const child = spawn("bash", ["-lc", command], { cwd: "/work", env: process.env });
+    // Own process group, so a timeout kills everything the command started: a
+    // child that outlives bash (`grep -r /` blocked on a device file) would
+    // otherwise hold stdout open and `close` would never fire.
+    const child = spawn("bash", ["-lc", command], { cwd: "/work", env: process.env, detached: true });
     let output = "";
     const append = (chunk: Buffer) => {
       output += chunk.toString("utf8");
@@ -53,7 +56,11 @@ function runBash(command: string): Promise<{ output: string; isError: boolean }>
     child.stdout.on("data", append);
     child.stderr.on("data", append);
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      try {
+        process.kill(-child.pid!, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
       output += `\n[killed after ${COMMAND_TIMEOUT_MS / 1000}s]`;
     }, COMMAND_TIMEOUT_MS);
     child.on("close", (code) => {

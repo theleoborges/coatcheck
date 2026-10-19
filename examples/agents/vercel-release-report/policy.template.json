@@ -1,0 +1,10 @@
+{
+  "secrets": {
+    "anthropic-api-key": { "allowed_hosts": ["api.anthropic.com"], "swap_headers": ["x-api-key"] },
+    "vercel-token": { "allowed_hosts": ["api.vercel.com"] },
+    "aws-reports": {
+      "allowed_hosts": ["${BUCKET}.s3.${REGION}.amazonaws.com", "sts.${REGION}.amazonaws.com"],
+      "signing": "aws-sigv4"
+    }
+  }
+}
