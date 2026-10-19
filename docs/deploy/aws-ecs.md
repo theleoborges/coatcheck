@@ -8,8 +8,11 @@ property 2 there: **the agent's own AWS identity can't read the secrets**,
 only coatcheck's can.
 
 Values in angle brackets and the account `123456789012` / region `us-east-1`
-are placeholders. AWS-hosted agents should use a scoped task role for their own AWS access; coatcheck's SigV4 signing ([signing-processors.md](../design/signing-processors.md)) is for keys that can't be roles (agents off AWS, S3-compatible stores, a counterparty's IAM user key). Build the image from this repo's `Dockerfile` and push it
-to your own ECR repository. It is based on `node:24-slim` (coatcheck needs
+are placeholders. AWS-hosted agents should use a scoped task role for their own AWS access; coatcheck's SigV4 signing ([signing-processors.md](../design/signing-processors.md)) is for keys that can't be roles (agents off AWS, S3-compatible stores, a counterparty's IAM user key). Use the published image,
+`ghcr.io/theleoborges/coatcheck:<version>` (public), or build your own from
+this repo's `Dockerfile`. Either way, keeping a copy in your own ECR repository
+(for example through an ECR pull-through cache rule for `ghcr.io`) means tasks
+don't depend on GHCR at launch. It is based on `node:24-slim` (coatcheck needs
 Node 24), runs as the `node` user (UID 1000), listens on `3128` (proxy and
 vault API) and, with CDP enabled, `8444`.
 

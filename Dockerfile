@@ -1,4 +1,6 @@
-FROM node:24-slim AS build
+# The build stage runs on the builder's platform: tsc output is the same for every
+# target, so a multi-platform build (release.yml) compiles once, natively.
+FROM --platform=$BUILDPLATFORM node:24-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.json tsconfig.base.json ./
 COPY packages/core/package.json packages/core/tsconfig.json ./packages/core/

@@ -43,7 +43,7 @@ You need Docker. Secrets come from environment variables (the `env` provider), s
 
 ```bash
 export COATCHECK_API_TOKEN=$(openssl rand -hex 32)   # required: the demo listens on 0.0.0.0
-docker compose -f examples/docker-compose.env.yml up --build
+docker compose -f examples/docker-compose.env.yml up
 ```
 
 This starts coatcheck on `localhost:3128` with three demo secrets from the compose file: `example-api-key` and `example-echo-key` (single values) and `example-login` (a username/password pair). In another terminal:
@@ -88,7 +88,15 @@ npm install -g @coatcheck/provider-aws                   # add for COATCHECK_PRO
 COATCHECK_PROVIDER=env COATCHECK_SECRET_EXAMPLE_API_KEY=sk-demo coatcheck
 ```
 
-Node ≥ 24. There is no published container image yet: build one from this repository (`docker build -t coatcheck .`, as the compose files do) or run from source (see [Development](#development)).
+Node ≥ 24. Or use the container image, which has core and both providers, for `linux/amd64` and `linux/arm64`:
+
+```bash
+docker pull ghcr.io/theleoborges/coatcheck:0.3.0   # also :0.3 and :latest
+docker run --rm -p 127.0.0.1:3128:3128 -e COATCHECK_BIND_HOST=0.0.0.0 -e COATCHECK_API_TOKEN=$COATCHECK_API_TOKEN \
+  -e COATCHECK_PROVIDER=env -e COATCHECK_SECRET_EXAMPLE_API_KEY=sk-demo ghcr.io/theleoborges/coatcheck:0.3.0
+```
+
+Each release tag builds it from the tagged source, with provenance and an SBOM. To build your own: `docker build -t coatcheck .` (the LocalStack demo and the example agents build from the checkout).
 
 ## Example agents
 
