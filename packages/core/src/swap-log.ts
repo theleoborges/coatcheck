@@ -10,6 +10,8 @@ export interface SwapOutcome {
   skipped?: SwapInfo[];
   /** Tickets whose value can't be represented where they sit (request refused). */
   invalid?: SwapInfo[];
+  /** A signing ticket whose request was verified and re-signed. */
+  signed?: { scheme: string; info: SwapInfo };
 }
 
 /**
@@ -19,7 +21,9 @@ export interface SwapOutcome {
  * `result=body-skipped` (a body ticket whose secret doesn't enable `swap_body`),
  * `result=placement-skipped` (a ticket in the request line or a header its
  * secret isn't swapped in; `where=` names the places, never the values),
- * `result=invalid-value` (a value that can't go in a header; not forwarded).
+ * `result=invalid-value` (a value that can't go in a header; not forwarded),
+ * `result=signed` (a signing ticket's request verified and re-signed),
+ * `result=signing-skipped` (a signing ticket met as a literal; sent as is).
  * `postSwapText` is the text *after* swaps were applied — any ticket literal (`cct_<hex>`)
  * remaining in it is un-swapped (TTL-expired token, stale tunnel, or a literal
  * the agent typed by mistake). Never logs token values, IDs, or request bodies.
@@ -39,6 +43,13 @@ export function logSwapOutcome(
   }
   if (denied.length > 0 || invalid.length > 0) return; // nothing is forwarded, so un-swapped literals don't matter
 
+  if (outcome.signed) {
+    const { scheme: signing, info } = outcome.signed;
+    const line = `[swap] scheme=${scheme} host=${hostname} result=signed signing=${signing} secrets=${info.secretName} max_age_ms=${info.ageMs}`;
+    if (info.unbound) console.warn(`${line} unbound=1`);
+    else console.log(line);
+  }
+
   const bound = swaps.filter(s => !s.unbound);
   const unbound = swaps.filter(s => s.unbound);
   if (bound.length > 0) {
@@ -49,7 +60,14 @@ export function logSwapOutcome(
   }
 
   const bodySkipped = (outcome.skipped ?? []).filter(s => s.where === undefined);
-  const headSkipped = (outcome.skipped ?? []).filter(s => s.where !== undefined);
+  const headSkipped = (outcome.skipped ?? []).filter(s => s.where !== undefined && s.where !== 'signing');
+  const signingSkipped = (outcome.skipped ?? []).filter(s => s.where === 'signing');
+  if (signingSkipped.length > 0) {
+    console.warn(
+      `[swap] scheme=${scheme} host=${hostname} result=signing-skipped secrets=${names(signingSkipped)} where=signing ` +
+      '(a signing ticket is only used as a key, never swapped as a literal; it was sent as is)'
+    );
+  }
   if (bodySkipped.length > 0) {
     console.warn(
       `[swap] scheme=${scheme} host=${hostname} result=body-skipped secrets=${names(bodySkipped)} ` +
@@ -81,6 +99,50 @@ export function logBodyUnscanned(scheme: 'http' | 'https', hostname: string, max
     `[swap] scheme=${scheme} host=${hostname} result=body-unscanned reason=too-large max_bytes=${maxBytes} ` +
     '(tickets in this body are sent as literals; raise COATCHECK_MAX_SWAP_BODY_BYTES if needed)'
   );
+}
+
+/**
+ * A signing request refused before anything was forwarded:
+ * `result=signature-mismatch` (the agent's signature isn't coatcheck's
+ * reconstruction) or `result=unsignable reason=…` (a shape coatcheck doesn't
+ * re-sign). Never logs signatures, canonical requests or key material.
+ */
+export function logSigningRefused(
+  scheme: 'http' | 'https',
+  hostname: string,
+  result: 'signature-mismatch' | 'unsignable',
+  info: SwapInfo,
+  reason?: string,
+): void {
+  console.warn(`[swap] scheme=${scheme} host=${hostname} result=${result} secrets=${info.secretName}${reason ? ` reason=${reason}` : ''}`);
+}
+
+/** JSON body of the `403` sent when the agent's signature doesn't match coatcheck's reconstruction. */
+export function signatureMismatchBody(info: SwapInfo, signing: string): string {
+  return JSON.stringify({
+    error: `Request signed with the ticket for '${info.secretName}' doesn't match the request coatcheck received (${signing}): ` +
+      'a header changed after signing, an encoding coatcheck canonicalises differently, or a key other than the ticket',
+    reason: 'signature-mismatch',
+    secrets: [info.secretName],
+  });
+}
+
+const UNSIGNABLE_HINTS: Record<string, string> = {
+  'body-too-large': 'the body must be hashed and is larger than COATCHECK_MAX_SWAP_BODY_BYTES',
+  sigv4a: 'SigV4a (AWS4-ECDSA-P256-SHA256) is not re-signed; use SigV4',
+  'streaming-signed-payload': 'per-chunk signed payloads (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) are not re-signed; use UNSIGNED-PAYLOAD',
+  'malformed-authorization': 'the Authorization header does not parse, or carries the ticket somewhere other than the access key id',
+  'repeated-payload-hash': 'x-amz-content-sha256 is repeated',
+};
+
+/** JSON body of the `403` sent when a signing request has a shape coatcheck doesn't re-sign. */
+export function unsignableBody(info: SwapInfo, reason: string): string {
+  return JSON.stringify({
+    error: `Request using the signing ticket for '${info.secretName}' can't be re-signed: ${UNSIGNABLE_HINTS[reason] ?? reason}`,
+    reason: 'unsignable',
+    detail: reason,
+    secrets: [info.secretName],
+  });
 }
 
 /** Header that marks a response coatcheck produced instead of forwarding the request. */

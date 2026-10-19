@@ -150,7 +150,7 @@ coatcheck does a **literal substring replace** of live ticket strings, so the ru
 - **Tickets outside `Authorization`** (URL, other headers, body) for secrets that don't opt in there.
 - **Ticket in a header name.** Only header values are scanned.
 - **Any client that ignores `HTTPS_PROXY`.** Node's built-in `https` module is the common case: it needs an explicit agent such as `https-proxy-agent`, or `NODE_USE_ENV_PROXY=1` on Node ≥ 24. curl, git, Python `requests` and Node `fetch` honour the variable.
-- **Client-side signing**, such as AWS SigV4, HMAC request signatures, or JWT minting. The client computes a signature over the ticket, not the real secret.
+- **Client-side signing** the secret isn't configured for: HMAC request signatures, JWT minting, or AWS SigV4 on a secret without `signing`. The client computes a signature over the ticket, not the real secret. For AWS SigV4, see [Signed requests](#signed-requests).
 - **Expired tickets.** After 15 minutes the ticket is forwarded literally.
 
 If an upstream returns 401 while you are using a ticket, assume the swap did not happen before you assume the stored credential is wrong. coatcheck logs one line per request, with secret names and counts but never values:
@@ -165,10 +165,33 @@ If an upstream returns 401 while you are using a ticket, assume the swap did not
 | `placement-skipped secrets=… where=…` | A ticket appeared in the URL (`where=url`) or a header (`where=header:<name>`) its secret isn't swapped in. It was sent as a literal. |
 | `body-unscanned` | The body was larger than `COATCHECK_MAX_SWAP_BODY_BYTES` and streamed through unscanned. |
 | `miss unswapped_ticket_literals=N` | A `cct_<64 hex>` string reached the upstream intact (unknown or expired ticket). |
+| `signed signing=aws-sigv4 secrets=…` | A request signed with a signing ticket was verified and re-signed with the real key ([Signed requests](#signed-requests)). |
+| `signature-mismatch secrets=…` | The agent's signature doesn't match the request coatcheck received. Not forwarded (`403`). |
+| `unsignable secrets=… reason=…` | A signing request coatcheck doesn't re-sign (`body-too-large`, `sigv4a`, `streaming-signed-payload`, `malformed-authorization`). Not forwarded (`403`). |
+| `signing-skipped secrets=…` | A signing ticket was used as a literal (`Bearer cct_…`, a presigned URL). It was sent as is and the upstream rejects it. |
 
 `[connect] host=… mode=mitm|passthrough reason=…` lines show which tunnels coatcheck intercepted.
 
 On the plain-HTTP proxy path the same placement rules apply to the path and query, headers and body; tickets are never swapped in the host or userinfo, and `Proxy-Authorization` and hop-by-hop headers are not forwarded.
+
+### Signed requests
+
+Some credentials are never sent: the client signs each request with them. For **AWS SigV4** (agents running outside AWS, S3-compatible stores, keys from a counterparty), mark the secret `"signing": "aws-sigv4"` in the policy (or `"_signing": "aws-sigv4"` in the secret). The secret is the JSON of an access key, snake_case or as `aws configure export-credentials` prints it:
+
+```json
+{"access_key_id": "AKIA…", "secret_access_key": "…", "session_token": "(optional)"}
+```
+
+The mint returns one credential ticket, and the agent's unmodified SDK or CLI uses it as both halves of the key:
+
+```bash
+TOK=$(curl -s "$COATCHECK_URL/_vault/aws-reports" | jq -r .token)   # {"token":"cct_…","signing":"aws-sigv4",…}
+AWS_ACCESS_KEY_ID=$TOK AWS_SECRET_ACCESS_KEY=$TOK aws s3 cp report.md s3://reports-bucket/reports/
+```
+
+coatcheck checks the host binding, verifies that the agent signed exactly the request it received (with the ticket as the key), applies the ordinary swaps, then re-signs with the real key: the upstream sees the real access key id and a valid signature, and the secret key never leaves coatcheck. A session token in the secret is added and signed. Bodies the signature must hash (every service but S3, which sends a payload-hash header) are buffered up to `COATCHECK_MAX_SWAP_BODY_BYTES`; past it the request is refused (`403 unsignable reason=body-too-large`), never streamed half-signed. S3 uploads stream at any size. `?field=secret_access_key` is refused: there is no literal ticket for the key.
+
+Fails closed: presigned URLs and other query-string auth (the ticket leaves as a literal and AWS rejects it), SigV4a and per-chunk signed streaming payloads (`403 unsignable`). Design: [docs/design/signing-processors.md](docs/design/signing-processors.md). On AWS itself, give the agent a scoped task role instead.
 
 ## Policy file
 
@@ -191,6 +214,7 @@ On the plain-HTTP proxy path the same placement rules apply to the path and quer
 - `allowed_hosts` entries are exact hostnames, or `*.example.com`, which matches any subdomain but not `example.com` itself. Entries are case-insensitive and IDNs are converted to punycode. IP addresses match exactly. HTTPS is implied; write `http://host` to also allow plaintext HTTP. Ports and paths are not allowed. A bare `*` and wildcards over a single label (`*.com`) are rejected.
 - `swap_headers` (optional, a list of header names) and `swap_url` (optional, `true`/`false`) let the secret's tickets be swapped outside `Authorization`; see [Swap placement](#swap-placement).
 - `swap_body` (optional, `true`/`false`) turns on request body substitution for the secret; see [Request bodies](#request-bodies).
+- `signing` (optional, `"aws-sigv4"`) makes the secret a signing key: its ticket is used by the client's SDK to sign and coatcheck re-signs; see [Signed requests](#signed-requests).
 - The schema is strict: unknown keys, empty `allowed_hosts` or `swap_headers` lists, a non-boolean `swap_body` or `swap_url`, and invalid entries all stop startup.
 
 ### Allowed hosts
@@ -412,7 +436,7 @@ coatcheck makes different trade-offs:
 - **Unmodified tools.** coatcheck is a standard `HTTPS_PROXY` with TLS interception, so curl, git, SDKs, and code an LLM writes on the fly work if they honour the proxy variable and trust the CA. No client changes are needed.
 - **Secrets by name from a store.** The agent asks for `github-token` and gets a ticket. It never holds secret material, sealed or otherwise. The cost is a stateful component and a backend dependency.
 - **Browser logins.** coatcheck logs an agent into a website through a remote browser by performing the fill and submit itself over CDP, with the agent's frames held and inbound redaction as a backstop. tokenizer does not cover browsers.
-- **Weaker today.** coatcheck has no signing processors, an area where tokenizer is ahead. Both bind secrets to hosts; coatcheck's binding comes from an operator policy file and the stored secret rather than from the sealed secret.
+- **Signing.** coatcheck re-signs AWS SigV4 transparently: the agent's unmodified SDK signs with the ticket, coatcheck verifies that signature and re-signs with the real key. It has no JWT, OAuth client-credentials or GitHub App processors, where tokenizer is ahead. Both bind secrets to hosts; coatcheck's binding comes from an operator policy file and the stored secret rather than from the sealed secret.
 
 ## Development
 

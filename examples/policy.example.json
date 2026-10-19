@@ -3,7 +3,11 @@
     "example-api-key": { "allowed_hosts": ["httpbin.org"] },
     "example-echo-key": { "allowed_hosts": ["postman-echo.com"] },
     "example-login": { "allowed_hosts": ["*.example.com"] },
-    "github-*": { "allowed_hosts": ["api.github.com", "github.com"] }
+    "github-*": { "allowed_hosts": ["api.github.com", "github.com"] },
+    "example-aws-reports": {
+      "allowed_hosts": ["example-reports-bucket.s3.us-east-1.amazonaws.com", "sts.us-east-1.amazonaws.com"],
+      "signing": "aws-sigv4"
+    }
   },
   "shared": {
     "browserbase-api-key": { "allowed_hosts": ["api.browserbase.com"], "swap_headers": ["X-BB-API-Key"] }

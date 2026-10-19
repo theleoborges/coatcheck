@@ -122,3 +122,27 @@ describe('allowedHostsJson', () => {
     expect(headers(['authorization', 'x-a'], undefined)).toEqual(['x-a']);
   });
 });
+
+describe('signing: _signing and policy signing', () => {
+  const sigv4 = { type: 'aws-sigv4' } as const;
+
+  it('parses _signing and refuses an unknown value', () => {
+    expect(parseSecretValue('{"access_key_id":"A","secret_access_key":"s","_signing":"aws-sigv4"}').inBand).toEqual({ signing: sigv4 });
+    expect(parseSecretValue('{"a":"b","_signing":"hmac-md5"}').inBand).toEqual({ error: expect.stringContaining('_signing') });
+    expect(parseSecretValue('{"a":"b","_signing":true}').inBand).toEqual({ error: expect.stringContaining('_signing') });
+  });
+
+  it('enables signing from either source', () => {
+    const h = hosts('s3.example.com');
+    expect(resolveBinding('aws', h, {}, false, { signing: sigv4 })).toEqual(expect.objectContaining({ ok: true, signing: sigv4 }));
+    expect(resolveBinding('aws', h, { signing: sigv4 }, false, {})).toEqual(expect.objectContaining({ ok: true, signing: sigv4 }));
+    expect(resolveBinding('aws', h, {}, false, {})).not.toHaveProperty('signing');
+  });
+
+  it('fails with 500 when the two sources disagree on the type', () => {
+    // Only one type exists in this build; a second (hmac) is item 25. Simulate a disagreement.
+    const other = { type: 'other' } as unknown as typeof sigv4;
+    expect(resolveBinding('aws', hosts('s3.example.com'), { signing: other }, false, { signing: sigv4 }))
+      .toEqual({ ok: false, status: 500, error: expect.stringContaining('_signing') });
+  });
+});

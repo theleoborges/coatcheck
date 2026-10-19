@@ -129,9 +129,54 @@ Fails silently (the upstream receives `cct_…` and returns 401/403):
   `COATCHECK_MAX_SWAP_BODY_BYTES` (default 1 MiB; logged as
   `result=body-unscanned`).
 - **Any transform of the ticket**: hashing, HMAC signing with it,
-  base64-encoding it, splitting it.
+  base64-encoding it, splitting it. The exception is a signing ticket
+  (below), which is meant to be used as a key.
 - **Traffic that bypasses the proxy** (section 4).
 - **A connection opened before any ticket existed** (section 5).
+
+### Signing tickets (AWS SigV4)
+
+A mint response with `"signing": "aws-sigv4"` is a **signing ticket**: use it
+as both `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (or the SDK's
+`accessKeyId` and `secretAccessKey`) and send the request through the proxy.
+coatcheck parses `Authorization: AWS4-HMAC-SHA256 Credential=cct_…/…`,
+recomputes the agent's signature with the ticket as the key over the request
+it received, applies the ordinary swaps, and re-signs with the real key and
+session token. Design: `docs/design/signing-processors.md`.
+
+```bash
+TOK=$(curl -s "$COATCHECK_URL/_vault/aws-reports" | jq -r .token)
+AWS_ACCESS_KEY_ID=$TOK AWS_SECRET_ACCESS_KEY=$TOK aws sts get-caller-identity
+AWS_ACCESS_KEY_ID=$TOK AWS_SECRET_ACCESS_KEY=$TOK aws s3 cp report.md s3://reports-bucket/reports/
+```
+
+- The ticket is never swapped as a literal anywhere. `Authorization: Bearer
+  cct_…` with it is forwarded unchanged (`result=signing-skipped`) and the
+  upstream rejects it.
+- **Presigned URLs don't work.** `aws s3 presign` puts the ticket in
+  `X-Amz-Credential`; it leaves as a literal (`result=placement-skipped
+  where=url`) and S3 answers `InvalidAccessKeyId`.
+- **Bodies.** S3 clients send `x-amz-content-sha256`, so uploads stream at
+  any size. Other services hash the body: it is buffered up to
+  `COATCHECK_MAX_SWAP_BODY_BYTES`, and past it the request is refused with
+  `403 unsignable reason=body-too-large`.
+- **Refused shapes** (`403`, `X-Coatcheck-Denied: unsignable`, nothing
+  forwarded): SigV4a (`reason=sigv4a`), per-chunk signed streaming payloads
+  (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, `reason=streaming-signed-payload`;
+  SDK defaults stream unsigned), an `Authorization` that doesn't parse
+  (`reason=malformed-authorization`).
+- **`403 signature-mismatch`**: the agent's signature doesn't match the request
+  coatcheck received. A header changed after signing, a client library that
+  canonicalises differently, or a key other than the ticket.
+- `?field=secret_access_key` is `400`: there is no literal ticket for the key.
+  Other fields get normal tickets; `_cleartext` fields (`region`) return values.
+
+| `[swap] result=` | Meaning |
+|---|---|
+| `signed signing=aws-sigv4 secrets=…` | Verified and re-signed; forwarded. |
+| `signature-mismatch secrets=…` | `403`, not forwarded. |
+| `unsignable secrets=… reason=…` | `403`, not forwarded. |
+| `signing-skipped secrets=…` | The signing ticket was used as a literal; forwarded as is. |
 
 A 401/403 when using a ticket almost always means the swap did not happen.
 Debug the call path; the stored secret is usually fine. coatcheck logs

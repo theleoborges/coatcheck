@@ -1,7 +1,12 @@
 import http from 'node:http';
 import { URL } from 'node:url';
 import type { HeadLocation, TokenStore, SwapInfo, SwapResult } from './token-store.js';
-import { DENIED_HEADER, hostMismatchBody, invalidValueBody, logBodyUnscanned, logSwapOutcome } from './swap-log.js';
+import {
+  DENIED_HEADER, hostMismatchBody, invalidValueBody, logBodyUnscanned, logSigningRefused, logSwapOutcome,
+  signatureMismatchBody, unsignableBody, type SwapOutcome,
+} from './swap-log.js';
+import { planSigning, type SigningPlan } from './signing/processor.js';
+import type { SignableRequest } from './signing/request.js';
 import { swapRequestBody } from './body-swap.js';
 import { headerFieldValue, percentEncodeUnsafe } from './value-encoding.js';
 import { swapBasicCredentials } from './basic-auth.js';
@@ -24,6 +29,9 @@ const HOP_BY_HOP = new Set([
  * `http://` entry; otherwise the request is answered `403` and never forwarded.
  * The body streams unless a `swap_body` ticket could apply; then it is
  * buffered up to `maxSwapBodyBytes` (design §3, "Swap-path hardening").
+ * A request signed with a signing ticket is verified and re-signed
+ * (docs/design/signing-processors.md §4.5); one whose body must be hashed is
+ * refused past the cap.
  */
 export function handleForwardRequest(
   req: http.IncomingMessage,
@@ -63,6 +71,29 @@ export function handleForwardRequest(
     postSwapText += output + '\n';
     return output;
   };
+  // A signing ticket used as a key, on the request as received (hop-by-hop
+  // headers removed, since they aren't forwarded; `host` as dialled).
+  const received = receivedSignable(req, parsed);
+  const plan = planSigning(tokenStore, received, target);
+  if (plan?.kind === 'denied') {
+    logSwapOutcome('http', hostname, { swaps: [], denied: plan.denied }, '');
+    req.resume();
+    res.writeHead(403, { 'Content-Type': 'application/json', [DENIED_HEADER]: 'host-mismatch' });
+    res.end(hostMismatchBody(plan.denied, hostname));
+    return;
+  }
+  const refuseUnsignable = (info: SwapInfo, reason: string) => {
+    logSigningRefused('http', hostname, 'unsignable', info, reason);
+    req.resume();
+    res.writeHead(403, { 'Content-Type': 'application/json', [DENIED_HEADER]: 'unsignable' });
+    res.end(unsignableBody(info, reason));
+  };
+  if (plan?.kind === 'unsignable') {
+    refuseUnsignable(plan.info, plan.reason);
+    return;
+  }
+  const signing: SigningPlan | undefined = plan ?? undefined;
+
   // A ticket in `Authorization: Basic` is hidden by base64; open it first.
   const swapHeader = (name: string, value: string): string => {
     const basic = name === 'authorization' ? swapBasicCredentials(tokenStore, value, target) : null;
@@ -81,7 +112,9 @@ export function handleForwardRequest(
   const path = swap(parsed.pathname + parsed.search, { kind: 'url' }, percentEncodeUnsafe);
   const headers: http.OutgoingHttpHeaders = {};
   for (const [key, value] of Object.entries(stripHopByHop(req.headers))) {
-    if (typeof value === 'string') headers[key] = swapHeader(key, value);
+    // A signing scheme's own headers are rewritten by the scheme, not swapped.
+    if (signing?.ownedHeaders.has(key)) headers[key] = value;
+    else if (typeof value === 'string') headers[key] = swapHeader(key, value);
     else if (Array.isArray(value)) headers[key] = value.map(v => swapHeader(key, v));
   }
   headers.host = parsed.host;
@@ -101,6 +134,34 @@ export function handleForwardRequest(
     deny();
     return;
   }
+
+  /**
+   * Verify the agent's signature over the request as received and re-sign
+   * the outgoing headers in place. False after refusing the request.
+   */
+  const sign = (receivedBody?: Buffer, outgoingBody?: Buffer): boolean => {
+    if (!signing) return true;
+    const outgoing: SignableRequest = { method: req.method ?? 'GET', target: path, headers: headerPairs(headers) };
+    const result = signing.finalize({ request: received, body: receivedBody }, { request: outgoing, body: outgoingBody });
+    if (!result.ok) {
+      logSigningRefused('http', hostname, 'signature-mismatch', signing.info);
+      req.resume();
+      res.writeHead(403, { 'Content-Type': 'application/json', [DENIED_HEADER]: 'signature-mismatch' });
+      res.end(signatureMismatchBody(signing.info, signing.scheme));
+      return false;
+    }
+    for (const key of Object.keys(headers)) delete headers[key];
+    for (const [name, value] of result.headers) {
+      const key = name.toLowerCase();
+      const existing = headers[key];
+      const v = value.trim();
+      headers[key] = existing === undefined ? v : Array.isArray(existing) ? [...existing, v] : [String(existing), v];
+    }
+    return true;
+  };
+  const outcome = (): SwapOutcome => ({
+    swaps, denied, skipped, ...(signing ? { signed: { scheme: signing.scheme, info: signing.info } } : {}),
+  });
 
   const send = (): http.ClientRequest | null => {
     try {
@@ -138,8 +199,16 @@ export function handleForwardRequest(
 
   req.on('error', () => res.destroy());
   const hasBody = req.headers['content-length'] !== undefined || req.headers['transfer-encoding'] !== undefined;
-  if (!hasBody || !tokenStore.hasLiveBodyTicketFor(target)) {
-    logSwapOutcome('http', hostname, { swaps, denied, skipped }, postSwapText);
+  const needsBody = hasBody && signing?.needsBody === true;
+  // A signature over the body needs all of it: past the cap, refused up front when the length says so.
+  if (needsBody && Number(req.headers['content-length']) > maxSwapBodyBytes) {
+    refuseUnsignable(signing.info, 'body-too-large');
+    return;
+  }
+  if (!hasBody || (!needsBody && !tokenStore.hasLiveBodyTicketFor(target))) {
+    const empty = signing?.needsBody ? Buffer.alloc(0) : undefined;
+    if (!sign(empty, empty)) return;
+    logSwapOutcome('http', hostname, outcome(), postSwapText);
     const proxyReq = send();
     if (proxyReq) req.pipe(proxyReq);
     return;
@@ -152,11 +221,17 @@ export function handleForwardRequest(
     chunks.push(chunk);
     bytes += chunk.length;
     if (bytes <= maxSwapBodyBytes) return;
-    // Too large to hold: send what we have and stream the rest unscanned,
-    // with the client's framing.
     req.off('data', onData);
     req.off('end', onEnd);
-    logSwapOutcome('http', hostname, { swaps, denied, skipped }, postSwapText);
+    // A body the signature covers can't be streamed half-signed.
+    if (needsBody) {
+      refuseUnsignable(signing.info, 'body-too-large');
+      return;
+    }
+    // Too large to hold: send what we have and stream the rest unscanned,
+    // with the client's framing.
+    if (!sign()) return;
+    logSwapOutcome('http', hostname, outcome(), postSwapText);
     logBodyUnscanned('http', hostname, maxSwapBodyBytes);
     const proxyReq = send();
     if (!proxyReq) return;
@@ -164,7 +239,8 @@ export function handleForwardRequest(
     req.pipe(proxyReq);
   };
   const onEnd = () => {
-    let body: Buffer = Buffer.concat(chunks);
+    const receivedBody = Buffer.concat(chunks);
+    let body: Buffer = receivedBody;
     const bodySwap = swapRequestBody(tokenStore, body, {
       contentType: firstHeader(req.headers['content-type']),
       contentEncoding: firstHeader(req.headers['content-encoding']),
@@ -176,18 +252,52 @@ export function handleForwardRequest(
       postSwapText += bodySwap.result.output;
       body = bodySwap.body;
     }
-    logSwapOutcome('http', hostname, { swaps, denied, skipped }, postSwapText);
     if (denied.length > 0) {
+      logSwapOutcome('http', hostname, outcome(), postSwapText);
       deny();
       return;
     }
-    // Node de-chunked the body; re-send it with an exact length.
+    // Node de-chunked the body; re-send it with an exact length (signed
+    // after, since some SDKs sign Content-Length).
     delete headers['transfer-encoding'];
     headers['content-length'] = body.length;
+    if (!sign(receivedBody, body)) return;
+    logSwapOutcome('http', hostname, outcome(), postSwapText);
     send()?.end(body);
   };
   req.on('data', onData);
   req.on('end', onEnd);
+}
+
+/** Outgoing headers as name/value pairs, repeated headers as separate pairs. */
+function headerPairs(headers: http.OutgoingHttpHeaders): Array<[string, string]> {
+  return Object.entries(headers).flatMap(([k, v]): Array<[string, string]> =>
+    v === undefined ? [] : Array.isArray(v) ? v.map(x => [k, x]) : [[k, String(v)]]);
+}
+
+/**
+ * The request as the agent sent it, for verifying its signature: method,
+ * origin-form target from the absolute-form URL as written, the headers
+ * that are forwarded, and `host` as dialled (a client that signed another
+ * Host gets `signature-mismatch`).
+ */
+function receivedSignable(req: http.IncomingMessage, parsed: URL): SignableRequest {
+  const url = req.url ?? '';
+  const afterScheme = url.indexOf('//') + 2;
+  const slash = url.slice(afterScheme).search(/[/?]/);
+  const raw = slash === -1 ? '/' : url.slice(afterScheme + slash);
+  const target = raw.startsWith('?') ? `/${raw}` : raw;
+  const named = new Set(
+    String(req.headers.connection ?? '').split(',').map(h => h.trim().toLowerCase()).filter(Boolean),
+  );
+  const headers: Array<[string, string]> = [];
+  for (let i = 0; i + 1 < req.rawHeaders.length; i += 2) {
+    const name = req.rawHeaders[i];
+    const key = name.toLowerCase();
+    if (HOP_BY_HOP.has(key) || named.has(key)) continue;
+    headers.push([name, key === 'host' ? parsed.host : req.rawHeaders[i + 1]]);
+  }
+  return { method: req.method ?? 'GET', target, headers };
 }
 
 function firstHeader(value: string | string[] | undefined): string | undefined {

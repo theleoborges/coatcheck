@@ -1,4 +1,5 @@
 import { formatHostPattern, intersectHostPatterns, parseHostPattern, type HostPattern } from './host-matcher.js';
+import { parseSigningSpec, type SigningSpec } from './signing/spec.js';
 
 /**
  * A secret value as coatcheck reads it (design: docs/design/v1-decisions.md §3).
@@ -16,10 +17,15 @@ export interface SwapSettings {
   swapUrl?: boolean;
   /** Extra header names (lowercase) whose values a ticket is swapped in. */
   swapHeaders?: string[];
+  /**
+   * The secret is a signing key (docs/design/signing-processors.md §3): its
+   * credential ticket is used as a key and re-signed, never swapped.
+   */
+  signing?: SigningSpec;
 }
 
 /**
- * In-band `_allowed_hosts`, `_swap_body`, `_swap_url` and `_swap_headers`:
+ * In-band `_allowed_hosts`, `_swap_body`, `_swap_url`, `_swap_headers` and `_signing`:
  * each absent or parsed, or an error when any is invalid (fails minting with 500).
  */
 export type InBandMetadata = ({ hosts?: HostPattern[] } & SwapSettings) | { error: string };
@@ -96,6 +102,11 @@ function parseInBand(fields: Record<string, unknown>): InBandMetadata {
     if (typeof headers === 'string') return { error: `_swap_headers ${headers}` };
     out.swapHeaders = headers;
   }
+  if (fields._signing !== undefined) {
+    const signing = parseSigningSpec(fields._signing);
+    if (typeof signing === 'string') return { error: `_signing ${signing}` };
+    out.signing = signing;
+  }
   return out;
 }
 
@@ -105,6 +116,8 @@ export interface Placement {
   swapUrl: boolean;
   /** Extra header names beyond `DEFAULT_SWAP_HEADERS`, lowercase, sorted. */
   swapHeaders: string[];
+  /** Set when the secret is a signing key: mint issues one credential ticket. */
+  signing?: SigningSpec;
 }
 
 /** The outcome of resolving a secret's effective hosts at mint time. */
@@ -119,7 +132,8 @@ export type Binding =
  * Body and URL swapping are each on when either source enables it and neither
  * disables it. Extra swap headers, like hosts, are the intersection of both
  * lists when both are present, so a secret can narrow the operator's list but
- * never widen it.
+ * never widen it. Signing is on when either source sets it; when both do,
+ * they must name the same type (else 500), and the policy's spec is used.
  */
 export function resolveBinding(
   secretName: string,
@@ -136,10 +150,19 @@ export function resolveBinding(
   const policyHeaders = policySwap.swapHeaders;
   const ownHeaders = inBand.swapHeaders;
   const headers = policyHeaders && ownHeaders ? policyHeaders.filter(h => ownHeaders.includes(h)) : policyHeaders ?? ownHeaders ?? [];
+  if (policySwap.signing && inBand.signing && policySwap.signing.type !== inBand.signing.type) {
+    return {
+      ok: false,
+      status: 500,
+      error: `Secret '${secretName}' has _signing '${inBand.signing.type}' but the policy file says '${policySwap.signing.type}'`,
+    };
+  }
+  const signing = policySwap.signing ?? inBand.signing;
   const placement: Placement = {
     swapBody: enabled(policySwap.swapBody, inBand.swapBody),
     swapUrl: enabled(policySwap.swapUrl, inBand.swapUrl),
     swapHeaders: headers.filter(h => !DEFAULT_SWAP_HEADERS.includes(h)).sort(),
+    ...(signing ? { signing } : {}),
   };
   const hosts = policyHosts && own ? intersectHostPatterns(policyHosts, own) : policyHosts ?? own;
   if (hosts === undefined) {

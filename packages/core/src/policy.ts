@@ -1,6 +1,7 @@
 import { parseHostPattern, type HostPattern } from './host-matcher.js';
 import { isValidSecretName } from './secret-provider.js';
 import { parseSwapHeaders, type SwapSettings } from './secret-binding.js';
+import { parseSigningSpec } from './signing/spec.js';
 
 /**
  * The operator's policy file (`COATCHECK_POLICY_FILE`): allowed hosts per secret
@@ -15,7 +16,8 @@ export interface Policy {
 
 /**
  * Explicit `swap_body`, `swap_url` and `swap_headers` (where a ticket is
- * swapped, design §3) are each undefined when absent.
+ * swapped, design §3) and `signing` (docs/design/signing-processors.md §3)
+ * are each undefined when absent.
  */
 export interface SharedRule extends SwapSettings {
   allowedHosts: HostPattern[];
@@ -144,7 +146,7 @@ function allowedHosts(entry: Json, where: string, source: string, problems: stri
   return out.length === list.length ? out : null;
 }
 
-const ENTRY_KEYS = ['allowed_hosts', 'swap_body', 'swap_url', 'swap_headers'];
+const ENTRY_KEYS = ['allowed_hosts', 'swap_body', 'swap_url', 'swap_headers', 'signing'];
 
 /** The entry's explicit swap settings; keys that are absent or invalid are left out. */
 function swapSettingsOf(entry: Json, where: string, source: string, problems: string[]): SwapSettings {
@@ -159,6 +161,11 @@ function swapSettingsOf(entry: Json, where: string, source: string, problems: st
     const headers = parseSwapHeaders(entry.swap_headers);
     if (typeof headers === 'string') problems.push(`${source}: ${where}.swap_headers ${headers}`);
     else out.swapHeaders = headers;
+  }
+  if (entry.signing !== undefined) {
+    const signing = parseSigningSpec(entry.signing);
+    if (typeof signing === 'string') problems.push(`${source}: ${where}.signing ${signing}`);
+    else out.signing = signing;
   }
   return out;
 }

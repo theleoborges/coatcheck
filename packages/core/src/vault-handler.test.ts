@@ -448,9 +448,124 @@ describe('Vault Handler', () => {
       const refused = await postJSON(port, '/_vault/other-login/login', body);
       expect(refused.status).toBe(403);
     });
+
+    it('refuses to fill a signing secret\'s key field into a page (400, never reaches the driver)', async () => {
+      const policy = parsePolicy(JSON.stringify({
+        secrets: { 'aws-console': { allowed_hosts: ['signin.aws.amazon.com'], signing: 'aws-sigv4' } },
+      }), []);
+      await setup({ 'aws-console': JSON.stringify({ access_key_id: 'AKIAREAL', secret_access_key: 'real-key', SecretAccessKey: 'real-key' }) }, {}, { policy });
+      let calls = 0;
+      cdpSessionStore.attach(sid, { login: async () => { calls++; return { status: 200, url: 'https://signin.aws.amazon.com/' }; } });
+      for (const field of ['secret_access_key', 'SecretAccessKey']) {
+        const res = await postJSON(port, '/_vault/aws-console/login', { sessionId: sid, fields: { access_key_id: '#u', [field]: '#p' }, submit: '#go', until: 'navigation' });
+        expect(res.status, field).toBe(400);
+        expect(res.body.error).toContain('signing key');
+      }
+      expect(calls).toBe(0);
+    });
   });
 
   // --- Shared secrets (/_secret/{name}) ---
+
+  describe('signing secrets', () => {
+    const SIGNING_POLICY = parsePolicy(JSON.stringify({
+      secrets: {
+        'aws-reports': { allowed_hosts: ['reports.s3.us-east-1.amazonaws.com'], signing: 'aws-sigv4' },
+        'aws-inband': { allowed_hosts: ['sts.us-east-1.amazonaws.com'] },
+      },
+      shared: { 'aws-shared': { allowed_hosts: ['sts.us-east-1.amazonaws.com'], signing: 'aws-sigv4' } },
+    }), []);
+    const KEY = 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY';
+    const snake = JSON.stringify({ access_key_id: 'AKIAREAL', secret_access_key: KEY, passphrase: 'pp-secret', region: 'us-east-1', _cleartext: ['region'] });
+    const pascal = JSON.stringify({ Version: 1, AccessKeyId: 'ASIAREAL', SecretAccessKey: KEY, SessionToken: 'tok-secret', Expiration: '2026-01-01T00:00:00Z' });
+
+    function captureLog() {
+      const lines: string[] = [];
+      const spies = (['log', 'warn', 'error'] as const).map(m => vi.spyOn(console, m).mockImplementation((...a: unknown[]) => { lines.push(a.map(String).join(' ')); }));
+      return { lines, restore: () => spies.forEach(s => s.mockRestore()) };
+    }
+
+    it('mints one credential ticket with the public scheme, and logs signing=… and nothing else new', async () => {
+      await setup({ 'aws-reports': snake }, {}, { policy: SIGNING_POLICY });
+      const log = captureLog();
+      const { status, body } = await fetchJSON(port, '/_vault/aws-reports');
+      log.restore();
+      expect(status).toBe(200);
+      expect(Object.keys(body).sort()).toEqual(['allowed_hosts', 'expires_in', 'signing', 'token']);
+      expect(body).toEqual(expect.objectContaining({ expires_in: 900, allowed_hosts: ['reports.s3.us-east-1.amazonaws.com'], signing: 'aws-sigv4' }));
+      const ticket = tokenStore.signingTicket(body.token as string);
+      expect(ticket?.credential).toEqual({ scheme: 'aws-sigv4', accessKeyId: 'AKIAREAL', secretAccessKey: KEY });
+      expect(tokenStore.resolve(body.token as string)).toBeNull();
+      expect(log.lines).toEqual(['[issue] secret=aws-reports ttl_s=900 signing=aws-sigv4']);
+    });
+
+    it('accepts `aws configure export-credentials` casing, session token included', async () => {
+      await setup({ 'aws-reports': pascal }, {}, { policy: SIGNING_POLICY });
+      const { status, body } = await fetchJSON(port, '/_vault/aws-reports');
+      expect(status).toBe(200);
+      expect(tokenStore.signingTicket(body.token as string)?.credential)
+        .toEqual({ scheme: 'aws-sigv4', accessKeyId: 'ASIAREAL', secretAccessKey: KEY, sessionToken: 'tok-secret' });
+      expect(JSON.stringify(body)).not.toContain('tok-secret');
+    });
+
+    it('enables signing from an in-band _signing alone', async () => {
+      await setup({ 'aws-inband': JSON.stringify({ access_key_id: 'AKIAREAL', secret_access_key: KEY, _signing: 'aws-sigv4' }) }, {}, { policy: SIGNING_POLICY });
+      const { status, body } = await fetchJSON(port, '/_vault/aws-inband');
+      expect(status).toBe(200);
+      expect(body.signing).toBe('aws-sigv4');
+    });
+
+    it('refuses ?field= on the key field (either casing) with 400', async () => {
+      await setup({ 'aws-reports': snake, 'aws-pascal': pascal }, {}, { policy: parsePolicy(JSON.stringify({ secrets: { 'aws-*': { allowed_hosts: ['reports.s3.us-east-1.amazonaws.com'], signing: 'aws-sigv4' } } }), []) });
+      for (const path of ['/_vault/aws-reports?field=secret_access_key', '/_vault/aws-pascal?field=SecretAccessKey']) {
+        const { status, body } = await fetchJSON(port, path);
+        expect(status, path).toBe(400);
+        expect(body.error).toContain('use the credential ticket');
+      }
+      expect(tokenStore.size).toBe(0);
+    });
+
+    it('issues a normal literal ticket for another field, and returns a _cleartext field', async () => {
+      await setup({ 'aws-reports': snake }, {}, { policy: SIGNING_POLICY });
+      const pp = await fetchJSON(port, '/_vault/aws-reports?field=passphrase');
+      expect(pp.status).toBe(200);
+      expect(tokenStore.resolve(pp.body.token as string)).toBe('pp-secret');
+      expect(pp.body.signing).toBeUndefined();
+      const region = await fetchJSON(port, '/_vault/aws-reports?field=region');
+      expect(region.body).toEqual({ value: 'us-east-1', cleartext: true });
+    });
+
+    it('fails with 500 and issues nothing when the key is missing, whatever is asked', async () => {
+      await setup({
+        'aws-reports': JSON.stringify({ access_key_id: 'AKIAREAL', passphrase: 'pp' }),
+      }, {}, { policy: SIGNING_POLICY });
+      for (const path of ['/_vault/aws-reports', '/_vault/aws-reports?field=passphrase']) {
+        const { status, body } = await fetchJSON(port, path);
+        expect(status, path).toBe(500);
+        expect(body.error).toContain('secret_access_key');
+      }
+      expect(tokenStore.size).toBe(0);
+    });
+
+    it('refuses an access key id that cannot sit in a credential scope', async () => {
+      await setup({ 'aws-reports': JSON.stringify({ access_key_id: 'AKIA/REAL', secret_access_key: KEY }) }, {}, { policy: SIGNING_POLICY });
+      expect((await fetchJSON(port, '/_vault/aws-reports')).status).toBe(500);
+    });
+
+    it('fails with 500 on an invalid in-band _signing', async () => {
+      await setup({ 'aws-reports': JSON.stringify({ access_key_id: 'AKIAREAL', secret_access_key: KEY, _signing: 'sigv2' }) }, {}, { policy: SIGNING_POLICY });
+      expect((await fetchJSON(port, '/_vault/aws-reports')).status).toBe(500);
+      expect(tokenStore.size).toBe(0);
+    });
+
+    it('mints a signing ticket for an allowlisted shared secret', async () => {
+      await setup({}, { 'aws-shared': snake }, { policy: SIGNING_POLICY });
+      const { status, body } = await fetchJSON(port, '/_secret/aws-shared');
+      expect(status).toBe(200);
+      expect(body.signing).toBe('aws-sigv4');
+      expect(tokenStore.signingTicket(body.token as string)?.secretName).toBe('shared:aws-shared');
+    });
+  });
 
   describe('/_secret/{name}', () => {
     it('issues token for allowlisted shared secret', async () => {

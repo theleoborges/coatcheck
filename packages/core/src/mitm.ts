@@ -15,7 +15,12 @@ import { swapRequestBody } from './body-swap.js';
 import { headerFieldValue, percentEncodeUnsafe } from './value-encoding.js';
 import { swapBasicFieldLine, type BasicSwapResult } from './basic-auth.js';
 import type { SwapInfo, SwapResult } from './token-store.js';
-import { DENIED_HEADER, hostMismatchBody, uninspectableBodyBody, invalidValueBody, logBodyUnscanned, logSwapOutcome, type SwapOutcome } from './swap-log.js';
+import {
+  DENIED_HEADER, hostMismatchBody, uninspectableBodyBody, invalidValueBody, logBodyUnscanned, logSigningRefused, logSwapOutcome,
+  signatureMismatchBody, unsignableBody, type SwapOutcome,
+} from './swap-log.js';
+import { planSigning, type SigningPlan } from './signing/processor.js';
+import { signableFromHead, signableFromRequestHead } from './signing/request.js';
 
 export interface MitmDeps {
   tokenStore: TokenStore;
@@ -53,6 +58,11 @@ function isMultipartContentType(ct: string | undefined): boolean {
   return ct !== undefined && /^multipart\/form-data\s*(;|$)/i.test(ct.trim());
 }
 
+/** The `signed` part of a swap outcome for a signed request. */
+function signedOutcome(plan: SigningPlan | undefined): Pick<SwapOutcome, 'signed'> {
+  return plan ? { signed: { scheme: plan.scheme, info: plan.info } } : {};
+}
+
 /** A `Content-Type` field line (RFC 9112 §5: name, optional whitespace, colon). */
 const CONTENT_TYPE_LINE = /^content-type[ \t]*:/i;
 
@@ -68,9 +78,9 @@ type BodyState =
       head: RequestHead;
       /**
        * The head's swap outcome; `output` is the swapped head, without the
-       * final CRLFCRLF; `logText` adds decoded Basic credentials, for the miss log.
+       * final CRLFCRLF; `logText` adds decoded Basic credentials (`basicText`), for the miss log.
        */
-      headOutcome: SwapOutcome & { output: string; logText: string };
+      headOutcome: SwapOutcome & { output: string; logText: string; basicText: string };
       raw: Buffer[];
       rawBytes: number;
       data: Buffer[];
@@ -80,6 +90,8 @@ type BodyState =
        * refused rather than forwarded (`uninspectable-body`).
        */
       adapterReq?: (body: unknown) => boolean;
+      /** The request is re-signed once the body is complete (design: docs/design/signing-processors.md §4.4). */
+      signing?: SigningPlan;
     };
 
 /**
@@ -254,7 +266,22 @@ export function createConnectHandler(deps: MitmDeps) {
           return;
         }
 
-        const swapped = swapHead(head);
+        // A signing ticket used as a key: checked before the literal swap,
+        // which skips the headers the scheme writes (design:
+        // docs/design/signing-processors.md §4.2).
+        const plan = planSigning(tokenStore, signableFromRequestHead(head), swapTarget);
+        if (plan?.kind === 'denied') {
+          logSwapOutcome('https', hostname, { swaps: [], denied: plan.denied }, '');
+          denyForSwaps(plan.denied, []);
+          return;
+        }
+        if (plan?.kind === 'unsignable') {
+          refuseUnsignable(plan, plan.reason);
+          return;
+        }
+        const signing = plan ?? undefined;
+
+        const swapped = swapHead(head, signing?.ownedHeaders);
         if (swapped.denied.length > 0 || swapped.invalid.length > 0) {
           logSwapOutcome('https', hostname, swapped, swapped.logText);
           denyForSwaps(swapped.denied, swapped.invalid);
@@ -277,12 +304,25 @@ export function createConnectHandler(deps: MitmDeps) {
           denyUninspectable(`larger than ${maxSwapBodyBytes} bytes`);
           return;
         }
-        if (hasBody && (tokenStore.hasLiveBodyTicketFor(swapTarget) || adapterReq)) {
-          body = { mode: 'buffer', remaining, decoder, head, headOutcome: swapped, raw: [], rawBytes: 0, data: [], adapterReq };
+        // A signature over the body needs all of it: past the cap the request
+        // is refused, never streamed half-signed.
+        if (signing?.needsBody && framing.kind === 'length' && framing.length > maxSwapBodyBytes) {
+          refuseUnsignable(signing, 'body-too-large');
+          return;
+        }
+        if (hasBody && (signing?.needsBody || tokenStore.hasLiveBodyTicketFor(swapTarget) || adapterReq)) {
+          body = { mode: 'buffer', remaining, decoder, head, headOutcome: swapped, raw: [], rawBytes: 0, data: [], adapterReq, signing };
           continue;
         }
-        logSwapOutcome('https', hostname, swapped, swapped.logText);
-        sendUpstream(Buffer.from(swapped.output + '\r\n\r\n'));
+        let outHead = swapped.output;
+        if (signing) {
+          const empty = signing.needsBody ? Buffer.alloc(0) : undefined;
+          const signed = signHead(outHead, signing, empty, empty);
+          if (signed === null) return;
+          outHead = signed;
+        }
+        logSwapOutcome('https', hostname, { ...swapped, ...signedOutcome(signing) }, signing ? `${outHead}\n${swapped.basicText}` : swapped.logText);
+        sendUpstream(Buffer.from(outHead + '\r\n\r\n'));
         if (hasBody) body = { mode: 'stream', remaining, decoder };
         else finishRequest();
       }
@@ -294,13 +334,18 @@ export function createConnectHandler(deps: MitmDeps) {
      * be a field value are refused). Each ticket swaps only where its secret
      * allows (`Authorization` by default); a header name is never swapped.
      * `Authorization: Basic` credentials are decoded, swapped and re-encoded
-     * (base64 hides their tickets).
+     * (base64 hides their tickets). Headers in `owned` (a signing scheme's
+     * own) are left as they are: the scheme rewrites them.
      */
-    function swapHead(head: RequestHead) {
+    function swapHead(head: RequestHead, owned?: ReadonlySet<string>) {
       const results: SwapResult[] = [tokenStore.replaceAll(head.requestLine, swapTarget, { kind: 'url' }, percentEncodeUnsafe)];
       const lines = [results[0].output];
       const basic: BasicSwapResult[] = [];
       for (const fieldLine of head.fieldLines) {
+        if (owned?.has(fieldLine.slice(0, fieldLine.indexOf(':')).toLowerCase())) {
+          lines.push(fieldLine);
+          continue;
+        }
         const b = swapBasicFieldLine(tokenStore, fieldLine, swapTarget);
         if (b) {
           basic.push(b);
@@ -316,9 +361,11 @@ export function createConnectHandler(deps: MitmDeps) {
         lines.push(`${name}:${r.output}`);
       }
       const output = lines.join('\r\n');
+      const basicText = basic.map(b => b.userPass).join('\n');
       return {
         output,
-        logText: [output, ...basic.map(b => b.userPass)].join('\n'),
+        logText: `${output}\n${basicText}`,
+        basicText,
         swaps: results.flatMap(r => r.swaps),
         denied: results.flatMap(r => r.denied),
         invalid: results.flatMap(r => r.invalid ?? []),
@@ -359,10 +406,23 @@ export function createConnectHandler(deps: MitmDeps) {
             denyUninspectable(`larger than ${maxSwapBodyBytes} bytes`);
             return true;
           }
-          // Too large to hold: forward what we have and stream the rest unscanned.
-          logSwapOutcome('https', hostname, state.headOutcome, state.headOutcome.logText);
+          // A body the signature covers can't be streamed half-signed.
+          if (state.signing?.needsBody) {
+            refuseUnsignable(state.signing, 'body-too-large');
+            return true;
+          }
+          // Too large to hold: forward what we have and stream the rest unscanned
+          // (a signature that doesn't cover the body is still applied).
+          let outHead = state.headOutcome.output;
+          if (state.signing) {
+            const signed = signHead(outHead, state.signing);
+            if (signed === null) return true;
+            outHead = signed;
+          }
+          logSwapOutcome('https', hostname, { ...state.headOutcome, ...signedOutcome(state.signing) },
+            state.signing ? `${outHead}\n${state.headOutcome.basicText}` : state.headOutcome.logText);
           logBodyUnscanned('https', hostname, maxSwapBodyBytes);
-          sendUpstream(Buffer.concat([Buffer.from(state.headOutcome.output + '\r\n\r\n'), ...state.raw]));
+          sendUpstream(Buffer.concat([Buffer.from(outHead + '\r\n\r\n'), ...state.raw]));
           body = { mode: 'stream', remaining: state.remaining, decoder: state.decoder };
           if (complete) finishRequest();
           return complete;
@@ -385,11 +445,14 @@ export function createConnectHandler(deps: MitmDeps) {
       }, swapTarget);
       const outcome = state.headOutcome;
       const deniedSwaps = [...outcome.denied, ...(bodySwap?.result.denied ?? [])];
-      logSwapOutcome('https', hostname, {
+      const combined: SwapOutcome = {
         swaps: [...outcome.swaps, ...(bodySwap?.result.swaps ?? [])],
         denied: deniedSwaps,
         skipped: [...(outcome.skipped ?? []), ...(bodySwap?.result.skipped ?? [])],
-      }, bodySwap ? `${outcome.logText}\n${bodySwap.result.output}` : outcome.logText);
+      };
+      const bodyText = bodySwap ? `\n${bodySwap.result.output}` : '';
+      // A signed request is logged once it is signed, with the head that leaves.
+      if (!state.signing || deniedSwaps.length > 0) logSwapOutcome('https', hostname, combined, `${outcome.logText}${bodyText}`);
       if (deniedSwaps.length > 0) {
         denyForSwaps(deniedSwaps, []);
         return;
@@ -401,7 +464,7 @@ export function createConnectHandler(deps: MitmDeps) {
       let effective: Buffer | null = null;
       if (bodySwap && bodySwap.result.swaps.length > 0) {
         effective = bodySwap.body;
-      } else if (state.adapterReq) {
+      } else if (state.adapterReq || state.signing) {
         effective = decoded;
       }
 
@@ -452,7 +515,41 @@ export function createConnectHandler(deps: MitmDeps) {
           outBody = effective;
         }
       }
+      // Signed last, over the head that leaves (Content-Length included: some
+      // SDKs sign it) and the body after any swap.
+      if (state.signing) {
+        const signed = signHead(head, state.signing, decoded, effective ?? decoded);
+        if (signed === null) return;
+        head = signed;
+        logSwapOutcome('https', hostname, { ...combined, ...signedOutcome(state.signing) }, `${head}\n${outcome.basicText}${bodyText}`);
+      }
       sendUpstream(Buffer.concat([Buffer.from(head + '\r\n\r\n'), outBody]));
+    }
+
+    /**
+     * Verify the agent's signature over the head as received and re-sign
+     * `outHead` (the head after swaps). Returns the signed head, or null
+     * after refusing the request (`403 signature-mismatch`).
+     */
+    function signHead(outHead: string, plan: SigningPlan, receivedBody?: Buffer, outgoingBody?: Buffer): string | null {
+      // Swapped values can't hold CR/LF, so the head splits back into its lines.
+      const [requestLine, ...fieldLines] = outHead.split('\r\n');
+      const result = plan.finalize(
+        { request: plan.received, body: receivedBody },
+        { request: signableFromHead(requestLine, fieldLines), body: outgoingBody },
+      );
+      if (!result.ok) {
+        logSigningRefused('https', hostname, 'signature-mismatch', plan.info);
+        denyAndClose(403, 'signature-mismatch', signatureMismatchBody(plan.info, plan.scheme));
+        return null;
+      }
+      return [requestLine, ...result.headers.map(([name, value]) => `${name}:${value}`)].join('\r\n');
+    }
+
+    /** A signing request coatcheck can't re-sign: refused, nothing forwarded. */
+    function refuseUnsignable(plan: { info: SwapInfo }, reason: string) {
+      logSigningRefused('https', hostname, 'unsignable', plan.info, reason);
+      denyAndClose(403, 'unsignable', unsignableBody(plan.info, reason));
     }
 
     /** The request has been sent in full: honour an upgrade it asked for. */

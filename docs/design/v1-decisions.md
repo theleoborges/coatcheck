@@ -458,6 +458,14 @@ by the agent is deferred, and if it is ever added it may only narrow.
   cross-origin iframe logins fail with `404 selector-not-found`. The current residual risks are in
   `cdp-broker-login.md`.
 
+### Signing processors (roadmap items 23–26)
+
+Some credentials are never sent literally: the client signs each request with
+them (AWS SigV4, HMAC APIs). A signing secret mints one credential ticket that
+the agent's SDK uses as its key; coatcheck verifies the agent's signature and
+re-signs with the real key, under the same host binding. Design, decisions
+and the implementation plan: [signing-processors.md](signing-processors.md).
+
 ## 4. Configuration
 
 Use environment variables for scalar settings, plus one optional JSON policy

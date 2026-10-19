@@ -81,6 +81,8 @@ is a different principal. Property 2 is violated. Ways to close it:
 - Block the agent container from the credentials endpoint (`169.254.170.2`)
   with egress rules, if nothing in the agent needs cloud credentials.
 
+AWS-hosted agents should use a scoped task role for their own AWS access; coatcheck's SigV4 signing ([docs/design/signing-processors.md](design/signing-processors.md)) is for keys that can't be roles (agents off AWS, S3-compatible stores, a counterparty's IAM user key).
+
 provider-aws supports the second option: `COATCHECK_AWS_EXTERNAL_ID` is sent as
 `ExternalId` on `AssumeRole`, and coatcheck warns at startup when
 `COATCHECK_AWS_ROLE_ARN` is set without it. [docs/deploy/aws-ecs.md](deploy/aws-ecs.md)
@@ -156,7 +158,8 @@ the agent can also reach the internet directly.
 | Upstream TLS is verified | `tls.connect` with default `rejectUnauthorized` (`packages/core/src/mitm.ts`) |
 | CONNECT targets cannot reach a shell or the filesystem | Targets are parsed strictly (RFC 1123 DNS name or IP literal, port 1–65535; otherwise `400`) (`packages/core/src/connect-target.ts`). Certificates are generated in-process with WebCrypto; leaf keys stay in memory (LRU, 1000 entries) and only the CA is written to disk, when `COATCHECK_CA_DIR` is set (`packages/core/src/ca.ts`). |
 | Browser-service responses carry no raw CDP route | With CDP enabled, adapter hosts' JSON responses are rewritten: the Browserbase adapter points every Browserbase `ws(s)` URL (session `connectUrl`, debug endpoint `wsUrl` and `debuggerUrl`s) at the local CDP proxy and deletes `signingKey`, `seleniumRemoteUrl` and live-view URLs; it also strips `extensionId` from session-create request bodies, and refuses (`403 uninspectable-body`) any request body on that host it can't read as JSON — content-encoded, over `COATCHECK_MAX_SWAP_BODY_BYTES`, or not JSON, `multipart/form-data` uploads excepted — so the strip can't be bypassed by re-shaping the body (`packages/core/src/browser-adapters.ts`, `packages/core/src/mitm.ts`, `packages/core/src/json-response-rewriter.ts`; attack test in `packages/core/src/server.test.ts`) |
-| Logs carry no values | Swap logs record secret names, host, and ticket age only (`packages/core/src/swap-log.ts`) |
+| Signing keys never leave coatcheck | For a secret with `signing` (AWS SigV4), the mint issues one credential ticket and no ticket for the key field (`?field=secret_access_key` is `400`, and a broker login refuses to fill it into a page). The agent signs with the ticket; coatcheck verifies that signature over the request it received, then re-signs with the real key. The wire carries the access key id and a per-request signature, from which the key can't be recovered; signing tickets are never swapped as literals, and a request whose body must be hashed is refused past `COATCHECK_MAX_SWAP_BODY_BYTES` rather than streamed (`packages/core/src/signing/*`, `packages/core/src/mitm.ts`, `packages/core/src/forward.ts`; attack tests in `packages/core/src/signing.server.test.ts`) |
+| Logs carry no values | Swap logs record secret names, host, and ticket age only; signing logs never carry signatures, canonical requests, strings-to-sign or key material (`packages/core/src/swap-log.ts`) |
 | OAuth refresh failures don't log provider bodies | Only the HTTP status and the RFC 6749 `error` code (sanitised to `[A-Za-z0-9_.-]`, at most 64 chars) are logged (`oauthErrorCode`, `packages/core/src/vault-handler.ts`) |
 
 ## Known gaps
@@ -291,6 +294,16 @@ MITM speaks HTTP/1.1 only and advertises just `http/1.1` over ALPN. After a
 `101 Switching Protocols` response the tunnel becomes a raw pipe, so WebSocket
 frames are neither swapped nor inspected.
 
+### LOW: query-string auth and streaming signed payloads are not re-signed
+
+Signing processors (`docs/design/signing-processors.md`) re-sign SigV4 in the
+`Authorization` header only. A presigned URL carries the signing ticket in
+`X-Amz-Credential`; it leaves as a literal (`result=placement-skipped`) and
+the upstream rejects it. SigV4a and per-chunk signed streaming payloads
+(`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) are refused with `403 unsignable`.
+Both fail closed: no real key material is involved. Follow-ups in the
+roadmap's "After 1.0" list.
+
 ### Fixed: agent scripts could read values filled into the page
 
 Fixed by roadmap item 20 (broker-performed login): coatcheck no longer hands
@@ -343,6 +356,14 @@ vendor API key it holds directly).
   A broker controls where secrets go, not what an authorized call does.
 - **Upstream trust.** The upstream API and the remote browser vendor see real
   values.
+- **Signing authority and the access key id.** An agent holding a signing
+  ticket can have any request to the secret's allowed hosts signed: the same
+  authority as holding the credential for those hosts, as with a swap ticket.
+  Authorisation stays with the upstream (IAM policy). Verification of the
+  agent's signature is a correctness guard (coatcheck never signs a request it
+  parsed differently), not a security boundary. The real access key id reaches
+  the allowed host and could be echoed back; AWS treats it as an identifier,
+  not a secret.
 - **Cleartext fields.** Fields listed in a secret's `_cleartext` are returned
   to the agent as plain values by design; only list non-sensitive data (URLs,
   account ids).
