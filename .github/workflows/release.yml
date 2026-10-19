@@ -7,18 +7,33 @@ name: Release
 # (`npx npm@latest stage approve <id>`, or the Staged Packages tab on
 # npmjs.com), core first because the providers peer-depend on it.
 # Each package lists this workflow as its trusted publisher on npmjs.com.
+#
+# The same tag pushes the container image to ghcr.io/theleoborges/coatcheck,
+# built from the tagged source (linux/amd64 and linux/arm64, with provenance and
+# an SBOM). The image doesn't wait for the npm approval: it is built from the
+# same commit, not from the registry. Run the workflow by hand with a tag
+# (Actions > Release > Run workflow) to build the image for a tag that already
+# exists; that run skips npm.
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build the image for (e.g. v0.3.0)'
+        required: true
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   publish:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -61,3 +76,67 @@ jobs:
             npm stage publish -w "$pkg" --provenance --access public
           done
           echo "Staged. Approve on npmjs.com (Staged Packages) or: npx npm@latest stage list && npx npm@latest stage approve <id>"
+
+  image:
+    needs: publish
+    # On a manual run `publish` is skipped; the image is still built.
+    if: ${{ !cancelled() && (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/theleoborges/coatcheck
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
+
+      # The same check as `publish`, so a manual run can't tag an image with a
+      # version the packages don't have.
+      - name: Image tags
+        id: tags
+        run: |
+          case "$TAG" in v[0-9]*) ;; *) echo "$TAG is not a release tag" >&2; exit 1 ;; esac
+          V="${TAG#v}"
+          for p in core provider-env provider-aws; do
+            PV=$(node -p "require('./packages/$p/package.json').version")
+            if [ "$PV" != "$V" ]; then
+              echo "packages/$p is $PV but the tag is $V" >&2
+              exit 1
+            fi
+          done
+          TAGS="$IMAGE:$V"
+          # Prereleases (0.4.0-rc.1) get only their own tag.
+          case "$V" in
+            *-*) ;;
+            *) TAGS="$TAGS,$IMAGE:${V%.*},$IMAGE:latest" ;;
+          esac
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.tags.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.tags.outputs.revision }}
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.title=coatcheck
+            org.opencontainers.image.description=Credential broker sidecar for AI agents
