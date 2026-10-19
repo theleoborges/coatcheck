@@ -1,7 +1,10 @@
 # Client integration guide
 
 How code running next to coatcheck (an agent, its scripts, its tools) obtains
-tickets and uses them so the swap actually happens.
+tickets and uses them so the swap actually happens. The tools themselves don't
+change: anything that honours `HTTPS_PROXY` and trusts coatcheck's CA works,
+including SDKs that sign requests (AWS SigV4, HMAC APIs), which sign with the
+ticket and are re-signed by coatcheck (section 3, "Signing tickets").
 
 Assumed setup: coatcheck listening on `127.0.0.1:3128`, and the client
 environment has

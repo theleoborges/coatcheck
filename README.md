@@ -1,6 +1,8 @@
 # coatcheck
 
-A credential broker sidecar for AI agents. The agent never holds a real secret: it asks coatcheck for one by name, gets back a short-lived ticket, and coatcheck swaps the ticket for the real value on the wire, in outbound HTTPS requests and in browser (CDP) sessions.
+A credential broker sidecar for AI agents. The agent never holds a real secret: it asks coatcheck for one by name, gets back a short-lived ticket, and coatcheck swaps the ticket for the real value on the wire, in outbound HTTPS requests and in browser (CDP) sessions. Keys that are never sent but sign each request (AWS access keys, HMAC API secrets) work too: the agent's unmodified SDK signs with the ticket, and coatcheck re-signs with the real key.
+
+The agent doesn't change its tools for any of this. curl, git, the AWS CLI, an SDK, or a script the model just wrote all work as they are: they only need `HTTPS_PROXY` and coatcheck's CA.
 
 It works like a coat check. You hand over the coat and get a ticket. The ticket gets you the coat back at that counter. Anywhere else it is a worthless scrap of paper. If a prompt injection gets the agent to print, log, or exfiltrate its credentials, what leaks is a ticket that expires in minutes and only works against the hosts the secret is bound to.
 
@@ -31,8 +33,9 @@ It works like a coat check. You hand over the coat and get a ticket. The ticket 
 
 1. **Tickets.** The agent calls `GET /_vault/{name}`. coatcheck fetches the secret from its backend and returns a ticket: `cct_` plus 64 hex characters. Tickets live only in coatcheck's memory and expire after 15 minutes. Each one is bound to the secret's allowed hosts (see [Policy file](#policy-file)); a secret with no allowed hosts gets no ticket.
 2. **HTTPS substitution.** The agent container sets `HTTPS_PROXY` to coatcheck and trusts coatcheck's CA. When the agent opens a tunnel to a host a ticket could be used on, coatcheck intercepts it with a certificate it signs itself, replaces the ticket in the `Authorization` header (the URL, other headers and the body only for secrets that opt in; see [Swap placement](#swap-placement)), and re-encrypts to the real host with normal certificate verification. A ticket is only replaced when the tunnel's target is one of its allowed hosts; otherwise the request is refused with `403` and never forwarded. Tunnels to every other host pass through untouched. This works with unmodified tools (curl, git, Python `requests`, Node `fetch`) because they only need proxy support and a trusted CA.
-3. **Browser login.** With the CDP proxy enabled, coatcheck rewrites the browser service's connection URLs so the agent's Playwright client connects through coatcheck. The agent navigates to a login page and calls `POST /_vault/{name}/login`; coatcheck fills and submits the form itself, on a freshly reloaded page with the agent paused, so no credential ever enters the agent's reach. It also redacts any real value the page echoes back. See [Browser login (CDP)](#browser-login-cdp).
-4. **OAuth refresh.** `POST /_vault/{name}/refresh` runs the refresh-token exchange inside coatcheck, writes the new tokens back to the backend, and returns a ticket for the new access token.
+3. **Signed requests.** For a signing key, the ticket stands in for the key itself: the agent's SDK signs with it (`AWS_ACCESS_KEY_ID=$TOK AWS_SECRET_ACCESS_KEY=$TOK aws s3 cp …`). coatcheck checks the host binding, verifies the agent signed exactly the request it received, and re-signs it with the real key. The real key never leaves coatcheck in any form. See [Signed requests](#signed-requests).
+4. **Browser login.** With the CDP proxy enabled, coatcheck rewrites the browser service's connection URLs so the agent's Playwright client connects through coatcheck. The agent navigates to a login page and calls `POST /_vault/{name}/login`; coatcheck fills and submits the form itself, on a freshly reloaded page with the agent paused, so no credential ever enters the agent's reach. It also redacts any real value the page echoes back. See [Browser login (CDP)](#browser-login-cdp).
+5. **OAuth refresh.** `POST /_vault/{name}/refresh` runs the refresh-token exchange inside coatcheck, writes the new tokens back to the backend, and returns a ticket for the new access token.
 
 ## Quickstart
 
@@ -210,7 +213,22 @@ For **HMAC-signed APIs** (exchanges, in-house services), the operator writes the
 
 The secret is the HMAC key as a plain string, or `{"key_id": "…", "secret": "…"}` plus other fields (`passphrase` gets an ordinary ticket). The mint returns one ticket and the public recipe (`"signing": {"type": "hmac", …}`, never the key or `key_id`). The agent's client uses the ticket as both the API key (sent in `key_header`) and the HMAC secret; coatcheck verifies that HMAC, puts the real `key_id` in `key_header` (or removes it when the secret has none; the agent then sends `X-Coatcheck-Key: cct_…`), and writes the real signature into `signature_header`. `key_header` and `signature_header` can't be `Host`, a framing header or a hop-by-hop / `Proxy-*` header. Recipe keys: `hash` (`sha256` default, `sha384`, `sha512`, `sha1`), `encoding` (`hex` default, `base64`), `key_encoding` of the stored secret (`utf8` default; `base64` or `hex` need `"verify": false`, since an SDK can't decode a ticket), `message` parts concatenated in order (`method`, `path`, `query`, `path_query`, `body`, `header:<name>`, `literal:<text>`), `verify` (default `true`). A recipe that signs the body is buffered and refused past the cap, like SigV4. Not supported yet: a signature in the query string, nested hashes, coatcheck-generated timestamps.
 
-Design: [docs/design/signing-processors.md](docs/design/signing-processors.md).
+#### What signing covers
+
+It covers most of what agents actually need:
+
+- **AWS SigV4** in the `Authorization` header: every AWS service through the unmodified CLI or SDKs (S3 uploads of any size stream), and S3-compatible stores that issue static key pairs (Cloudflare R2, MinIO, Backblaze B2, DigitalOcean Spaces, Wasabi). This is for agents that run **off AWS** or hold a counterparty's key; on AWS, give the agent a scoped task role instead.
+- **HMAC-signed APIs** whose signature goes in a header over parts of the request: the common `timestamp + method + path + body` pattern of exchanges and in-house services, any hash in the SHA family, hex or base64. Extra fields such as an exchange passphrase get ordinary tickets.
+
+It doesn't cover, and fails closed on (the request is refused, or leaves with the worthless ticket and the upstream rejects it):
+
+- **Asymmetric signing:** Ed25519 and ECDSA/RSA keys (Binance Ed25519/RSA keys, Coinbase's CDP JWTs, Oracle OCI). The design keeps these out of scope.
+- **Signatures in the query string:** AWS presigned URLs, Binance-style `&signature=`.
+- **AWS SigV4a and per-chunk signed streaming payloads** (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`; the SDK defaults stream unsigned and work).
+- **Nested-hash HMAC schemes** (Kraken), and APIs that need coatcheck to generate the timestamp or nonce.
+- **Derived credentials** (JWT bearer assertions, OAuth client credentials, GitHub App installation tokens). These belong to the refresh endpoint, not request signing.
+
+The follow-ups are listed in the roadmap. Design: [docs/design/signing-processors.md](docs/design/signing-processors.md).
 
 ## Policy file
 
@@ -441,6 +459,7 @@ coatcheck is **pre-1.0**. The HTTP API, ticket format (`cct_…`), and configura
 - **Request bodies are substituted only on opt-in** (`swap_body`, see [Request bodies](#request-bodies)), and never when content-encoded. On the MITM path, request framing is strict: ambiguous framing (for example both `Content-Length` and `Transfer-Encoding`, or a coding other than `chunked`) gets `400` with `X-Coatcheck-Denied: bad-framing` and the tunnel is closed. A header section over 64 KiB gets `431`. Request trailers pass through unswapped.
 - **Interception follows the bindings, not the request.** In the default `bound` mode, a keep-alive tunnel opened to a host before any ticket for it existed (a host bound only by a secret's `_allowed_hosts`) stays a raw tunnel, so a ticket later sent down it reaches the upstream unswapped. Clients that pin certificates fail on intercepted hosts unless listed in `COATCHECK_PASSTHROUGH_HOSTS`. Intercepted tunnels speak HTTP/1.1 only (ALPN), and WebSocket frames after an upgrade are not inspected.
 - **Without `COATCHECK_API_TOKEN`, any local process can mint tickets.** That is the intended sidecar setup (loopback, shared network namespace), and coatcheck refuses to start off loopback without a token. The token is one shared secret: there are no per-client identities or scopes.
+- **Signing covers SigV4 and header HMAC recipes, not every scheme.** Asymmetric keys (Ed25519, ECDSA/RSA), query-string signatures (presigned URLs), SigV4a and nested-hash recipes fail closed; see [What signing covers](#what-signing-covers).
 - **Three built-in secret backends** (environment variables, a JSON file, AWS). HashiCorp Vault and Vercel are planned; anything else needs a custom provider module.
 - **Browserbase is the only built-in browser adapter.** Other services need a custom adapter (`BrowserAdapter` in `@coatcheck/core`).
 - **The site and the browser vendor see the password.** coatcheck performs the login against the real site, so the site necessarily receives the credential; this is the accepted upstream-trust boundary. Client-side-hashing and challenge logins work because the page's own JS sees the raw value.
@@ -448,14 +467,16 @@ coatcheck is **pre-1.0**. The HTTP API, ticket format (`cct_…`), and configura
 
 ## How this differs from superfly/tokenizer
 
-[superfly/tokenizer](https://github.com/superfly/tokenizer) solves the same core problem and is a well-designed piece of work. If its model fits your setup, use it. It is a stateless Go proxy. Secrets are sealed (encrypted to the proxy's key) and travel with the request, so the proxy keeps no secret store. Each secret carries its own `allowed_hosts`, so it cannot be redirected elsewhere. Its processors cover much more than literal substitution: HMAC signing, AWS SigV4, JWT, and OAuth client credentials. The trade-off is that clients must cooperate. They send plain HTTP to the proxy with a `Proxy-Tokenizer` header that carries the sealed secret.
+[superfly/tokenizer](https://github.com/superfly/tokenizer) solves the same core problem and is a well-designed piece of work. If its model fits your setup, use it. It is a stateless Go proxy. Secrets are sealed (encrypted to the proxy's key) and travel with the request, so the proxy keeps no secret store. Each secret carries its own `allowed_hosts`, so it cannot be redirected elsewhere. Its processors go beyond substitution: HMAC and AWS SigV4 signing, JWT, and OAuth client credentials.
 
-coatcheck makes different trade-offs:
+The two differ in where they put the work. tokenizer asks the client to cooperate: it sends plain HTTP to the proxy with a `Proxy-Tokenizer` header carrying the sealed secret, and for HMAC it passes the message to sign. coatcheck's rule is **don't make the agent change its tools**. An agent's tools are whatever it finds or writes in the moment, and every adaptation they need is one more thing a model gets wrong or a prompt injection can route around. So coatcheck adapts on the wire instead:
 
-- **Unmodified tools.** coatcheck is a standard `HTTPS_PROXY` with TLS interception, so curl, git, SDKs, and code an LLM writes on the fly work if they honour the proxy variable and trust the CA. No client changes are needed.
+- **Unmodified tools.** coatcheck is a standard `HTTPS_PROXY` with TLS interception. curl, git, the AWS CLI, SDKs, and code an LLM writes on the fly work if they honour the proxy variable and trust the CA.
+- **Signing without client changes.** The agent's unmodified SDK signs with the ticket as if it were the key. coatcheck verifies that signature over the request it received, then re-signs with the real key (AWS SigV4, operator-declared HMAC recipes). The client never sends coatcheck a message to sign, and the operator, not the agent, decides what is signed and where.
 - **Secrets by name from a store.** The agent asks for `github-token` and gets a ticket. It never holds secret material, sealed or otherwise. The cost is a stateful component and a backend dependency.
 - **Browser logins.** coatcheck logs an agent into a website through a remote browser by performing the fill and submit itself over CDP, with the agent's frames held and inbound redaction as a backstop. tokenizer does not cover browsers.
-- **Signing.** coatcheck re-signs AWS SigV4 and recipe-declared HMAC transparently: the agent's unmodified SDK (or its own client) signs with the ticket, coatcheck verifies that signature and re-signs with the real key. It has no JWT, OAuth client-credentials or GitHub App processors, where tokenizer is ahead. Both bind secrets to hosts; coatcheck's binding comes from an operator policy file and the stored secret rather than from the sealed secret.
+
+Where tokenizer is ahead: JWT and OAuth client-credentials processors, and a stateless deployment with no secret store to run. Both bind secrets to hosts; coatcheck's binding comes from an operator policy file and the stored secret rather than from the sealed secret.
 
 ## Development
 

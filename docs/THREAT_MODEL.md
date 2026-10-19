@@ -11,7 +11,9 @@ context.
 
 The agent receives a **ticket** (`cct_` + 64 hex chars) instead of a secret.
 coatcheck swaps the ticket for the real value on the wire, after TLS
-termination, on traffic it intercepts.
+termination, on traffic it intercepts. For signing keys (AWS SigV4, HMAC
+recipes) the agent signs with the ticket and coatcheck re-signs with the real
+key, which never leaves coatcheck in any form.
 
 ## Attacker
 

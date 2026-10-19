@@ -10,8 +10,9 @@ Public repo, Apache-2.0. Published to npm as `@coatcheck/*` (see "Positioning").
 
 ## Positioning (decided)
 
-- Closest prior art is [superfly/tokenizer](https://github.com/superfly/tokenizer) (stateless Go proxy, sealed secrets, per-secret `allowed_hosts`, HMAC/SigV4/JWT/OAuth processors, requires clients to send plain HTTP + `Proxy-Tokenizer` header). Don't compete on HTTP processors.
-- coatcheck's differentiators: **browser/CDP credential injection** (headline), transparent `HTTPS_PROXY` MITM that works with unmodified tools, and by-name lookup from a secret backend.
+- Closest prior art is [superfly/tokenizer](https://github.com/superfly/tokenizer) (stateless Go proxy, sealed secrets, per-secret `allowed_hosts`, HMAC/SigV4/JWT/OAuth processors, requires clients to send plain HTTP + `Proxy-Tokenizer` header, and for HMAC the message to sign).
+- The philosophy that separates them: **don't make the agent change its tools.** coatcheck adapts on the wire so curl, git, the AWS CLI, SDKs and model-written code work unmodified. Processors are in scope when they keep that property: SigV4 and HMAC re-signing (items 23–26) verify the unmodified client's signature made with the ticket and re-sign; nothing that needs client cooperation (a special header, a message passed to the proxy).
+- coatcheck's differentiators: **browser/CDP credential injection** (headline), transparent `HTTPS_PROXY` MITM that works with unmodified tools (including request signing), and by-name lookup from a secret backend.
 - v1 ships with CDP injection.
 - npm: unscoped `coatcheck` is taken → publish under `@coatcheck/*` (`core`, `provider-aws`, `provider-env`, later `provider-vault`, `provider-vercel`).
 
