@@ -6,6 +6,7 @@ Small agents that run behind coatcheck and never hold a real secret, not even th
 |---|---|---|---|
 | [`gh-triage/`](gh-triage) | `env` | HTTPS swap with unmodified tools (`gh`, `curl`) | `anthropic-api-key`, `github-token` |
 | [`browser-login/`](browser-login) | `aws` (SSM + Secrets Manager via an assumed role with `ExternalId`) | Broker-performed browser login over CDP, through Browserbase | `anthropic-api-key`, `the-internet-login`, shared `browserbase-api-key` |
+| [`ledger-reconcile/`](ledger-reconcile) | `env` | HMAC re-signing for an API with no SDK: the agent writes its client from the recipe in the mint response. Self-contained (the API is a container) | `anthropic-api-key`, `ledger` (signing) |
 | [`vercel-release-report/`](vercel-release-report) | `env` | A bearer swap (Vercel) and AWS SigV4 re-signing (unmodified `aws` CLI, IAM user key) from an agent off AWS | `anthropic-api-key`, `vercel-token`, `aws-reports` (signing) |
 
 All use the same harness ([`harness/src/agent.ts`](harness/src/agent.ts)): an agent loop on the Anthropic TypeScript SDK with one tool, Anthropic's `bash` tool. It mints a fresh `anthropic-api-key` ticket before every model call; coatcheck swaps it for the real key on the wire to `api.anthropic.com`. The system prompt ([`harness/system.md`](harness/system.md)) tells the model how tickets work.
@@ -24,6 +25,8 @@ browser-login also needs:
 
 - AWS CLI v2 and a profile (`AWS_PROFILE`) with a default region, allowed to create SSM parameters, a Secrets Manager secret and an IAM role. `run.sh` passes the profile's credentials to coatcheck with `aws configure export-credentials`.
 - A Browserbase account: an API key, and your project ID.
+
+ledger-reconcile needs nothing else: the API it talks to runs in the compose stack.
 
 vercel-release-report also needs:
 
@@ -105,3 +108,21 @@ It is safe to re-run (an existing key file is kept). To rotate, delete `.aws-rep
 What the run exercises: `aws sts get-caller-identity` (a form POST with no payload-hash header: the body is buffered, hashed and re-signed), `aws s3 cp` (the CLI sends `x-amz-content-sha256`, so the upload streams), `aws s3 ls`. Presigned URLs don't work: the ticket in `X-Amz-Credential` leaves as a literal and S3 answers `InvalidAccessKeyId`. Authorisation stays with IAM: a write outside `reports/` is IAM's `AccessDenied`.
 
 `smoke.sh` runs `sts get-caller-identity`, `s3 cp` of a generated file, `s3 ls`, and one Vercel `GET /v7/deployments` in the agent container, then the negative checks (another bucket: `403`; a presigned URL: `403 InvalidAccessKeyId`), and asserts coatcheck's `result=signed`, `result=denied`, `result=placement-skipped` and the `vercel-token` hit. It leaves one small object under `reports/smoke/`.
+
+## ledger-reconcile
+
+An agent reconciles accounts on an **HMAC-signed internal API**, modelled on the common exchange recipe (`base64(HMAC-SHA256(secret, timestamp + method + path_query + body))`, key id in `X-Ledger-Key`). It runs anywhere with Docker: the API is a container in the example (`service/`, `node:https` and `node:crypto`, no dependencies), with ~60 seeded transactions and planted anomalies (a duplicated transfer, a round payment to a new counterparty, a weekend payroll run, a balance that doesn't reconcile).
+
+```bash
+cd ledger-reconcile
+./smoke.sh                                 # no model: sign one GET, the negative checks, assert result=signed signing=hmac
+ANTHROPIC_API_KEY=… ./run.sh               # reconcile; writes out/reconciliation.md
+ANTHROPIC_API_KEY=… ./run.sh attack.md     # red team: get the HMAC secret or move money
+```
+
+There is no SDK: the agent writes its own client from the recipe in the mint response (`"signing": {"type": "hmac", …}`), signing with the ticket as the secret and sending the ticket in `X-Ledger-Key`. coatcheck verifies that signature, puts the real key id in `X-Ledger-Key` and writes the real signature. See [Signed requests](../../README.md#signed-requests).
+
+- coatcheck holds the **auditor** key only (read-only). The **operator** key, which may `POST /v1/transfers`, is given to the service alone, so no agent can obtain write authority through coatcheck.
+- The ledger is on the `egress` network only, not on the agent's: the agent's only route to it is the proxy.
+- `run.sh` and `smoke.sh` generate fresh keys per run and a self-signed certificate for `ledger` in `certs/` (git-ignored); coatcheck trusts it with `NODE_EXTRA_CA_CERTS`.
+- The ±30 s timestamp window is the service's control: coatcheck re-signs whatever timestamp the agent sets, and a replayed request is refused by the ledger (`401 stale-timestamp`).

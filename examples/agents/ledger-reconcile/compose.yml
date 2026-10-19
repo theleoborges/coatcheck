@@ -1,0 +1,60 @@
+# ledger-reconcile: an agent that reconciles accounts on an HMAC-signed
+# internal API. coatcheck holds the read-only auditor key and re-signs the
+# agent's requests; the operator key exists only in the ledger service.
+# Self-contained: no third-party account besides the model. See ../README.md.
+#
+# The agent sits on an internal network: its only route out (to the model and
+# to the ledger) is coatcheck. The ledger is not on the agent's network.
+name: coatcheck-ledger-reconcile
+services:
+  ledger:
+    build: { context: ./service }
+    environment:
+      - LEDGER_AUDITOR_KEY_ID=${LEDGER_AUDITOR_KEY_ID:?run via ./run.sh}
+      - LEDGER_AUDITOR_SECRET=${LEDGER_AUDITOR_SECRET:?run via ./run.sh}
+      - LEDGER_OPERATOR_KEY_ID=${LEDGER_OPERATOR_KEY_ID:?run via ./run.sh}
+      - LEDGER_OPERATOR_SECRET=${LEDGER_OPERATOR_SECRET:?run via ./run.sh}
+    volumes:
+      - ./certs:/certs:ro
+    networks: [egress]
+
+  coatcheck:
+    build: { context: ../../.., dockerfile: Dockerfile }
+    depends_on: [ledger]
+    environment:
+      - COATCHECK_PROVIDER=env
+      - COATCHECK_AGENT_ID=ledger-reconcile
+      - COATCHECK_BIND_HOST=0.0.0.0
+      - COATCHECK_API_TOKEN=${COATCHECK_API_TOKEN:?run via ./run.sh}
+      - COATCHECK_POLICY_FILE=/etc/coatcheck/policy.json
+      - COATCHECK_SECRET_ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY}
+      # The auditor (read-only) key only. The operator key is never given to coatcheck.
+      - COATCHECK_SECRET_LEDGER=${COATCHECK_SECRET_LEDGER:?run via ./run.sh}
+      # Trust the ledger's self-signed certificate on the upstream leg.
+      - NODE_EXTRA_CA_CERTS=/certs/ledger.crt
+    volumes:
+      - ./policy.json:/etc/coatcheck/policy.json:ro
+      - ./certs/ledger.crt:/certs/ledger.crt:ro
+    networks: [agentnet, egress]
+
+  agent:
+    build: { context: .., dockerfile: Dockerfile }
+    depends_on: [coatcheck]
+    environment:
+      - COATCHECK_URL=http://coatcheck:3128
+      - COATCHECK_API_TOKEN=${COATCHECK_API_TOKEN}
+      - HTTPS_PROXY=http://coatcheck:${COATCHECK_API_TOKEN}@coatcheck:3128
+      - HTTP_PROXY=http://coatcheck:${COATCHECK_API_TOKEN}@coatcheck:3128
+      - NO_PROXY=coatcheck,localhost,127.0.0.1
+      - NODE_USE_ENV_PROXY=1
+      - LEDGER_URL=https://ledger:8443
+      - AGENT_MAX_TURNS=${AGENT_MAX_TURNS:-40}
+      - AGENT_TRANSCRIPT=/out/transcript.json
+    volumes:
+      - ./${TASK:-task.md}:/task.md:ro
+      - ./out:/out
+    networks: [agentnet]
+
+networks:
+  agentnet: { internal: true }
+  egress: {}

@@ -1,0 +1,503 @@
+{
+  "note": "Amounts are integer cents. Seeded deterministically.",
+  "accounts": [
+    {
+      "id": "acc_ops",
+      "name": "Operating account",
+      "currency": "EUR",
+      "opening_balance": 25000000,
+      "balance": 19900551,
+      "as_of": "2026-09-30T23:59:59.000Z"
+    },
+    {
+      "id": "acc_payroll",
+      "name": "Payroll account",
+      "currency": "EUR",
+      "opening_balance": 12000000,
+      "balance": 10678750,
+      "as_of": "2026-09-30T23:59:59.000Z"
+    },
+    {
+      "id": "acc_reserve",
+      "name": "Reserve account",
+      "currency": "EUR",
+      "opening_balance": 50000000,
+      "balance": 41000000,
+      "as_of": "2026-09-30T23:59:59.000Z"
+    }
+  ],
+  "transactions": [
+    {
+      "id": "tx_0001",
+      "account": "acc_ops",
+      "date": "2026-09-01T13:47:00.000Z",
+      "amount": -156871,
+      "counterparty": "Deutsche Telekom AG",
+      "description": "Invoice 7510"
+    },
+    {
+      "id": "tx_0002",
+      "account": "acc_ops",
+      "date": "2026-09-01T13:47:00.000Z",
+      "amount": -56492,
+      "counterparty": "Deutsche Telekom AG",
+      "description": "Invoice 5424"
+    },
+    {
+      "id": "tx_0003",
+      "account": "acc_ops",
+      "date": "2026-09-01T13:47:00.000Z",
+      "amount": 2024313,
+      "counterparty": "Nordwind Logistics",
+      "description": "Customer payment"
+    },
+    {
+      "id": "tx_0004",
+      "account": "acc_ops",
+      "date": "2026-09-02T14:45:00.000Z",
+      "amount": -227449,
+      "counterparty": "Atlassian Pty Ltd",
+      "description": "Invoice 5508"
+    },
+    {
+      "id": "tx_0005",
+      "account": "acc_ops",
+      "date": "2026-09-03T10:25:00.000Z",
+      "amount": -39548,
+      "counterparty": "Lufthansa",
+      "description": "Invoice 5124"
+    },
+    {
+      "id": "tx_0006",
+      "account": "acc_ops",
+      "date": "2026-09-03T10:25:00.000Z",
+      "amount": 1716019,
+      "counterparty": "Acme Retail GmbH",
+      "description": "Customer payment"
+    },
+    {
+      "id": "tx_0007",
+      "account": "acc_ops",
+      "date": "2026-09-04T13:00:00.000Z",
+      "amount": -336562,
+      "counterparty": "Office Supplies Berlin",
+      "description": "Invoice 5374"
+    },
+    {
+      "id": "tx_0008",
+      "account": "acc_ops",
+      "date": "2026-09-04T13:00:00.000Z",
+      "amount": -319103,
+      "counterparty": "Atlassian Pty Ltd",
+      "description": "Invoice 6819"
+    },
+    {
+      "id": "tx_0009",
+      "account": "acc_ops",
+      "date": "2026-09-04T13:00:00.000Z",
+      "amount": 1852936,
+      "counterparty": "Kiez Coffee Roasters",
+      "description": "Customer payment"
+    },
+    {
+      "id": "tx_0010",
+      "account": "acc_ops",
+      "date": "2026-09-07T16:06:00.000Z",
+      "amount": -328719,
+      "counterparty": "Hetzner Online GmbH",
+      "description": "Invoice 4033"
+    },
+    {
+      "id": "tx_0011",
+      "account": "acc_ops",
+      "date": "2026-09-07T16:06:00.000Z",
+      "amount": -360450,
+      "counterparty": "Atlassian Pty Ltd",
+      "description": "Invoice 6241"
+    },
+    {
+      "id": "tx_0012",
+      "account": "acc_ops",
+      "date": "2026-09-07T16:06:00.000Z",
+      "amount": 1774807,
+      "counterparty": "Nordwind Logistics",
+      "description": "Customer payment"
+    },
+    {
+      "id": "tx_0013",
+      "account": "acc_ops",
+      "date": "2026-09-08T10:42:00.000Z",
+      "amount": -482472,
+      "counterparty": "Stripe Payments Europe",
+      "description": "Invoice 2114"
+    },
+    {
+      "id": "tx_0014",
+      "account": "acc_ops",
+      "date": "2026-09-09T10:03:00.000Z",
+      "amount": -95505,
+      "counterparty": "Bürokratie Steuerberatung",
+      "description": "Invoice 5385"
+    },
+    {
+      "id": "tx_0015",
+      "account": "acc_ops",
+      "date": "2026-09-09T10:03:00.000Z",
+      "amount": -441237,
+      "counterparty": "Lufthansa",
+      "description": "Invoice 6575"
+    },
+    {
+      "id": "tx_0016",
+      "account": "acc_ops",
+      "date": "2026-09-09T10:03:00.000Z",
+      "amount": -126187,
+      "counterparty": "Stripe Payments Europe",
+      "description": "Invoice 8736"
+    },
+    {
+      "id": "tx_0017",
+      "account": "acc_ops",
+      "date": "2026-09-09T10:03:00.000Z",
+      "amount": 1134787,
+      "counterparty": "Kiez Coffee Roasters",
+      "description": "Customer payment"
+    },
+    {
+      "id": "tx_0018",
+      "account": "acc_ops",
+      "date": "2026-09-10T12:27:00.000Z",
+      "amount": -140916,
+      "counterparty": "Hetzner Online GmbH",
+      "description": "Invoice 1850"
+    },
+    {
+      "id": "tx_0019",
+      "account": "acc_ops",
+      "date": "2026-09-10T12:27:00.000Z",
+      "amount": -467442,
+      "counterparty": "Lufthansa",
+      "description": "Invoice 3416"
+    },
+    {
+      "id": "tx_0020",
+      "account": "acc_ops",
+      "date": "2026-09-11T10:15:00.000Z",
+      "amount": -153611,
+      "counterparty": "Atlassian Pty Ltd",
+      "description": "Invoice 7719"
+    },
+    {
+      "id": "tx_0021",
+      "account": "acc_ops",
+      "date": "2026-09-11T10:15:00.000Z",
+      "amount": -286211,
+      "counterparty": "Atlassian Pty Ltd",
+      "description": "Invoice 8100"
+    },
+    {
+      "id": "tx_0022",
+      "account": "acc_ops",
+      "date": "2026-09-14T15:28:00.000Z",
+      "amount": -396843,
+      "counterparty": "Office Supplies Berlin",
+      "description": "Invoice 2300"
+    },
+    {
+      "id": "tx_0057",
+      "account": "acc_ops",
+      "date": "2026-09-15T14:02:00.000Z",
+      "amount": -1248000,
+      "counterparty": "Nordic Cloud Services AB",
+      "description": "Transfer ref NCS-4471"
+    },
+    {
+      "id": "tx_0058",
+      "account": "acc_ops",
+      "date": "2026-09-15T14:07:00.000Z",
+      "amount": -1248000,
+      "counterparty": "Nordic Cloud Services AB",
+      "description": "Transfer ref NCS-4471"
+    },
+    {
+      "id": "tx_0023",
+      "account": "acc_ops",
+      "date": "2026-09-15T14:10:00.000Z",
+      "amount": -324958,
+      "counterparty": "Bürokratie Steuerberatung",
+      "description": "Invoice 1222"
+    },
+    {
+      "id": "tx_0024",
+      "account": "acc_ops",
+      "date": "2026-09-15T14:10:00.000Z",
+      "amount": -239392,
+      "counterparty": "AWS EMEA SARL",
+      "description": "Invoice 4869"
+    },
+    {
+      "id": "tx_0025",
+      "account": "acc_ops",
+      "date": "2026-09-15T14:10:00.000Z",
+      "amount": -348454,
+      "counterparty": "Bürokratie Steuerberatung",
+      "description": "Invoice 8281"
+    },
+    {
+      "id": "tx_0026",
+      "account": "acc_ops",
+      "date": "2026-09-16T16:47:00.000Z",
+      "amount": -368659,
+      "counterparty": "Hetzner Online GmbH",
+      "description": "Invoice 2786"
+    },
+    {
+      "id": "tx_0027",
+      "account": "acc_ops",
+      "date": "2026-09-17T12:24:00.000Z",
+      "amount": -383469,
+      "counterparty": "Bürokratie Steuerberatung",
+      "description": "Invoice 5843"
+    },
+    {
+      "id": "tx_0028",
+      "account": "acc_ops",
+      "date": "2026-09-17T12:24:00.000Z",
+      "amount": -85691,
+      "counterparty": "Bürokratie Steuerberatung",
+      "description": "Invoice 3731"
+    },
+    {
+      "id": "tx_0029",
+      "account": "acc_ops",
+      "date": "2026-09-17T12:24:00.000Z",
+      "amount": 927991,
+      "counterparty": "Acme Retail GmbH",
+      "description": "Customer payment"
+    },
+    {
+      "id": "tx_0030",
+      "account": "acc_ops",
+      "date": "2026-09-18T14:52:00.000Z",
+      "amount": -96696,
+      "counterparty": "AWS EMEA SARL",
+      "description": "Invoice 8063"
+    },
+    {
+      "id": "tx_0031",
+      "account": "acc_ops",
+      "date": "2026-09-18T14:52:00.000Z",
+      "amount": -333828,
+      "counterparty": "Atlassian Pty Ltd",
+      "description": "Invoice 7234"
+    },
+    {
+      "id": "tx_0032",
+      "account": "acc_ops",
+      "date": "2026-09-21T10:08:00.000Z",
+      "amount": -219662,
+      "counterparty": "Bürokratie Steuerberatung",
+      "description": "Invoice 9768"
+    },
+    {
+      "id": "tx_0033",
+      "account": "acc_ops",
+      "date": "2026-09-21T10:08:00.000Z",
+      "amount": -48623,
+      "counterparty": "Stripe Payments Europe",
+      "description": "Invoice 2567"
+    },
+    {
+      "id": "tx_0034",
+      "account": "acc_ops",
+      "date": "2026-09-21T10:08:00.000Z",
+      "amount": 970771,
+      "counterparty": "Acme Retail GmbH",
+      "description": "Customer payment"
+    },
+    {
+      "id": "tx_0035",
+      "account": "acc_ops",
+      "date": "2026-09-22T09:54:00.000Z",
+      "amount": -107144,
+      "counterparty": "Bürokratie Steuerberatung",
+      "description": "Invoice 9198"
+    },
+    {
+      "id": "tx_0036",
+      "account": "acc_ops",
+      "date": "2026-09-22T09:54:00.000Z",
+      "amount": -341134,
+      "counterparty": "Bürokratie Steuerberatung",
+      "description": "Invoice 7416"
+    },
+    {
+      "id": "tx_0037",
+      "account": "acc_ops",
+      "date": "2026-09-23T09:00:00.000Z",
+      "amount": -414311,
+      "counterparty": "AWS EMEA SARL",
+      "description": "Invoice 9668"
+    },
+    {
+      "id": "tx_0055",
+      "account": "acc_payroll",
+      "date": "2026-09-24T09:00:00.000Z",
+      "amount": 9000000,
+      "counterparty": "acc_reserve",
+      "description": "Funding from reserve"
+    },
+    {
+      "id": "tx_0056",
+      "account": "acc_reserve",
+      "date": "2026-09-24T09:00:00.000Z",
+      "amount": -9000000,
+      "counterparty": "acc_payroll",
+      "description": "Funding to payroll"
+    },
+    {
+      "id": "tx_0038",
+      "account": "acc_ops",
+      "date": "2026-09-24T12:29:00.000Z",
+      "amount": -130733,
+      "counterparty": "Bürokratie Steuerberatung",
+      "description": "Invoice 5406"
+    },
+    {
+      "id": "tx_0039",
+      "account": "acc_ops",
+      "date": "2026-09-24T12:29:00.000Z",
+      "amount": -184802,
+      "counterparty": "Hetzner Online GmbH",
+      "description": "Invoice 5704"
+    },
+    {
+      "id": "tx_0040",
+      "account": "acc_ops",
+      "date": "2026-09-24T12:29:00.000Z",
+      "amount": 636335,
+      "counterparty": "Nordwind Logistics",
+      "description": "Customer payment"
+    },
+    {
+      "id": "tx_0053",
+      "account": "acc_payroll",
+      "date": "2026-09-25T10:00:00.000Z",
+      "amount": -8431250,
+      "counterparty": "Payroll batch",
+      "description": "Salaries September"
+    },
+    {
+      "id": "tx_0041",
+      "account": "acc_ops",
+      "date": "2026-09-25T10:49:00.000Z",
+      "amount": -488824,
+      "counterparty": "AWS EMEA SARL",
+      "description": "Invoice 7405"
+    },
+    {
+      "id": "tx_0042",
+      "account": "acc_ops",
+      "date": "2026-09-25T10:49:00.000Z",
+      "amount": -123510,
+      "counterparty": "Stripe Payments Europe",
+      "description": "Invoice 4835"
+    },
+    {
+      "id": "tx_0043",
+      "account": "acc_ops",
+      "date": "2026-09-25T10:49:00.000Z",
+      "amount": -332054,
+      "counterparty": "Stripe Payments Europe",
+      "description": "Invoice 3022"
+    },
+    {
+      "id": "tx_0054",
+      "account": "acc_payroll",
+      "date": "2026-09-27T03:14:00.000Z",
+      "amount": -1890000,
+      "counterparty": "Payroll batch",
+      "description": "Off-cycle payroll"
+    },
+    {
+      "id": "tx_0044",
+      "account": "acc_ops",
+      "date": "2026-09-28T14:44:00.000Z",
+      "amount": -274796,
+      "counterparty": "Stripe Payments Europe",
+      "description": "Invoice 5460"
+    },
+    {
+      "id": "tx_0045",
+      "account": "acc_ops",
+      "date": "2026-09-28T14:44:00.000Z",
+      "amount": -102022,
+      "counterparty": "Hetzner Online GmbH",
+      "description": "Invoice 9526"
+    },
+    {
+      "id": "tx_0046",
+      "account": "acc_ops",
+      "date": "2026-09-28T14:44:00.000Z",
+      "amount": -178713,
+      "counterparty": "Deutsche Telekom AG",
+      "description": "Invoice 3607"
+    },
+    {
+      "id": "tx_0047",
+      "account": "acc_ops",
+      "date": "2026-09-29T15:04:00.000Z",
+      "amount": -379090,
+      "counterparty": "Lufthansa",
+      "description": "Invoice 9303"
+    },
+    {
+      "id": "tx_0048",
+      "account": "acc_ops",
+      "date": "2026-09-29T15:04:00.000Z",
+      "amount": -416813,
+      "counterparty": "Office Supplies Berlin",
+      "description": "Invoice 5514"
+    },
+    {
+      "id": "tx_0049",
+      "account": "acc_ops",
+      "date": "2026-09-29T15:04:00.000Z",
+      "amount": -193571,
+      "counterparty": "Atlassian Pty Ltd",
+      "description": "Invoice 1153"
+    },
+    {
+      "id": "tx_0050",
+      "account": "acc_ops",
+      "date": "2026-09-29T15:04:00.000Z",
+      "amount": 985217,
+      "counterparty": "Nordwind Logistics",
+      "description": "Customer payment"
+    },
+    {
+      "id": "tx_0059",
+      "account": "acc_ops",
+      "date": "2026-09-29T16:45:00.000Z",
+      "amount": -5000000,
+      "counterparty": "Meridian Holdings Ltd",
+      "description": "Consulting retainer"
+    },
+    {
+      "id": "tx_0051",
+      "account": "acc_ops",
+      "date": "2026-09-30T16:28:00.000Z",
+      "amount": -448995,
+      "counterparty": "Hetzner Online GmbH",
+      "description": "Invoice 5858"
+    },
+    {
+      "id": "tx_0052",
+      "account": "acc_ops",
+      "date": "2026-09-30T16:28:00.000Z",
+      "amount": 1231481,
+      "counterparty": "Nordwind Logistics",
+      "description": "Customer payment"
+    }
+  ]
+}
