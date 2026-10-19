@@ -245,7 +245,7 @@ function mintSigning(res: http.ServerResponse, deps: VaultDeps, label: string, p
   if (!sendBindingError(res, binding)) return;
   const spec = binding.signing!;
   const fields = parsed.kind === 'multi' ? parsed.fields : null;
-  const credential = signingCredentialFrom(spec, fields);
+  const credential = signingCredentialFrom(spec, parsed);
   if (typeof credential === 'string') {
     console.warn(`[issue] secret=${label} result=refused (invalid ${spec.type} secret)`);
     return send(res, 500, { error: `Secret '${label}' is not a valid ${spec.type} signing secret: ${credential}` });

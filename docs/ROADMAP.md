@@ -11,8 +11,8 @@ Security fixes include a test that performs the attack and shows it is
 blocked. The decisions behind this list, and the alternatives that were
 rejected, are in `docs/design/v1-decisions.md`.
 
-Status: items 1–20, 22 and 23 are done. What remains is item 21, items
-24–26 and the "After 1.0" list.
+Status: items 1–20, 22, 23 and 25 are done. What remains is item 21, items
+24 and 26, and the "After 1.0" list.
 
 ## Phase 1: shell injection (HIGH)
 
@@ -322,6 +322,18 @@ Design and implementation plan: `docs/design/signing-processors.md`.
     vectors, a property check against `@smithy/signature-v4`, and the
     integration cases in `signing.server.test.ts` (real `@aws-sdk/client-s3`
     through the proxy).
+
+25. **[Done]** **HMAC recipes** (design §5). `signing` (policy) or `_signing`
+    (in-band) may be an HMAC recipe: `hash`, `key_header`, `signature_header`,
+    `encoding`, `key_encoding`, `message` parts (`method`, `path`, `query`,
+    `path_query`, `body`, `header:<name>`, `literal:<text>`), `verify`. Strict
+    schema: a malformed recipe fails startup (policy) or minting (`500`,
+    in-band). The mint returns the public recipe; the agent sends the ticket in
+    `key_header` and signs with it; coatcheck verifies (unless `verify:
+    false`), puts the real `key_id` in `key_header` (or strips it) and writes
+    the real signature. `?field=secret` is `400`. Tests: `signing/hmac.test.ts`
+    (every malformed shape, each part, each hash and encoding against
+    `node:crypto`) and integration test 12.
 
 ## After 1.0
 

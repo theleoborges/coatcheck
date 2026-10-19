@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, beforeAll } from 'vitest';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import tls from 'node:tls';
 import { SignatureV4 } from '@smithy/signature-v4';
 import { HttpRequest } from '@smithy/protocol-http';
@@ -15,6 +15,8 @@ import {
   amzDateOf, canonicalRequest, parseSigV4Authorization, payloadMode, stringToSign, uriEncode, type SigV4Authorization, type SigV4Credential,
 } from './signing/sigv4.js';
 import type { SignableRequest } from './signing/request.js';
+import { hmacMessage, hmacSignature, type HmacRecipe } from './signing/hmac.js';
+import { parseSigningSpec } from './signing/spec.js';
 import type { CertAuthority } from './ca.js';
 import type { TokenStore } from './token-store.js';
 
@@ -361,6 +363,85 @@ describe('signing: AWS SigV4 through the proxy', () => {
     expect(echo.headers['content-length']).toBe(String(Buffer.byteLength(echo.body!)));
     const auth = await expectSignedWith(echo, REAL);
     expect(auth.signedHeaders).toContain('content-length');
+  });
+
+  it('12. HMAC end to end: verified, key header replaced, re-signed; tampering, verify:false, X-Coatcheck-Key and a signed key header', async () => {
+    const SECRET = 'ledger-auditor-real-secret';
+    const LEDGER = { type: 'hmac', hash: 'sha256', key_header: 'X-Ledger-Key', signature_header: 'X-Ledger-Signature', encoding: 'base64', message: ['header:X-Ledger-Timestamp', 'method', 'path_query', 'body'] };
+    // The service: verifies with node:crypto over its own reading of the request.
+    const respond: Responder = (req, body, res) => {
+      const msgKeyHeader = req.headers['x-signs-key'] === '1' ? String(req.headers['x-ledger-key'] ?? '') + '|' : '';
+      const expected = createHmac('sha256', SECRET)
+        .update(Buffer.concat([Buffer.from(`${msgKeyHeader}${String(req.headers['x-ledger-timestamp'] ?? '')}${req.method}${req.url}`), body]))
+        .digest('base64');
+      res.statusCode = req.headers['x-ledger-signature'] === expected ? 200 : 401;
+      res.end();
+    };
+    const { logs, upstream, tokenStore, port } = await setup({ respond, maxSwapBodyBytes: 1024 });
+    const ticketFor = (signing: unknown, keyId?: string) => {
+      const recipe = parseSigningSpec(signing) as HmacRecipe;
+      const { id } = tokenStore.issue('ledger', '', { allowedHosts: hosts('127.0.0.1'), signing: { scheme: 'hmac', recipe, key: Buffer.from(SECRET), ...(keyId ? { keyId } : {}) } });
+      seen.tickets.push(id);
+      return { id, recipe };
+    };
+    const host = `127.0.0.1:${upstream.port}`;
+    /** The agent's own client: HMAC with the ticket as the secret, the ticket in the key header. */
+    const agentRequest = (t: { id: string; recipe: HmacRecipe }, opts: { method?: string; path?: string; body?: string; extra?: string; signWith?: string; tamperPath?: string } = {}) => {
+      const method = opts.method ?? 'GET';
+      const path = opts.path ?? '/v1/accounts';
+      const body = Buffer.from(opts.body ?? '');
+      const ts = '1760000000';
+      const keyHeader = t.recipe.written.keyHeader;
+      const req: SignableRequest = {
+        method, target: path,
+        headers: [['Host', ` ${host}`], [keyHeader, ` ${t.id}`], ['X-Ledger-Timestamp', ` ${ts}`], ...(body.length ? [['Content-Length', ` ${body.length}`] as [string, string]] : [])],
+      };
+      const sig = hmacSignature(t.recipe, opts.signWith ?? t.id, hmacMessage(t.recipe, { request: req, body }));
+      const head = [`${method} ${opts.tamperPath ?? path} HTTP/1.1`, ...req.headers.map(([n, v]) => `${n}:${v}`), `${t.recipe.written.signatureHeader}: ${sig}`, ...(opts.extra ? [opts.extra] : [])].join('\r\n');
+      return Buffer.concat([Buffer.from(`${head}\r\n\r\n`), body]);
+    };
+    const roundTrip = async (raw: Buffer) => {
+      const t = await tunnel(port, upstream.port);
+      t.write(raw);
+      const [res] = await readResponses(t, 1);
+      return res;
+    };
+
+    const ledger = ticketFor(LEDGER, 'auditor-1');
+    expect((await roundTrip(agentRequest(ledger))).head).toMatch(/^HTTP\/1.1 200/);
+    expect((await roundTrip(agentRequest(ledger, { method: 'POST', path: '/v1/transfers?dry_run=1', body: '{"amount":100}' }))).head).toMatch(/^HTTP\/1.1 200/);
+    expect(upstream.received.map(r => r.headers['x-ledger-key'])).toEqual(['auditor-1', 'auditor-1']);
+    expect(logs.filter(l => l.includes('result=signed signing=hmac secrets=ledger'))).toHaveLength(2);
+
+    // A signature over a different message (the path changed after signing): refused, not forwarded.
+    const mismatch = await roundTrip(agentRequest(ledger, { tamperPath: '/v1/accounts/acc_ops' }));
+    expect(mismatch.head).toContain('X-Coatcheck-Denied: signature-mismatch');
+    // A signed body past the cap: refused, not forwarded.
+    const big = await roundTrip(agentRequest(ledger, { method: 'POST', path: '/v1/transfers', body: 'x'.repeat(4096) }));
+    expect(JSON.parse(big.body)).toEqual(expect.objectContaining({ reason: 'unsignable', detail: 'body-too-large' }));
+    expect(upstream.received).toHaveLength(2);
+
+    // verify: false signs whatever the agent sent.
+    const unverified = ticketFor({ ...LEDGER, verify: false }, 'auditor-1');
+    expect((await roundTrip(agentRequest(unverified, { signWith: 'not-the-ticket' }))).head).toMatch(/^HTTP\/1.1 200/);
+
+    // No key_id: the agent sends the ticket in X-Coatcheck-Key; coatcheck strips it.
+    const keyless = ticketFor({ ...LEDGER, key_header: 'X-Coatcheck-Key' });
+    expect((await roundTrip(agentRequest(keyless))).head).toMatch(/^HTTP\/1.1 200/);
+    const stripped = upstream.received[upstream.received.length - 1];
+    expect(stripped.headers['x-coatcheck-key']).toBeUndefined();
+    expect(stripped.headers['x-ledger-key']).toBeUndefined();
+
+    // A recipe that signs the key header: verified with the ticket there, signed with key_id there.
+    const signsKey = ticketFor({ ...LEDGER, message: ['header:X-Ledger-Key', 'literal:|', 'header:X-Ledger-Timestamp', 'method', 'path_query', 'body'] }, 'auditor-1');
+    expect((await roundTrip(agentRequest(signsKey, { extra: 'X-Signs-Key: 1' }))).head).toMatch(/^HTTP\/1.1 200/);
+    expect(upstream.received[upstream.received.length - 1].headers['x-ledger-key']).toBe('auditor-1');
+
+    // The HMAC ticket as a bearer literal: forwarded as is, the service refuses it.
+    const literal = await roundTrip(Buffer.from(`GET /v1/accounts HTTP/1.1\r\nHost: ${host}\r\nAuthorization: Bearer ${ledger.id}\r\n\r\n`));
+    expect(literal.head).toMatch(/^HTTP\/1.1 401/);
+    expect(logs.some(l => l.includes('result=signing-skipped secrets=ledger'))).toBe(true);
+    expect(logs.join('\n')).not.toContain(SECRET);
   });
 
   it('13. bound mode MITMs the signing host on the live ticket before the policy names it', async () => {

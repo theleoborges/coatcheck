@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { parseHostPattern, type HostPattern } from './host-matcher.js';
 import { allowedHostsJson, parseSecretValue, resolveBinding, userFields } from './secret-binding.js';
+import { parseSigningSpec, type SigningSpec } from './signing/spec.js';
 
 const hosts = (...entries: string[]) => entries.map(e => parseHostPattern(e) as HostPattern);
 
@@ -139,10 +140,23 @@ describe('signing: _signing and policy signing', () => {
     expect(resolveBinding('aws', h, {}, false, {})).not.toHaveProperty('signing');
   });
 
+  const hmac = parseSigningSpec({ type: 'hmac', key_header: 'X-Key', signature_header: 'X-Sig', message: ['method'] }) as SigningSpec;
+  const hmac2 = parseSigningSpec({ type: 'hmac', hash: 'sha512', key_header: 'X-Key', signature_header: 'X-Sig', message: ['body'] }) as SigningSpec;
+
   it('fails with 500 when the two sources disagree on the type', () => {
-    // Only one type exists in this build; a second (hmac) is item 25. Simulate a disagreement.
-    const other = { type: 'other' } as unknown as typeof sigv4;
-    expect(resolveBinding('aws', hosts('s3.example.com'), { signing: other }, false, { signing: sigv4 }))
+    expect(resolveBinding('aws', hosts('s3.example.com'), { signing: hmac }, false, { signing: sigv4 }))
       .toEqual({ ok: false, status: 500, error: expect.stringContaining('_signing') });
+  });
+
+  it('uses the policy recipe when both sources name hmac', () => {
+    expect(resolveBinding('ledger', hosts('ledger'), { signing: hmac2 }, false, { signing: hmac }))
+      .toEqual(expect.objectContaining({ ok: true, signing: hmac }));
+  });
+
+  it('parses an in-band HMAC recipe and reports an invalid one', () => {
+    expect(parseSecretValue(JSON.stringify({ key_id: 'k', secret: 's', _signing: { type: 'hmac', key_header: 'X-Key', signature_header: 'X-Sig', message: ['method'] } })).inBand)
+      .toEqual({ signing: hmac });
+    expect(parseSecretValue(JSON.stringify({ secret: 's', _signing: { type: 'hmac', key_header: 'X-Key', signature_header: 'X-Sig', message: [] } })).inBand)
+      .toEqual({ error: expect.stringContaining('message') });
   });
 });
