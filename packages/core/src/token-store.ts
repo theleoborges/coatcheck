@@ -14,6 +14,18 @@ const DEFAULT_TTL_SECONDS = 900; // 15 minutes — covers conversational latency
 export interface TokenStoreOptions {
   /** TTL for tickets issued without an explicit one (`COATCHECK_TICKET_TTL_SECONDS`). */
   defaultTtlSeconds?: number;
+  /** Most live tickets held at once; past it `issue` throws `TicketLimitError`. Default 10,000. */
+  maxTickets?: number;
+}
+
+const DEFAULT_MAX_TICKETS = 10_000;
+
+/** `issue` with `maxTickets` live tickets already held (each holds a real value until it expires). */
+export class TicketLimitError extends Error {
+  constructor(readonly maxTickets: number) {
+    super(`Too many live tickets (${maxTickets}); retry once some expire`);
+    this.name = 'TicketLimitError';
+  }
 }
 const CLEANUP_INTERVAL_MS = 30_000; // 30 seconds
 
@@ -153,16 +165,26 @@ export class TokenStore {
   private cleanupTimer: NodeJS.Timeout;
 
   private readonly defaultTtlSeconds: number;
+  private readonly maxTickets: number;
 
   constructor(opts: TokenStoreOptions = {}) {
     this.defaultTtlSeconds = opts.defaultTtlSeconds ?? DEFAULT_TTL_SECONDS;
+    this.maxTickets = opts.maxTickets ?? DEFAULT_MAX_TICKETS;
     // Periodically clean up expired tokens
     this.cleanupTimer = setInterval(() => this.evictExpired(), CLEANUP_INTERVAL_MS);
     this.cleanupTimer.unref();
   }
 
-  /** Issue an HTTP(S) ticket for a secret, swapped on the wire for `target` hosts. */
+  /**
+   * Issue an HTTP(S) ticket for a secret, swapped on the wire for `target` hosts.
+   * Throws `TicketLimitError` when `maxTickets` live tickets are already held,
+   * so an agent minting in a loop can't grow the store without bound.
+   */
   issue(secretName: string, realValue: string, opts: IssueOptions = {}): IssuedToken {
+    if (this.tokens.size >= this.maxTickets) {
+      this.evictExpired();
+      if (this.tokens.size >= this.maxTickets) throw new TicketLimitError(this.maxTickets);
+    }
     const ttlSeconds = opts.ttlSeconds ?? this.defaultTtlSeconds;
     const id = TICKET_PREFIX + randomBytes(32).toString('hex');
     const now = Date.now();

@@ -183,6 +183,15 @@ export function uninspectableBodyBody(hostname: string, why: string): string {
   });
 }
 
+/** Body of the 502 sent when a browser-service response can't be inspected for CDP URLs. */
+export function uninspectableResponseBody(hostname: string, why: string): string {
+  return JSON.stringify({
+    error: `Response from browser-service host '${hostname}' can't be inspected (${why}); refused so no direct browser route reaches the agent`,
+    reason: 'uninspectable-response',
+    host: hostname,
+  });
+}
+
 function names(infos: SwapInfo[]): string {
   return infos.map(s => s.secretName).join(',');
 }

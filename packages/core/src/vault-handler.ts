@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { TokenStore } from './token-store.js';
+import { TicketLimitError, TokenStore, type IssueOptions, type IssuedToken } from './token-store.js';
 import type { CertAuthority } from './ca.js';
 import type { CdpSessionStore, LoginRequest, LoginResult } from './cdp-session-store.js';
 import { InvalidSecretNameError, isValidSecretName, type SecretProvider } from './secret-provider.js';
@@ -186,7 +186,13 @@ export function handleVaultRequest(
     if (secretName === null) return true;
     readJsonBody(req).then(body => {
       handleLogin(secretName, body, res, deps);
-    }).catch(() => {
+    }).catch((err: unknown) => {
+      if (err instanceof BodyTooLargeError) {
+        // Stop reading: the rest of the body is never buffered.
+        res.writeHead(413, { 'Content-Type': 'application/json', Connection: 'close' });
+        res.end(JSON.stringify({ error: `Request body over ${MAX_JSON_BODY_BYTES} bytes` }), () => req.destroy());
+        return;
+      }
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Invalid JSON body' }));
     });
@@ -209,6 +215,18 @@ export function handleVaultRequest(
 }
 
 /** Issue an HTTP(S) ticket and answer with it, its allowed hosts and any opt-in swap placements. */
+/** Issue a ticket, or answer 429 (and return null) when the store is at its live-ticket cap. */
+function issueOr429(res: http.ServerResponse, deps: VaultDeps, label: string, value: string, opts: IssueOptions): IssuedToken | null {
+  try {
+    return deps.tokenStore.issue(label, value, opts);
+  } catch (err) {
+    if (!(err instanceof TicketLimitError)) throw err;
+    console.warn(`[issue] secret=${label} result=refused (live-ticket cap ${err.maxTickets})`);
+    send(res, 429, { error: err.message });
+    return null;
+  }
+}
+
 function issueTicket(
   res: http.ServerResponse,
   deps: VaultDeps,
@@ -218,7 +236,8 @@ function issueTicket(
   via?: string,
 ): void {
   const { allowedHosts, swapBody, swapUrl, swapHeaders } = binding;
-  const token = deps.tokenStore.issue(label, value, { allowedHosts, swapBody, swapUrl, swapHeaders });
+  const token = issueOr429(res, deps, label, value, { allowedHosts, swapBody, swapUrl, swapHeaders });
+  if (!token) return;
   const flags = `${allowedHosts ? '' : ' unbound=1'}${swapBody ? ' swap_body=1' : ''}${swapUrl ? ' swap_url=1' : ''}` +
     (swapHeaders.length > 0 ? ` swap_headers=${swapHeaders.join(',')}` : '');
   console.log(`[issue] secret=${label} ttl_s=${token.ttlSeconds}${flags}${via ? ` via=${via}` : ''}`);
@@ -266,7 +285,8 @@ function mintSigning(res: http.ServerResponse, deps: VaultDeps, label: string, p
   }
 
   const { allowedHosts } = binding;
-  const token = deps.tokenStore.issue(label, '', { allowedHosts, signing: credential });
+  const token = issueOr429(res, deps, label, '', { allowedHosts, signing: credential });
+  if (!token) return;
   console.log(`[issue] secret=${label} ttl_s=${token.ttlSeconds}${allowedHosts ? '' : ' unbound=1'} signing=${spec.type}`);
   send(res, 200, {
     token: token.id,
@@ -328,12 +348,38 @@ function decodeSecretName(segment: string, res: http.ServerResponse): string | n
   return name;
 }
 
-/** Collect and JSON-parse a request body (rejects on malformed JSON). */
+/** Largest vault API request body read (a login request is a few hundred bytes). */
+const MAX_JSON_BODY_BYTES = 64 * 1024;
+
+class BodyTooLargeError extends Error {}
+
+/**
+ * Collect and JSON-parse a request body (rejects on malformed JSON, and with
+ * `BodyTooLargeError` past `MAX_JSON_BODY_BYTES`, declared or sent, without
+ * holding more than that).
+ */
 function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
-    let raw = '';
-    req.on('data', chunk => { raw += chunk; });
+    if (Number(req.headers['content-length'] ?? 0) > MAX_JSON_BODY_BYTES) {
+      reject(new BodyTooLargeError());
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    const onData = (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_JSON_BODY_BYTES) {
+        req.off('data', onData);
+        chunks.length = 0;
+        reject(new BodyTooLargeError());
+        return;
+      }
+      chunks.push(chunk);
+    };
+    req.on('data', onData);
     req.on('end', () => {
+      if (size > MAX_JSON_BODY_BYTES) return;
+      const raw = Buffer.concat(chunks).toString('utf8');
       if (raw.trim() === '') return resolve({});
       try {
         resolve(JSON.parse(raw));

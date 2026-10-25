@@ -4,7 +4,7 @@ import tls from 'node:tls';
 import type { TokenStore } from './token-store.js';
 import type { CertAuthority, HostCert } from './ca.js';
 import type { CdpSessionStore } from './cdp-session-store.js';
-import { createJsonResponseRewriter } from './json-response-rewriter.js';
+import { createJsonResponseRewriter, UninspectableResponseError } from './json-response-rewriter.js';
 import type { BrowserAdapter } from './browser-adapters.js';
 import { parseConnectTarget } from './connect-target.js';
 import { matchesHost, parseHostPattern, type HostPattern } from './host-matcher.js';
@@ -16,7 +16,7 @@ import { headerFieldValue, percentEncodeUnsafe } from './value-encoding.js';
 import { swapBasicFieldLine, type BasicSwapResult } from './basic-auth.js';
 import type { SwapInfo, SwapResult } from './token-store.js';
 import {
-  DENIED_HEADER, hostMismatchBody, uninspectableBodyBody, invalidValueBody, logBodyUnscanned, logSigningRefused, logSwapOutcome,
+  DENIED_HEADER, hostMismatchBody, uninspectableBodyBody, uninspectableResponseBody, invalidValueBody, logBodyUnscanned, logSigningRefused, logSwapOutcome,
   signatureMismatchBody, unsignableBody, type SwapOutcome,
 } from './swap-log.js';
 import { planSigning, type SigningPlan } from './signing/processor.js';
@@ -41,7 +41,7 @@ export interface MitmDeps {
   maxSwapBodyBytes: number;
 }
 
-const STATUS_TEXT = { 400: 'Bad Request', 403: 'Forbidden', 431: 'Request Header Fields Too Large' } as const;
+const STATUS_TEXT = { 400: 'Bad Request', 403: 'Forbidden', 431: 'Request Header Fields Too Large', 502: 'Bad Gateway' } as const;
 
 /** A header section that hasn't ended within this many bytes gets 431. */
 export const MAX_HEAD_BYTES = 64 * 1024;
@@ -228,6 +228,16 @@ export function createConnectHandler(deps: MitmDeps) {
     // fixed per CONNECT, so resolved once rather than per keep-alive request.
     const reqAdapter = adapterFor(hostname);
     const adapterReq = reqAdapter?.rewriteRequestJson?.bind(reqAdapter);
+    // Its responses get CDP URLs rewritten to the local CDP proxy. One rewriter
+    // per tunnel, told each request's method as it goes upstream so it frames
+    // every keep-alive response (a HEAD answer has no body).
+    const responseRewriter = cdp && reqAdapter
+      ? createJsonResponseRewriter(
+        body => reqAdapter.rewriteJson(body, realUrl =>
+          `ws://${cdp.advertiseHost}:${cdp.port}/cdp/${cdpSessionStore.register(realUrl, reqAdapter.name)}`),
+        { maxBodyBytes: maxSwapBodyBytes },
+      )
+      : undefined;
 
     /**
      * Process buffered client data request by request (HTTP keep-alive: every
@@ -257,6 +267,8 @@ export function createConnectHandler(deps: MitmDeps) {
         const head = parseRequestHead(requestData.subarray(0, headerEnd).toString());
         requestData = requestData.subarray(headerEnd + 4);
         upgradeRequested = head.header('upgrade') !== undefined;
+        // Every request that isn't refused goes upstream (a refusal closes the tunnel).
+        responseRewriter?.request(head.requestLine.slice(0, head.requestLine.indexOf(' ')));
 
         // Find where this request ends (RFC 9112 §6); ambiguous framing is
         // refused, since the upstream might read it differently (design §5).
@@ -606,7 +618,7 @@ export function createConnectHandler(deps: MitmDeps) {
      * and close the tunnel: requests pipelined ahead of this one that the
      * upstream hasn't answered are abandoned (design §3, "Host binding details").
      */
-    function denyAndClose(status: 400 | 403 | 431, reason: string, responseBody: string) {
+    function denyAndClose(status: 400 | 403 | 431 | 502, reason: string, responseBody: string) {
       denied = true;
       pendingWrites = [];
       requestData = Buffer.alloc(0);
@@ -662,21 +674,33 @@ export function createConnectHandler(deps: MitmDeps) {
       // Responses flow back to the client. For a browser adapter's REST host (when
       // the CDP proxy is on) the adapter rewrites CDP URLs to the local CDP proxy;
       // every other host pipes through unmodified.
-      const adapter = adapterFor(hostname);
-      if (cdp && adapter) {
-        const register = (realUrl: string) =>
-          `ws://${cdp.advertiseHost}:${cdp.port}/cdp/${cdpSessionStore.register(realUrl, adapter.name)}`;
-        const rewriter = createJsonResponseRewriter(body => adapter.rewriteJson(body, register));
+      if (responseRewriter) {
+        /** Forward rewritten bytes; a response the rewriter can't inspect closes the tunnel. */
+        const forward = (rewrite: () => Buffer): boolean => {
+          let out: Buffer;
+          try {
+            out = rewrite();
+          } catch (err) {
+            if (!(err instanceof UninspectableResponseError)) throw err;
+            console.warn(`[connect] host=${hostname} refused response: not inspectable (${err.reason})`);
+            denyAndClose(502, 'uninspectable-response', uninspectableResponseBody(hostname, err.reason));
+            return false;
+          }
+          if (out.length > 0) tlsSocket.write(out);
+          return true;
+        };
         realSocket.on('data', (chunk: Buffer) => {
           if (denied) return;
           if (rawPipe) {
             tlsSocket.write(chunk);
             return;
           }
-          const out = rewriter.push(chunk);
-          if (out.length > 0) tlsSocket.write(out);
+          forward(() => responseRewriter.push(chunk));
         });
-        realSocket.on('end', () => tlsSocket.end());
+        realSocket.on('end', () => {
+          if (denied) return;
+          if (rawPipe || forward(() => responseRewriter.end())) tlsSocket.end();
+        });
       } else {
         realSocket.pipe(tlsSocket);
       }

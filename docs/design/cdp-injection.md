@@ -113,12 +113,25 @@ streaming rewriter (`packages/core/src/mitm.ts`).
 `createJsonResponseRewriter` (`packages/core/src/json-response-rewriter.ts`) is
 a small, vendor-neutral HTTP/1.1 response parser:
 
-- Frames each response by `Content-Length`, or decodes `Transfer-Encoding:
-  chunked` and re-emits it with a `Content-Length`.
+- Frames each response as RFC 9112 §6.3 does. `mitm.ts` tells it each
+  request's method as the request goes upstream, so the answer to a `HEAD`
+  has no body; `1xx` (interim), `204` and `304` have none either. A body is
+  framed by `Content-Length`, or `Transfer-Encoding: chunked` is decoded and
+  re-emitted with a `Content-Length`; with neither, the body runs until the
+  upstream closes and is rewritten then. The parser stays in step on every
+  keep-alive response: nothing the agent can make the upstream send switches
+  it off. (Before the security review of 0.3.0, a response with neither
+  framing header, such as a `HEAD` answer or a `100 Continue`, switched the
+  tunnel to raw passthrough for the rest of its life.)
+- Decodes `Content-Encoding` (`gzip`, `deflate`, `br`, `zstd`) for the
+  transform, so an agent asking for compressed responses gets them rewritten.
 - If the body parses as JSON, hands it to the adapter's `rewriteJson` and, if
-  that changed anything, re-serialises it and recomputes `Content-Length`.
-- Non-JSON bodies pass through unchanged. A response with neither framing
-  header switches the connection to raw passthrough for the rest of its life.
+  that changed anything, re-serialises it (uncompressed) and recomputes
+  `Content-Length`. Non-JSON bodies pass through unchanged.
+- Fails closed: a response it can't frame or decode, or whose body (decoded)
+  is over `COATCHECK_MAX_SWAP_BODY_BYTES`, is refused with
+  `502 uninspectable-response` and the tunnel is closed. Nothing of it reaches
+  the agent.
 
 The Browserbase adapter (`packages/core/src/browser-adapters.ts`):
 

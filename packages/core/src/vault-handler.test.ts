@@ -105,9 +105,9 @@ describe('Vault Handler', () => {
   async function setup(
     secrets: Record<string, string>,
     sharedSecrets: Record<string, string> = {},
-    opts: Pick<MemoryProviderInit, 'writable'> & { noShared?: boolean; missingSecretUrl?: string; policy?: Policy; allowUnbound?: boolean } = {},
+    opts: Pick<MemoryProviderInit, 'writable'> & { noShared?: boolean; missingSecretUrl?: string; policy?: Policy; allowUnbound?: boolean; maxTickets?: number } = {},
   ) {
-    tokenStore = new TokenStore();
+    tokenStore = new TokenStore({ maxTickets: opts.maxTickets });
     cdpSessionStore = new CdpSessionStore();
     sid = cdpSessionStore.register('wss://browser.test/session', 'test');
     const provider = createMemoryProvider({
@@ -785,6 +785,39 @@ describe('Vault Handler', () => {
       expect((await postJSON(port, '/_vault/example-login/login', { ...okReq, sessionId: sid, submit: 42 })).status).toBe(400);
       expect((await postJSON(port, '/_vault/example-login/login', { ...okReq, sessionId: sid, until: { nope: 1 } })).status).toBe(400);
     });
+
+    // Attack (security review, finding 2): one huge login body used to be
+    // buffered whole, so the agent could exhaust the broker's memory.
+    it('413s a body over 64 KiB, declared or streamed, without reaching the controller', async () => {
+      await setup({ 'example-login': login });
+      const { calls } = attachController({ status: 200, url: 'x' });
+      const big = { ...okReq, sessionId: sid, pad: 'x'.repeat(64 * 1024) };
+      expect((await postJSON(port, '/_vault/example-login/login', big)).status).toBe(413);
+      // Chunked: no Content-Length to refuse on, so the cap applies while reading.
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/_vault/example-login/login' }, res => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+        });
+        req.on('error', reject);
+        for (let i = 0; i < 80; i++) req.write('x'.repeat(1024));
+        req.end();
+      });
+      expect(status).toBe(413);
+      expect(calls).toHaveLength(0);
+    });
+  });
+
+  // Attack (security review, finding 3): each ticket holds a real value for
+  // its TTL, so minting in a loop used to grow the store without bound.
+  it('429s a mint once the live-ticket cap is reached', async () => {
+    await setup({ github: 'ghp_x' }, {}, { maxTickets: 2 });
+    expect((await fetchJSON(port, '/_vault/github')).status).toBe(200);
+    expect((await fetchJSON(port, '/_vault/github')).status).toBe(200);
+    const { status, body } = await fetchJSON(port, '/_vault/github');
+    expect(status).toBe(429);
+    expect(body.error).toContain('Too many live tickets');
+    expect(tokenStore.size).toBe(2);
   });
 
   // --- mint-tokens is gone (replaced by /login) ---
