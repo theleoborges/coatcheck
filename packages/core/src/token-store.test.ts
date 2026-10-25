@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { TokenStore, TICKET_PREFIX, TICKET_PATTERN } from './token-store.js';
+import { TicketLimitError, TokenStore, TICKET_PREFIX, TICKET_PATTERN } from './token-store.js';
 import { parseHostPattern, type HostPattern } from './host-matcher.js';
 
 /** Most tests use unbound tickets, which swap for any target. */
@@ -22,6 +22,19 @@ describe('TokenStore', () => {
     const token = store.issue('my-secret', 'real-value-123');
     expect(token.id).toMatch(/^cct_[a-f0-9]{64}$/);
     expect(token.ttlSeconds).toBe(900);
+  });
+
+  it('refuses to issue past maxTickets live tickets, counting only unexpired ones', () => {
+    store = new TokenStore({ maxTickets: 2 });
+    store.issue('a', 'v1', { ttlSeconds: 0 });
+    store.issue('b', 'v2');
+    // The expired ticket is evicted to make room.
+    return new Promise<void>(resolve => setTimeout(() => {
+      store.issue('c', 'v3');
+      expect(() => store.issue('d', 'v4')).toThrow(TicketLimitError);
+      expect(store.size).toBe(2);
+      resolve();
+    }, 5));
   });
 
   it('exports one prefix and pattern that match issued tickets', () => {
