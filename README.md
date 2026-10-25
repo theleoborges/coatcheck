@@ -91,9 +91,9 @@ COATCHECK_PROVIDER=env COATCHECK_SECRET_EXAMPLE_API_KEY=sk-demo coatcheck
 Node ≥ 24. Or use the container image, which has core and both providers, for `linux/amd64` and `linux/arm64`:
 
 ```bash
-docker pull ghcr.io/theleoborges/coatcheck:0.3.0   # also :0.3 and :latest
+docker pull ghcr.io/theleoborges/coatcheck:0.4.0   # also :0.4 and :latest
 docker run --rm -p 127.0.0.1:3128:3128 -e COATCHECK_BIND_HOST=0.0.0.0 -e COATCHECK_API_TOKEN=$COATCHECK_API_TOKEN \
-  -e COATCHECK_PROVIDER=env -e COATCHECK_SECRET_EXAMPLE_API_KEY=sk-demo ghcr.io/theleoborges/coatcheck:0.3.0
+  -e COATCHECK_PROVIDER=env -e COATCHECK_SECRET_EXAMPLE_API_KEY=sk-demo ghcr.io/theleoborges/coatcheck:0.4.0
 ```
 
 Each release tag builds it from the tagged source, with provenance and an SBOM. To build your own: `docker build -t coatcheck .` (the LocalStack demo and the example agents build from the checkout).

@@ -1,6 +1,6 @@
 {
   "name": "@coatcheck/provider-aws",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "coatcheck secret provider: AWS SSM Parameter Store (per-agent) and Secrets Manager (shared), with optional STS AssumeRole.",
   "license": "Apache-2.0",
   "repository": {
@@ -42,7 +42,7 @@
     "!dist/**/*.test.*"
   ],
   "peerDependencies": {
-    "@coatcheck/core": "^0.3.0"
+    "@coatcheck/core": "^0.4.0"
   },
   "dependencies": {
     "@aws-sdk/client-secrets-manager": "^3.600.0",
