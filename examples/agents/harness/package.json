@@ -7,7 +7,7 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.135.0",
+    "@anthropic-ai/sdk": "^1.1.0",
     "playwright-core": "^1.55.0"
   },
   "devDependencies": {
